@@ -31,7 +31,7 @@ export type LeaveRequest = { id: string; startDate: string; endDate: string; day
 export type Task = { id: string; title: string; priority: string; status: string; dueDate: string; assignee: string; project: string };
 
 export type Expense = { id: string; employee: string; category: string; amount: number; currency: string; expenseDate: string; description: string; status: "submitted" | "approved" | "rejected" | "paid"; project?: string };
-export type ApprovalRequest = { id: string; requestType: string; title: string; requester: string; amount?: number; status: "pending" | "approved" | "rejected" | "paid"; requiredRole: string; createdAt: string };
+export type ApprovalRequest = { id: string; requestType: string; title: string; details?: string | null; requester: string; amount?: number | null; status: "pending" | "approved" | "rejected" | "paid"; requiredRole: string; createdAt: string };
 export type Asset = { id: string; assetTag: string; name: string; category: string; serialNumber: string; status: "available" | "assigned" | "maintenance" | "retired"; assignee?: string; location: string; value: number };
 export type Vendor = { id: string; name: string; category: string; contactName: string; email: string; status: "active" | "review" | "expired"; contractEnd?: string; spend: number };
 export type SupportTicket = { id: string; ticketNumber: string; subject: string; category: string; priority: "low" | "medium" | "high" | "urgent"; status: "open" | "assigned" | "in_progress" | "resolved" | "closed"; requester: string; assignee?: string; createdAt: string };

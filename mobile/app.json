@@ -1,0 +1,24 @@
+{
+  "expo": {
+    "name": "Zyntris Operations",
+    "slug": "zyntris-operations",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "scheme": "zyntris-ops",
+    "icon": "./assets/app-icon.png",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "org.zyntris.operations",
+      "config": { "usesNonExemptEncryption": false }
+    },
+    "android": {
+      "package": "org.zyntris.operations",
+      "adaptiveIcon": {
+        "backgroundColor": "#10212B",
+        "foregroundImage": "./assets/app-icon.png"
+      }
+    },
+    "plugins": ["expo-secure-store"]
+  }
+}

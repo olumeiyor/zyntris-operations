@@ -58,7 +58,9 @@ async function hashToken(value: string) {
 }
 
 async function auth(request: Request, env: Env): Promise<AuthContext | null> {
-  const token = getCookie(request, "zyntris_session");
+  const mobileRequest = new URL(request.url).pathname.startsWith("/api/mobile/");
+  const authorization = mobileRequest ? request.headers.get("authorization") : null;
+  const token = authorization?.match(/^Bearer\s+([a-f0-9]{64})$/i)?.[1] || getCookie(request, "zyntris_session");
   if (!token) return null;
   const tokenHash = await hashToken(token);
   const result = await env.DB.prepare(`
@@ -227,6 +229,25 @@ async function sendApprovalNotificationEmail(env: Env, email: string, fullName: 
   }
 }
 
+async function notifyApprovers(env: Env, context: AuthContext, requiredRole: string, title: string, body: string) {
+  const organization = await env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`).bind(context.organizationId).first<{ name: string }>();
+  const requester = await env.DB.prepare(`SELECT full_name as fullName FROM users WHERE id = ?`).bind(context.userId).first<{ fullName: string }>();
+  const approvers = await env.DB.prepare(`SELECT DISTINCT u.id, u.email, u.full_name as fullName FROM memberships m JOIN users u ON u.id = m.user_id JOIN roles r ON r.id = m.role_id WHERE m.organization_id = ? AND r.name = ? AND m.status = 'active' AND u.status = 'active' AND u.email_verified_at IS NOT NULL`).bind(context.organizationId, requiredRole).all<{ id: string; email: string; fullName: string }>();
+  const targets = approvers.results || [];
+  if (!targets.length) {
+    const admins = await env.DB.prepare(`SELECT DISTINCT u.id, u.email, u.full_name as fullName FROM memberships m JOIN users u ON u.id = m.user_id JOIN roles r ON r.id = m.role_id WHERE m.organization_id = ? AND r.name = 'Organization Admin' AND m.status = 'active' AND u.status = 'active' AND u.email_verified_at IS NOT NULL`).bind(context.organizationId).all<{ id: string; email: string; fullName: string }>();
+    const alert = `No active ${requiredRole} approver is assigned. Assign an approver to review ${title}.`;
+    const adminStatements = (admins.results || []).map((admin) => env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'approval_setup', ?, ?)`).bind(requestId(), context.organizationId, admin.id, `${requiredRole} approval needs setup`, alert));
+    if (adminStatements.length) await env.DB.batch(adminStatements);
+    if (organization) await Promise.all((admins.results || []).map((admin) => sendApprovalNotificationEmail(env, admin.email, admin.fullName, organization.name, `${requiredRole} approval routing needs setup`, alert)));
+    return;
+  }
+  const details = `${requester?.fullName || "A team member"} submitted “${title.replace(/[\r\n]+/g, " ").slice(0, 120)}”. ${body.slice(0, 1800)}`;
+  const subjectTitle = title.replace(/[\r\n]+/g, " ").slice(0, 120);
+  await env.DB.batch(targets.map((approver) => env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'approval_pending', ?, ?)`).bind(requestId(), context.organizationId, approver.id, "Approval pending", details)));
+  if (organization) await Promise.all(targets.map((approver) => sendApprovalNotificationEmail(env, approver.email, approver.fullName, organization.name, `Approval pending: ${subjectTitle}`, details)));
+}
+
 async function handlePublicAuth(request: Request, env: Env, path: string): Promise<Response | null> {
   if (request.method === "GET" && path === "/api/auth/config") return json({ emailVerificationEnabled: Boolean(env.BREVO_API_KEY), demoEnabled: Boolean(env.DEMO_ACCESS_PASSWORD) });
   if (request.method === "POST" && path === "/api/auth/accept-invite") {
@@ -377,13 +398,34 @@ async function dashboard(env: Env, organizationId: string) {
 
 async function handleApi(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const path = url.pathname;
+  const mobilePath = url.pathname.startsWith("/api/mobile/");
+  const path = mobilePath ? url.pathname.replace("/api/mobile", "/api") : url.pathname;
 
   if (request.method === "GET" && path === "/api/health") {
     return json({ ok: true, service: "zyntris-operations", environment: env.ENVIRONMENT, d1: Boolean(env.DB), r2: Boolean(env.FILES), timestamp: new Date().toISOString() });
   }
 
-  if (["POST", "PUT", "PATCH", "DELETE"].includes(request.method) && !originAllowed(request, env)) return error("Request origin rejected", 403);
+  if (!mobilePath && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method) && !originAllowed(request, env)) return error("Request origin rejected", 403);
+
+  if (mobilePath && request.method === "POST" && path === "/api/auth/login") {
+    if (!(await consumeAuthLimit(env, request, "login", 20, 15))) return error("Too many sign-in attempts. Try again later.", 429);
+    const body = await request.json<{ email?: string; password?: string }>();
+    const email = body.email?.trim().toLowerCase() || "";
+    const user = await env.DB.prepare(`SELECT id, password_hash as passwordHash, email_verified_at as verifiedAt, status FROM users WHERE email = ?`).bind(email).first<{ id: string; passwordHash: string | null; verifiedAt: string | null; status: string }>();
+    if (!user?.passwordHash || user.status !== "active" || !(await verifyPassword(body.password || "", user.passwordHash))) return error("Email or password is incorrect.", 401);
+    if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
+    const membership = await env.DB.prepare(`SELECT organization_id as organizationId FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created_at LIMIT 1`).bind(user.id).first<{ organizationId: string }>();
+    if (!membership) return error("No active organization is linked to this account.", 403);
+    const accessToken = await createSession(env, user.id, membership.organizationId);
+    await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type) VALUES (?, ?, ?, 'signed_in', 'authentication', 'mobile_session')`).bind(`audit-${crypto.randomUUID()}`, membership.organizationId, user.id).run();
+    return json({ accessToken, tokenType: "Bearer", expiresIn: 43200 });
+  }
+
+  if (mobilePath && request.method === "POST" && path === "/api/auth/logout") {
+    const token = request.headers.get("authorization")?.match(/^Bearer\s+([a-f0-9]{64})$/i)?.[1];
+    if (token) await env.DB.prepare(`DELETE FROM sessions WHERE token_hash = ?`).bind(await hashToken(token)).run();
+    return json({ ok: true });
+  }
 
   const publicAuth = await handlePublicAuth(request, env, path);
   if (publicAuth) return publicAuth;
@@ -400,6 +442,23 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const context = secured.context;
 
   if (context.isDemo && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return error("The demo sandbox is read-only. Changes are not allowed.", 403);
+
+  if (request.method === "GET" && path === "/api/notifications") {
+    const result = await env.DB.prepare(`SELECT id, type, title, body, read_at as readAt, created_at as createdAt FROM notifications WHERE organization_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 50`).bind(context.organizationId, context.userId).all();
+    const unread = await env.DB.prepare(`SELECT COUNT(*) as count FROM notifications WHERE organization_id = ? AND user_id = ? AND read_at IS NULL`).bind(context.organizationId, context.userId).first<{ count: number }>();
+    return json({ data: result.results || [], unread: unread?.count || 0 });
+  }
+
+  if (request.method === "PATCH" && path === "/api/notifications/read-all") {
+    await env.DB.prepare(`UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE organization_id = ? AND user_id = ? AND read_at IS NULL`).bind(context.organizationId, context.userId).run();
+    return json({ ok: true });
+  }
+
+  const notificationMatch = path.match(/^\/api\/notifications\/([^/]+)\/read$/);
+  if (request.method === "PATCH" && notificationMatch) {
+    await env.DB.prepare(`UPDATE notifications SET read_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND user_id = ? AND read_at IS NULL`).bind(notificationMatch[1], context.organizationId, context.userId).run();
+    return json({ ok: true });
+  }
 
   if (path.startsWith("/api/platform/")) {
     if (!context.isPlatformAdmin) return error("Platform administrator access is required.", 403);
@@ -615,6 +674,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "GET" && path === "/api/payroll/runs") {
+    if (!hasPermission(context, "payroll.view") && !hasPermission(context, "payroll.manage")) return error("Payroll viewing permission is required.", 403);
     const runs = await env.DB.prepare(`SELECT id, period_start as periodStart, period_end as periodEnd, payment_date as paymentDate, currency, status, employee_count as employeeCount, gross_total as grossTotal, deductions_total as deductionsTotal, employer_cost_total as employerCostTotal, net_total as netTotal, created_at as createdAt FROM payroll_runs WHERE organization_id = ? ORDER BY period_start DESC LIMIT 100`).bind(context.organizationId).all();
     return json({ data: runs.results || [] });
   }
@@ -690,11 +750,13 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       .bind(item.id, context.organizationId, runId, item.employeeId, item.employeeNumber, item.employeeName, item.jobTitle, item.baseSalary, item.gross, item.taxable, item.tax, item.employeePension, item.employerPension, item.otherDeductions, item.employerContributions, item.net, JSON.stringify(item.breakdown)));
     await env.DB.batch(statements);
     await audit(env, context, "created", "payroll_runs", runId, { periodStart: body.periodStart, periodEnd: body.periodEnd, employeeCount: calculated.length });
+    await notifyApprovers(env, context, "Finance Admin", `Payroll run · ${body.periodStart} to ${body.periodEnd}`, `A payroll run covering ${calculated.length} employees is ready for finance review.`);
     return json({ id: runId, employeeCount: calculated.length, status: "draft" }, { status: 201 });
   }
 
   const payrollRunMatch = path.match(/^\/api\/payroll\/runs\/([^/]+)(?:\/(action|payslips|export|payout))?$/);
   if (payrollRunMatch && request.method === "GET") {
+    if (!hasPermission(context, "payroll.view") && !hasPermission(context, "payroll.manage")) return error("Payroll viewing permission is required.", 403);
     const runId = payrollRunMatch[1];
     const run = await env.DB.prepare(`SELECT id, period_start as periodStart, period_end as periodEnd, payment_date as paymentDate, currency, status, employee_count as employeeCount, gross_total as grossTotal, deductions_total as deductionsTotal, employer_cost_total as employerCostTotal, net_total as netTotal, created_at as createdAt FROM payroll_runs WHERE id = ? AND organization_id = ?`).bind(runId, context.organizationId).first();
     if (!run) return error("Payroll run not found.", 404);
@@ -722,6 +784,10 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       .bind(...(actorColumn ? [next, context.userId, payrollRunMatch[1], context.organizationId, transition[body.action]] : [next, payrollRunMatch[1], context.organizationId, transition[body.action]])).run();
     if (!result.meta.changes) return error("That payroll transition is not allowed from the current status.", 409);
     await audit(env, context, body.action, "payroll_runs", payrollRunMatch[1]);
+    if (body.action === "review") {
+      const payrollRun = await env.DB.prepare(`SELECT period_start as periodStart, period_end as periodEnd FROM payroll_runs WHERE id = ? AND organization_id = ?`).bind(payrollRunMatch[1], context.organizationId).first<{ periodStart: string; periodEnd: string }>();
+      if (payrollRun) await notifyApprovers(env, context, "CEO", `Payroll run · ${payrollRun.periodStart} to ${payrollRun.periodEnd}`, "Finance review is complete. Final CEO approval is pending.");
+    }
     if (body.action === "approve") {
       const payrollNotice = await env.DB.prepare(`SELECT u.email, u.full_name as fullName, o.name as organizationName, r.period_start as periodStart, r.period_end as periodEnd FROM payroll_runs r JOIN users u ON u.id = r.created_by JOIN organizations o ON o.id = r.organization_id WHERE r.id = ? AND r.organization_id = ?`).bind(payrollRunMatch[1], context.organizationId).first<{ email: string; fullName: string; organizationName: string; periodStart: string; periodEnd: string }>();
       if (payrollNotice) await sendApprovalNotificationEmail(env, payrollNotice.email, payrollNotice.fullName, payrollNotice.organizationName, "Payroll record approved", `Your payroll record for ${payrollNotice.periodStart} to ${payrollNotice.periodEnd} has received final CEO approval.`);
@@ -841,6 +907,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'CEO', 'pending', 1, ?)`).bind(requestIdValue, context.organizationId, id, body.description, context.userId, amount, JSON.stringify({ category: body.category, project: body.project || null, approvalPolicy: ["CEO"] })),
     ]);
     await audit(env, context, "submitted", "expenses", id, { category: body.category, amount, description: body.description });
+    await notifyApprovers(env, context, "CEO", body.description, `A financial request for ₦${amount.toLocaleString("en-NG")} is pending your approval.`);
     return json({ id, requestId: requestIdValue, status: "submitted" }, { status: 201 });
   }
 
@@ -852,8 +919,29 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET" && path === "/api/requests") {
     if (!hasPermission(context, "requests.manage") && !hasPermission(context, "employees.view")) return error("You do not have permission to view requests.", 403);
     const canViewAll = hasPermission(context, "requests.manage") ? 1 : 0;
-    const result = await env.DB.prepare(`SELECT a.id, a.request_type as requestType, a.title, u.full_name as requester, a.amount, a.status, a.required_role as requiredRole, a.created_at as createdAt FROM approval_requests a JOIN users u ON u.id = a.requester_id WHERE a.organization_id = ? AND (? = 1 OR a.requester_id = ?) ORDER BY CASE a.status WHEN 'pending' THEN 1 ELSE 2 END, a.created_at DESC LIMIT 100`).bind(context.organizationId, canViewAll, context.userId).all();
+    const result = await env.DB.prepare(`SELECT a.id, a.request_type as requestType, a.title, json_extract(a.metadata_json, '$.details') as details, u.full_name as requester, a.amount, a.status, a.required_role as requiredRole, a.created_at as createdAt FROM approval_requests a JOIN users u ON u.id = a.requester_id WHERE a.organization_id = ? AND (? = 1 OR a.requester_id = ?) ORDER BY CASE a.status WHEN 'pending' THEN 1 ELSE 2 END, a.created_at DESC LIMIT 100`).bind(context.organizationId, canViewAll, context.userId).all();
     return json({ data: result.results || [] });
+  }
+
+  if (request.method === "POST" && path === "/api/requests") {
+    if (!hasPermission(context, "employees.view")) return error("Only organization members can submit requests.", 403);
+    const body = await request.json<{ requestType?: string; title?: string; details?: string; amount?: number | string; approverRole?: string }>();
+    const requestType = body.requestType?.trim() || "Other";
+    const title = body.title?.trim();
+    const details = body.details?.trim();
+    const amount = body.amount === undefined || body.amount === "" ? null : Number(body.amount);
+    if (!["Operational", "Access", "HR", "Leave", "Purchase", "Budget", "Other"].includes(requestType) || !title || title.length > 120 || !details || details.length > 2000 || (amount !== null && (!Number.isFinite(amount) || amount <= 0))) return error("Choose a supported request type and provide a valid title, details and optional positive amount.");
+    const financialTypes = ["expense", "purchase", "budget", "payroll", "reimbursement", "payment", "financial", "asset purchase"];
+    const financial = amount !== null || financialTypes.includes(requestType.toLowerCase());
+    if (financial && amount === null) return error("Financial requests must include an amount.");
+    const requiredRole = financial ? "CEO" : body.approverRole?.trim() || "Manager";
+    if (!financial && !["Manager", "HR Admin", "CEO"].includes(requiredRole)) return error("Choose a supported approval role.");
+    const id = `request-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, ?, ?, ?, ?, 'NGN', ?, 'pending', 1, ?)`)
+      .bind(id, context.organizationId, requestType, title, context.userId, amount, requiredRole, JSON.stringify({ details, approvalPolicy: [requiredRole] })).run();
+    await audit(env, context, "submitted", "requests", id, { requestType, title, amount, requiredRole });
+    await notifyApprovers(env, context, requiredRole, title, `${financial ? `A financial request for ₦${Number(amount || 0).toLocaleString("en-NG")} is` : "A request is"} pending your approval. Details: ${details}`);
+    return json({ id, requestType, title, amount, requiredRole, status: "pending" }, { status: 201 });
   }
 
   const requestMatch = path.match(/^\/api\/requests\/([^/]+)$/);

@@ -15,6 +15,7 @@ import { OrganizationSettings } from "./settings";
 import type { DashboardData, Employee, LeaveRequest, PageId, Task } from "./types";
 
 type IconComponent = typeof LayoutDashboard;
+type InboxNotification = { id: string; type: string; title: string; body: string; readAt: string | null; createdAt: string };
 
 type NavItem = { id: PageId; label: string; icon: IconComponent; badge?: string; section?: string; soon?: boolean };
 
@@ -64,6 +65,9 @@ export default function App() {
   const [showAddEmployee, setShowAddEmployee] = useState(false);
   const [showUpload, setShowUpload] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [notifications, setNotifications] = useState<InboxNotification[]>([]);
+  const [unreadNotifications, setUnreadNotifications] = useState(0);
+  const [notificationOpen, setNotificationOpen] = useState(false);
 
   useEffect(() => {
     const load = async () => {
@@ -86,6 +90,30 @@ export default function App() {
     };
     void load();
   }, []);
+
+  const refreshNotifications = async () => {
+    try {
+      const data = await api<{ data: InboxNotification[]; unread: number }>("/api/notifications");
+      setNotifications(data.data); setUnreadNotifications(data.unread);
+    } catch { /* Inbox is unavailable until an authenticated workspace is ready. */ }
+  };
+
+  useEffect(() => {
+    if (!user?.id) return;
+    void refreshNotifications();
+    const interval = window.setInterval(() => void refreshNotifications(), 45_000);
+    return () => window.clearInterval(interval);
+  }, [user?.id]);
+
+  const markNotificationRead = async (id: string) => {
+    try { await api(`/api/notifications/${id}/read`, { method: "PATCH" }); await refreshNotifications(); }
+    catch (cause) { setToast(cause instanceof Error ? cause.message : "Could not update notification"); }
+  };
+
+  const markAllNotificationsRead = async () => {
+    try { await api("/api/notifications/read-all", { method: "PATCH" }); await refreshNotifications(); }
+    catch (cause) { setToast(cause instanceof Error ? cause.message : "Could not update notifications"); }
+  };
 
   const reloadWorkspace = async () => {
     setAuthLoading(true);
@@ -112,7 +140,7 @@ export default function App() {
     if (["employees", "leave"].includes(item.id)) return userPermissions.has("employees.view");
     if (item.id === "payroll") return userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") || userPermissions.has("payroll.self.view");
     if (item.id === "expenses") return userPermissions.has("expenses.view") || userPermissions.has("expenses.manage");
-    if (item.id === "requests") return userPermissions.has("requests.manage");
+    if (item.id === "requests") return userPermissions.has("requests.manage") || userPermissions.has("employees.view");
     if (["dashboard", "reports"].includes(item.id)) return userPermissions.has("employees.view") || userPermissions.has("operations.view");
     return userPermissions.has("operations.view");
   });
@@ -172,7 +200,7 @@ export default function App() {
       <main className="main-content">
         <header className="topbar">
           <div className="topbar-left"><button className="icon-button mobile-menu" onClick={() => setMobileNav(true)}><Menu size={20} /></button><button className="collapse-button" onClick={() => setCollapsed(!collapsed)} aria-label="Toggle sidebar">{collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}</button><div className="breadcrumb"><span>Workspace</span><ChevronLeft size={14} className="breadcrumb-chevron" /><strong>{currentLabel}</strong></div></div>
-          <div className="topbar-actions"><button className="search-trigger" onClick={() => setToast("Global search is ready for employees, tasks, documents and more")}><Search size={17} /><span>Search anything</span><kbd>⌘ K</kbd></button><button className="icon-button notification-button" onClick={() => setToast("You have 3 unread notifications")}><Bell size={18} /><span className="notification-dot"></span></button><div className="topbar-divider"></div><button className="profile-chip" onClick={async () => { await api("/api/auth/logout", { method: "POST" }); setUser(null); }}><div className="avatar avatar-sm">{user.fullName.split(/\s+/).slice(0, 2).map((part) => part[0]).join("").toUpperCase()}</div><span>{user.fullName.split(" ")[0]}</span><ChevronDown size={14} /></button></div>
+          <div className="topbar-actions"><button className="search-trigger" onClick={() => setToast("Global search is ready for employees, tasks, documents and more")}><Search size={17} /><span>Search anything</span><kbd>⌘ K</kbd></button><div className="notification-wrap"><button className="icon-button notification-button" aria-label={`Notifications, ${unreadNotifications} unread`} aria-expanded={notificationOpen} onClick={() => { setNotificationOpen(!notificationOpen); if (!notificationOpen) void refreshNotifications(); }}><Bell size={18} />{unreadNotifications > 0 && <span className="notification-count">{unreadNotifications > 9 ? "9+" : unreadNotifications}</span>}</button>{notificationOpen && <section className="notification-popover"><div className="notification-heading"><div><strong>Notifications</strong><span>{unreadNotifications ? `${unreadNotifications} unread` : "All caught up"}</span></div>{unreadNotifications > 0 && <button onClick={() => void markAllNotificationsRead()}>Mark all read</button>}</div><div className="notification-list">{notifications.length ? notifications.map((item) => <button className={`notification-item ${item.readAt ? "is-read" : ""}`} key={item.id} onClick={() => { if (!item.readAt) void markNotificationRead(item.id); }}><span className="notification-indicator"><Bell size={14} /></span><span className="notification-copy"><strong>{item.title}</strong><span>{item.body}</span><small>{new Date(item.createdAt).toLocaleString()}</small></span></button>) : <div className="notification-empty">No notifications yet. New approvals will appear here.</div>}</div></section>}</div><div className="topbar-divider"></div><button className="profile-chip" onClick={async () => { await api("/api/auth/logout", { method: "POST" }); setUser(null); }}><div className="avatar avatar-sm">{user.fullName.split(/\s+/).slice(0, 2).map((part) => part[0]).join("").toUpperCase()}</div><span>{user.fullName.split(" ")[0]}</span><ChevronDown size={14} /></button></div>
         </header>
 
         <div className="page-wrap">

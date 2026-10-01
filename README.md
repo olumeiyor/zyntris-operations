@@ -13,7 +13,9 @@ Cloudflare-native operations SaaS for **Zyntris — One Platform. Every Operatio
 - Organization profile, time zone, and currency settings stored in D1.
 - Remuneration records: employee compensation profiles, recurring earnings/deductions, configurable tax/contribution bands, draft calculations, review/approval, employee self-service payslips and payroll-register CSV. Payroll-authorized admins can collect bank details encrypted at rest for record keeping (masked in the UI); no payout files or bank transfers are initiated, and “paid” is a manual record status only.
 - HR-controlled employee onboarding with tenant-scoped department/team profiles, assigned access roles, Brevo email invitations, single-use 72-hour account-setup links, and resend support. Requesters receive Brevo email notices when a request or payroll run is approved.
-- Server-enforced role/permission access for HR and operations modules, with employee self-scoping on expense/request records; CEO approval escalation for expense claims above ₦1m.
+- Server-enforced role/permission access for HR and operations modules, with employee self-scoping on expense/request records; every financial request requires CEO approval.
+- Persistent user-and-tenant-scoped in-app notifications and Brevo email to each assigned approver when an expense, operational request, or payroll review is awaiting action.
+- Separate Expo / React Native iOS and Android app in [`mobile/`](mobile/README.md). It uses a mobile-only bearer-token API prefix and does not enter the Cloudflare web build.
 - Read-only platform administration for onboarded organization and audit-activity summaries, restricted to explicitly allowlisted verified accounts.
 - Password-gated, read-only demo sandbox backed only by fictional demo-tenant records.
 - Custom Domain configuration for `app.zyntris.org`.
@@ -106,6 +108,7 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 ## Operational workflows now included
 
 - Expense submission creates a D1 expense record and a linked approval request.
+- General operational requests can be submitted from web or mobile; financial requests are routed to the CEO, and other requests to their selected role. Approvers are alerted through both email and the in-app inbox.
 - Approval decisions update both the request and its source expense, and write to the audit log.
 - Asset register supports ownership, location, lifecycle status and current value.
 - Vendor register surfaces contract expiry and spend risk.

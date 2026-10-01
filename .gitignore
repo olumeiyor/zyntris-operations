@@ -7,3 +7,9 @@ dist
 !.env.example
 coverage
 *.log
+mobile/.expo
+mobile/android
+mobile/ios
+mobile/dist
+mobile/*.apk
+mobile/*.aab
