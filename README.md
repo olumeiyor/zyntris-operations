@@ -12,7 +12,7 @@ Cloudflare-native operations SaaS for **Zyntris — One Platform. Every Operatio
 - Organization registration with verified-email activation, tenant-specific administrator membership, and a 30-day trial.
 - Organization profile, time zone, and currency settings stored in D1.
 - Remuneration records: employee compensation profiles, recurring earnings/deductions, configurable tax/contribution bands, draft calculations, review/approval, employee self-service payslips and payroll-register CSV. Payroll-authorized admins can collect bank details encrypted at rest for record keeping (masked in the UI); no payout files or bank transfers are initiated, and “paid” is a manual record status only.
-- HR-controlled employee onboarding with tenant-scoped department/team profiles, assigned access roles, Brevo email invitations, single-use 72-hour account-setup links, and resend support.
+- HR-controlled employee onboarding with tenant-scoped department/team profiles, assigned access roles, Brevo email invitations, single-use 72-hour account-setup links, and resend support. Requesters receive Brevo email notices when a request or payroll run is approved.
 - Server-enforced role/permission access for HR and operations modules, with employee self-scoping on expense/request records; CEO approval escalation for expense claims above ₦1m.
 - Read-only platform administration for onboarded organization and audit-activity summaries, restricted to explicitly allowlisted verified accounts.
 - Password-gated, read-only demo sandbox backed only by fictional demo-tenant records.

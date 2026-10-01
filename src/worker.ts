@@ -198,6 +198,35 @@ async function sendEmployeeInviteEmail(env: Env, email: string, fullName: string
   return response.ok;
 }
 
+async function sendApprovalNotificationEmail(env: Env, email: string, fullName: string, organizationName: string, subject: string, message: string) {
+  if (!env.BREVO_API_KEY) return false;
+  const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[char] || char);
+  const configuredSender = env.EMAIL_SENDER || "Zyntris <no-reply@zyntris.org>";
+  const senderMatch = configuredSender.match(/^\s*(.*?)\s*<([^<>]+)>\s*$/);
+  const sender = senderMatch ? { name: senderMatch[1] || "Zyntris", email: senderMatch[2] } : { name: "Zyntris", email: configuredSender.trim() };
+  const safeName = escapeHtml(fullName);
+  const safeOrganization = escapeHtml(organizationName);
+  const safeMessage = escapeHtml(message);
+  try {
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: { "api-key": env.BREVO_API_KEY, "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({
+        sender,
+        to: [{ email, name: fullName }],
+        subject,
+        textContent: `Hello ${fullName},\n\n${message}\n\nSign in to your ${organizationName} workspace: ${env.APP_ORIGIN}`,
+        htmlContent: `<p>Hello ${safeName},</p><p>${safeMessage}</p><p>Sign in to your <strong>${safeOrganization}</strong> workspace to view the details.</p><p><a href="${env.APP_ORIGIN}">Open Zyntris</a></p>`,
+      }),
+    });
+    if (!response.ok) console.warn("Brevo rejected an approval notification", response.status);
+    return response.ok;
+  } catch (cause) {
+    console.warn("Could not deliver an approval notification", cause);
+    return false;
+  }
+}
+
 async function handlePublicAuth(request: Request, env: Env, path: string): Promise<Response | null> {
   if (request.method === "GET" && path === "/api/auth/config") return json({ emailVerificationEnabled: Boolean(env.BREVO_API_KEY), demoEnabled: Boolean(env.DEMO_ACCESS_PASSWORD) });
   if (request.method === "POST" && path === "/api/auth/accept-invite") {
@@ -693,6 +722,10 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       .bind(...(actorColumn ? [next, context.userId, payrollRunMatch[1], context.organizationId, transition[body.action]] : [next, payrollRunMatch[1], context.organizationId, transition[body.action]])).run();
     if (!result.meta.changes) return error("That payroll transition is not allowed from the current status.", 409);
     await audit(env, context, body.action, "payroll_runs", payrollRunMatch[1]);
+    if (body.action === "approve") {
+      const payrollNotice = await env.DB.prepare(`SELECT u.email, u.full_name as fullName, o.name as organizationName, r.period_start as periodStart, r.period_end as periodEnd FROM payroll_runs r JOIN users u ON u.id = r.created_by JOIN organizations o ON o.id = r.organization_id WHERE r.id = ? AND r.organization_id = ?`).bind(payrollRunMatch[1], context.organizationId).first<{ email: string; fullName: string; organizationName: string; periodStart: string; periodEnd: string }>();
+      if (payrollNotice) await sendApprovalNotificationEmail(env, payrollNotice.email, payrollNotice.fullName, payrollNotice.organizationName, "Payroll record approved", `Your payroll record for ${payrollNotice.periodStart} to ${payrollNotice.periodEnd} has received final CEO approval.`);
+    }
     return json({ ok: true, status: next });
   }
 
@@ -829,7 +862,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const body = await request.json<{ status?: string }>();
     if (!body.status || !["approved", "rejected", "paid", "cancelled"].includes(body.status)) return error("A valid request status is required");
     const requestIdValue = requestMatch[1];
-    const item = await env.DB.prepare(`SELECT source_record_id as sourceRecordId, request_type as requestType, required_role as requiredRole, amount, current_step as currentStep, status FROM approval_requests WHERE id = ? AND organization_id = ?`).bind(requestIdValue, context.organizationId).first<{ sourceRecordId: string | null; requestType: string; requiredRole: string; amount: number | null; currentStep: number; status: string }>();
+    const item = await env.DB.prepare(`SELECT source_record_id as sourceRecordId, requester_id as requesterId, title, request_type as requestType, required_role as requiredRole, amount, current_step as currentStep, status FROM approval_requests WHERE id = ? AND organization_id = ?`).bind(requestIdValue, context.organizationId).first<{ sourceRecordId: string | null; requesterId: string; title: string; requestType: string; requiredRole: string; amount: number | null; currentStep: number; status: string }>();
     if (!item) return error("Request not found.", 404);
     if (item.status !== "pending") return error("This request has already been decided.", 409);
     const financialTypes = ["expense", "purchase", "budget", "payroll", "reimbursement", "payment", "financial", "asset purchase"];
@@ -844,6 +877,10 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       ...(item.sourceRecordId ? [env.DB.prepare(`UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.status, item.sourceRecordId, context.organizationId)] : []),
     ]);
     await audit(env, context, body.status, "requests", requestIdValue, { role: context.role, stage: item.currentStep });
+    if (body.status === "approved") {
+      const requester = await env.DB.prepare(`SELECT u.email, u.full_name as fullName, o.name as organizationName FROM users u JOIN organizations o ON o.id = ? WHERE u.id = ?`).bind(context.organizationId, item.requesterId).first<{ email: string; fullName: string; organizationName: string }>();
+      if (requester) await sendApprovalNotificationEmail(env, requester.email, requester.fullName, requester.organizationName, "Your Zyntris request was approved", `Your ${item.requestType.toLowerCase()} request “${item.title}” has been approved.`);
+    }
     return json({ ok: true, id: requestIdValue, status: body.status });
   }
 
