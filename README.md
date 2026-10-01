@@ -1,5 +1,7 @@
 # Zyntris Operations Platform
 
+Repository: `zyntris-operations` — Zyntris Operation
+
 Cloudflare-native operations SaaS for **Zyntris — One Platform. Every Operation.**
 
 - React/Vite responsive operations workspace with a premium enterprise UI.
