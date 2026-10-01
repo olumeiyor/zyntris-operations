@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 64" role="img" aria-labelledby="title desc">
+  <title id="title">Zyntris</title>
+  <desc id="desc">Zyntris — One Platform. Every Operation.</desc>
+  <defs>
+    <linearGradient id="z" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#78B5FF"/><stop offset="1" stop-color="#2F73EF"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="18" fill="#0D1B34"/>
+  <path d="M17 18h30v8L27 40h20v7H17v-8l20-14H17v-7Z" fill="url(#z)"/>
+  <circle cx="48" cy="17" r="4" fill="#79D7C2"/>
+  <text x="79" y="38" fill="#fff" font-family="Manrope, Arial, sans-serif" font-size="28" font-weight="800" letter-spacing="-1.2">zyntris</text>
+  <circle cx="190" cy="17" r="4" fill="#79D7C2"/>
+</svg>

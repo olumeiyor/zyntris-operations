@@ -1,0 +1,25 @@
+.platform-admin { display: grid; gap: 20px; }
+.platform-admin .page-header { align-items: flex-end; }
+.platform-admin .page-header p { margin-bottom: 0; }
+.platform-privacy { display: flex; align-items: center; gap: 10px; padding: 13px 15px; border: 1px solid #dce7e8; border-radius: 10px; background: #f3f8f7; color: #39555c; font-size: 13px; line-height: 1.5; }
+.platform-privacy svg { flex: none; color: #34846e; }
+.platform-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 14px; }
+.platform-stat { display: grid; gap: 8px; padding: 18px; }
+.platform-stat>span { display: grid; width: 32px; height: 32px; place-items: center; border-radius: 9px; background: #eef4f3; color: #244c54; }
+.platform-stat small { color: #73858c; font-size: 12px; }
+.platform-stat strong { color: #122a35; font-size: 25px; letter-spacing: -.04em; }
+.platform-stat em { color: #73858c; font-size: 12px; font-style: normal; }
+.platform-card { overflow: hidden; }
+.platform-card .card-heading { gap: 18px; }
+.platform-search { display: flex; align-items: center; gap: 8px; max-width: 330px; padding: 6px 8px 6px 11px; border: 1px solid #dce5e7; border-radius: 8px; background: #fff; color: #71828a; }
+.platform-search input { min-width: 80px; width: 100%; border: 0; outline: 0; color: #132633; font: inherit; font-size: 13px; }
+.platform-search button { padding: 7px 10px; border: 0; border-radius: 6px; background: #0d3445; color: #fff; font-size: 12px; font-weight: 700; }
+.platform-org-meta { display: block; margin-top: 4px; color: #7a8b91; font-size: 12px; }
+.platform-status { display: inline-flex; padding: 5px 8px; border-radius: 99px; background: #eef2f3; color: #53656a; font-size: 11px; font-weight: 750; text-transform: capitalize; }
+.platform-status.active, .platform-status.trialing { background: #e8f4ee; color: #247556; }
+.platform-status.suspended { background: #fbebea; color: #a4423b; }
+.platform-empty { padding: 26px !important; color: #75858b; text-align: center; }
+.platform-more { display: flex; justify-content: center; padding: 14px; }
+.platform-error { padding: 12px 14px; border: 1px solid #f0c5bf; border-radius: 8px; background: #fff4f2; color: #a1382d; font-size: 13px; }
+@media (max-width: 900px) { .platform-stats { grid-template-columns: repeat(2, minmax(0,1fr)); } .platform-card .card-heading { align-items: flex-start; flex-direction: column; } }
+@media (max-width: 560px) { .platform-stats { grid-template-columns: 1fr 1fr; gap: 9px; } .platform-stat { padding: 13px; } .platform-stat strong { font-size: 21px; } .platform-search { max-width: none; width: 100%; } }

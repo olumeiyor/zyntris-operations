@@ -1,0 +1,7 @@
+SESSION_SECRET="replace-with-a-long-random-secret"
+BREVO_API_KEY="replace-with-brevo-api-key"
+EMAIL_SENDER="Zyntris <no-reply@your-verified-domain.example>"
+APP_ORIGIN="http://localhost:5173"
+ENVIRONMENT="development"
+PLATFORM_ADMIN_EMAILS="verified-platform-admin@your-domain.example"
+DEMO_ACCESS_PASSWORD="replace-with-a-long-random-demo-password"

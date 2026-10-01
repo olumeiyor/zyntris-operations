@@ -1,0 +1,43 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "zyntris-operations",
+	"main": "src/worker.ts",
+	"compatibility_date": "2026-09-28",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+  "workers_dev": true,
+  "preview_urls": false,
+	"routes": [
+		{
+			"pattern": "app.zyntris.org",
+			"custom_domain": true
+		}
+	],
+	"assets": {
+		"directory": "./dist",
+		"binding": "ASSETS",
+		"not_found_handling": "single-page-application",
+		"run_worker_first": [
+			"/api/*"
+		]
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "zyntris-prod",
+			"database_id": "361a12bd-4673-4727-af18-460cf7944ab1",
+			"migrations_dir": "migrations"
+		}
+	],
+	"r2_buckets": [
+		{
+			"binding": "FILES",
+			"bucket_name": "zyntris-files"
+		}
+	],
+	"vars": {
+		"APP_ORIGIN": "https://app.zyntris.org",
+		"ENVIRONMENT": "production"
+	}
+}
