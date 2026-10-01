@@ -686,6 +686,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!body.action || !transition[body.action]) return error("Choose review, approve, pay or void.");
     const required = body.action === "review" ? "payroll.run" : "payroll.approve";
     if (!hasPermission(context, required)) return error("You do not have permission for this payroll action.", 403);
+    if (body.action === "approve" && context.role !== "CEO") return error("Only the CEO can give final approval to a payroll run.", 403);
     const actorColumn = body.action === "review" ? "reviewed_by" : body.action === "approve" ? "approved_by" : body.action === "pay" ? "paid_by" : null;
     const next = body.action === "review" ? "reviewed" : body.action === "approve" ? "approved" : body.action === "pay" ? "paid" : "void";
     const result = await env.DB.prepare(`UPDATE payroll_runs SET status = ?, ${actorColumn ? `${actorColumn} = ?,` : ""} updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = ?`)
@@ -804,7 +805,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const requestIdValue = `request-${crypto.randomUUID().slice(0, 8)}`;
     await env.DB.batch([
       env.DB.prepare(`INSERT INTO expenses (id, organization_id, employee_id, category, amount, currency, expense_date, description, status) VALUES (?, ?, ?, ?, ?, 'NGN', ?, ?, 'submitted')`).bind(id, context.organizationId, employeeId, body.category, amount, body.expenseDate, body.description),
-      env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'Finance Admin', 'pending', 1, ?)`).bind(requestIdValue, context.organizationId, id, body.description, context.userId, amount, JSON.stringify({ category: body.category, project: body.project || null, approvalPolicy: amount > 1000000 ? ["Finance Admin", "CEO"] : ["Finance Admin"] })),
+      env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'CEO', 'pending', 1, ?)`).bind(requestIdValue, context.organizationId, id, body.description, context.userId, amount, JSON.stringify({ category: body.category, project: body.project || null, approvalPolicy: ["CEO"] })),
     ]);
     await audit(env, context, "submitted", "expenses", id, { category: body.category, amount, description: body.description });
     return json({ id, requestId: requestIdValue, status: "submitted" }, { status: 201 });
@@ -828,18 +829,16 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const body = await request.json<{ status?: string }>();
     if (!body.status || !["approved", "rejected", "paid", "cancelled"].includes(body.status)) return error("A valid request status is required");
     const requestIdValue = requestMatch[1];
-    const item = await env.DB.prepare(`SELECT source_record_id as sourceRecordId, required_role as requiredRole, amount, current_step as currentStep, status FROM approval_requests WHERE id = ? AND organization_id = ?`).bind(requestIdValue, context.organizationId).first<{ sourceRecordId: string | null; requiredRole: string; amount: number | null; currentStep: number; status: string }>();
+    const item = await env.DB.prepare(`SELECT source_record_id as sourceRecordId, request_type as requestType, required_role as requiredRole, amount, current_step as currentStep, status FROM approval_requests WHERE id = ? AND organization_id = ?`).bind(requestIdValue, context.organizationId).first<{ sourceRecordId: string | null; requestType: string; requiredRole: string; amount: number | null; currentStep: number; status: string }>();
     if (!item) return error("Request not found.", 404);
     if (item.status !== "pending") return error("This request has already been decided.", 409);
-    const executiveOverride = context.role === "Organization Admin" || context.role === "CEO";
+    const financialTypes = ["expense", "purchase", "budget", "payroll", "reimbursement", "payment", "financial", "asset purchase"];
+    const isFinancialRequest = item.amount !== null || financialTypes.includes(item.requestType.trim().toLowerCase());
+    const requiredRole = isFinancialRequest ? "CEO" : item.requiredRole;
     if (body.status === "approved" || body.status === "rejected") {
-      if (!executiveOverride && context.role !== item.requiredRole) return error(`This step requires approval from ${item.requiredRole}.`, 403);
+      const organizationAdminMayDecide = !isFinancialRequest && context.role === "Organization Admin";
+      if (context.role !== requiredRole && !organizationAdminMayDecide) return error(`This request requires approval from ${requiredRole}.`, 403);
     } else if (body.status === "paid" && !hasPermission(context, "expenses.manage")) return error("Finance permission is required to mark a claim as paid.", 403);
-    if (body.status === "approved" && item.amount !== null && item.amount > 1000000 && item.currentStep === 1 && context.role !== "CEO" && context.role !== "Organization Admin") {
-      await env.DB.prepare(`UPDATE approval_requests SET required_role = 'CEO', current_step = 2, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'pending'`).bind(requestIdValue, context.organizationId).run();
-      await audit(env, context, "finance_reviewed_escalated", "requests", requestIdValue, { nextRole: "CEO" });
-      return json({ ok: true, id: requestIdValue, status: "pending", requiredRole: "CEO", nextStep: true });
-    }
     await env.DB.batch([
       env.DB.prepare(`UPDATE approval_requests SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'pending'`).bind(body.status, requestIdValue, context.organizationId),
       ...(item.sourceRecordId ? [env.DB.prepare(`UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.status, item.sourceRecordId, context.organizationId)] : []),

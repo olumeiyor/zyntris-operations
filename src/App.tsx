@@ -183,10 +183,10 @@ export default function App() {
           {page === "leave" && <Leave requests={leave} onToast={setToast} />}
           {page === "tasks" && <Tasks tasks={tasks} onToast={setToast} />}
           {page === "projects" && <Projects onToast={setToast} />}
-          {(["expenses", "requests", "budgets", "assets", "vendors", "helpdesk", "calendar", "customers"] as PageId[]).includes(page) && <OperationalWorkspace page={page} onToast={setToast} />}
+          {(["expenses", "requests", "budgets", "assets", "vendors", "helpdesk", "calendar", "customers"] as PageId[]).includes(page) && <OperationalWorkspace page={page} role={user.role} onToast={setToast} />}
           {page === "documents" && <Documents onUpload={() => setShowUpload(true)} onToast={setToast} />}
           {page === "reports" && <Reports onToast={setToast} />}
-          {page === "payroll" && (userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") ? <PayrollWorkspace onToast={setToast} readOnly={Boolean(user.isDemo)} /> : <EmployeePayslips />)}
+          {page === "payroll" && (userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") ? <PayrollWorkspace onToast={setToast} role={user.role} readOnly={Boolean(user.isDemo)} /> : <EmployeePayslips />)}
           {page === "settings" && <OrganizationSettings onToast={setToast} />}
           {page === "platform" && user.isPlatformAdmin && <PlatformAdminWorkspace />}
         </div>

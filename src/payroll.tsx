@@ -21,7 +21,7 @@ const monthStart = () => `${today().slice(0, 8)}01`;
 const monthEnd = () => { const now = new Date(); return new Date(now.getFullYear(), now.getMonth() + 1, 0).toISOString().slice(0, 10); };
 const body = (values: Record<string, FormDataEntryValue>) => Object.fromEntries(Object.entries(values).map(([key, value]) => [key, String(value)]));
 
-export function PayrollWorkspace({ onToast, readOnly = false }: { onToast: (message: string) => void; readOnly?: boolean }) {
+export function PayrollWorkspace({ onToast, role, readOnly = false }: { onToast: (message: string) => void; role: string; readOnly?: boolean }) {
   const [tab, setTab] = useState<"overview" | "employees" | "components" | "runs" | "settings">("overview");
   const [settings, setSettings] = useState<Settings | null>(null);
   const [profiles, setProfiles] = useState<Profile[]>([]);
@@ -34,6 +34,7 @@ export function PayrollWorkspace({ onToast, readOnly = false }: { onToast: (mess
   const [modal, setModal] = useState<"profile" | "component" | "assign" | "run" | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const isCeo = role === "CEO";
 
   const refresh = useCallback(async () => {
     const [policy, employeeData, componentData, runData] = await Promise.all([
@@ -85,6 +86,7 @@ export function PayrollWorkspace({ onToast, readOnly = false }: { onToast: (mess
 
   const runAction = async (action: string) => {
     if (!selectedRun) return;
+    if (action === "approve" && !isCeo) { onToast("Only the CEO can give final approval to a payroll run."); return; }
     setSaving(true); setError("");
     try { await payrollApi(`/api/payroll/runs/${selectedRun.id}/action`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action }) }); await refresh(); await openRun({ ...selectedRun, status: action === "review" ? "reviewed" : action === "approve" ? "approved" : action === "pay" ? "paid" : "void" }); onToast(`Payroll ${({ review: "marked reviewed", approve: "approved", pay: "marked paid", void: "voided" } as Record<string, string>)[action]}`); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Payroll action failed."); }

@@ -52,9 +52,9 @@ export const demoExpenses: Expense[] = [
 ];
 
 export const demoRequests: ApprovalRequest[] = [
-  { id: "request-001", requestType: "Expense", title: "Developer tooling renewal", requester: "Daniel Adeyemi", amount: 185000, status: "pending", requiredRole: "Finance Admin", createdAt: "24 min ago" },
+  { id: "request-001", requestType: "Expense", title: "Developer tooling renewal", requester: "Daniel Adeyemi", amount: 185000, status: "pending", requiredRole: "CEO", createdAt: "24 min ago" },
   { id: "request-002", requestType: "Leave", title: "Personal time · 05–06 Oct", requester: "Tunde Bello", status: "pending", requiredRole: "Manager", createdAt: "1 hr ago" },
-  { id: "request-003", requestType: "Purchase", title: "Customer workshop equipment", requester: "Fatima Musa", amount: 760000, status: "approved", requiredRole: "Finance Admin", createdAt: "Yesterday" },
+  { id: "request-003", requestType: "Purchase", title: "Customer workshop equipment", requester: "Fatima Musa", amount: 760000, status: "approved", requiredRole: "CEO", createdAt: "Yesterday" },
   { id: "request-004", requestType: "Document", title: "Vendor master agreement", requester: "Ifeanyi Obi", status: "pending", requiredRole: "Organization Admin", createdAt: "Yesterday" },
 ];
 
