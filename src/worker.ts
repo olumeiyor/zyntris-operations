@@ -106,16 +106,92 @@ function randomToken(bytes = 32) {
 
 async function passwordHash(password: string, salt = randomToken(16)) {
   const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
-  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: 120000 }, material, 256);
+  // Cloudflare Workers WebCrypto rejects PBKDF2 iteration counts above 100,000.
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: 100000 }, material, 256);
   const digest = [...new Uint8Array(bits)].map((part) => part.toString(16).padStart(2, "0")).join("");
-  return `pbkdf2-sha256$120000$${salt}$${digest}`;
+  return `pbkdf2-sha256$100000$${salt}$${digest}`;
 }
 
 async function verifyPassword(password: string, encoded: string) {
   const [algorithm, rounds, salt, expected] = encoded.split("$");
-  if (algorithm !== "pbkdf2-sha256" || rounds !== "120000" || !salt || !expected) return false;
+  if (algorithm !== "pbkdf2-sha256" || rounds !== "100000" || !salt || !expected) return false;
   const actual = await passwordHash(password, salt);
   return safeEqual(actual.split("$")[3] || "", expected);
+}
+
+function base32Encode(bytes: Uint8Array) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0, value = 0, output = "";
+  for (const byte of bytes) {
+    value = (value << 8) | byte; bits += 8;
+    while (bits >= 5) { output += alphabet[(value >>> (bits - 5)) & 31]; bits -= 5; }
+  }
+  if (bits) output += alphabet[(value << (5 - bits)) & 31];
+  return output;
+}
+
+function base32Decode(value: string) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  let bits = 0, buffer = 0;
+  const output: number[] = [];
+  for (const char of value.toUpperCase().replace(/=+$/g, "")) {
+    const index = alphabet.indexOf(char);
+    if (index < 0) throw new Error("Invalid authenticator secret");
+    buffer = (buffer << 5) | index; bits += 5;
+    if (bits >= 8) { output.push((buffer >>> (bits - 8)) & 255); bits -= 8; }
+  }
+  return new Uint8Array(output);
+}
+
+async function encryptTwoFactorSecret(env: Env, secret: string) {
+  if (!env.SESSION_SECRET) throw new Error("Two-factor encryption secret is unavailable.");
+  const rawKey = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`zyntris/totp/v1:${env.SESSION_SECRET}`));
+  const key = await crypto.subtle.importKey("raw", rawKey, { name: "AES-GCM" }, false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(secret));
+  const bytes = new Uint8Array(iv.length + encrypted.byteLength); bytes.set(iv); bytes.set(new Uint8Array(encrypted), iv.length);
+  return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function decryptTwoFactorSecret(env: Env, ciphertext: string) {
+  if (!env.SESSION_SECRET || !/^(?:[0-9a-f]{2})+$/.test(ciphertext)) throw new Error("Two-factor encryption key is unavailable or data is malformed.");
+  const rawKey = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`zyntris/totp/v1:${env.SESSION_SECRET}`));
+  const key = await crypto.subtle.importKey("raw", rawKey, { name: "AES-GCM" }, false, ["decrypt"]);
+  const bytes = new Uint8Array(ciphertext.match(/.{2}/g)!.map((byte) => Number.parseInt(byte, 16)));
+  const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12) }, key, bytes.slice(12));
+  return new TextDecoder().decode(decrypted);
+}
+
+async function matchTotp(secret: string, input: string) {
+  const code = input.replace(/\s+/g, "");
+  if (!/^\d{6}$/.test(code)) return null;
+  const key = await crypto.subtle.importKey("raw", base32Decode(secret), { name: "HMAC", hash: "SHA-1" }, false, ["sign"]);
+  const now = Math.floor(Date.now() / 30_000);
+  for (const counter of [now - 1, now, now + 1]) {
+    const message = new Uint8Array(8);
+    let remaining = counter;
+    for (let index = 7; index >= 0; index -= 1) { message[index] = remaining & 255; remaining = Math.floor(remaining / 256); }
+    const digest = new Uint8Array(await crypto.subtle.sign("HMAC", key, message));
+    const offset = digest[digest.length - 1] & 15;
+    const number = (((digest[offset] & 127) << 24) | (digest[offset + 1] << 16) | (digest[offset + 2] << 8) | digest[offset + 3]) % 1_000_000;
+    if (safeEqual(String(number).padStart(6, "0"), code)) return counter;
+  }
+  return null;
+}
+
+function makeRecoveryCodes() {
+  return Array.from({ length: 10 }, () => {
+    const raw = randomToken(5).toUpperCase();
+    return `${raw.slice(0, 5)}-${raw.slice(5)}`;
+  });
+}
+
+async function issueTwoFactorChallenge(env: Env, userId: string, organizationId: string, mobile: boolean) {
+  const token = randomToken();
+  await env.DB.prepare(`DELETE FROM two_factor_challenges WHERE expires_at <= CURRENT_TIMESTAMP OR created_at < datetime('now', '-1 day')`).run();
+  await env.DB.prepare(`INSERT INTO two_factor_challenges (id, token_hash, user_id, organization_id, is_mobile, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', '+5 minutes'))`)
+    .bind(requestId(), await hashToken(token), userId, organizationId, mobile ? 1 : 0).run();
+  return json({ twoFactorRequired: true, challengeToken: token, expiresIn: 300 });
 }
 
 async function encryptBankDetails(env: Env, details: { bankName: string; accountName: string; accountNumber: string }) {
@@ -248,7 +324,7 @@ async function notifyApprovers(env: Env, context: AuthContext, requiredRole: str
   if (organization) await Promise.all(targets.map((approver) => sendApprovalNotificationEmail(env, approver.email, approver.fullName, organization.name, `Approval pending: ${subjectTitle}`, details)));
 }
 
-async function handlePublicAuth(request: Request, env: Env, path: string): Promise<Response | null> {
+async function handlePublicAuth(request: Request, env: Env, path: string, mobile = false): Promise<Response | null> {
   if (request.method === "GET" && path === "/api/auth/config") return json({ emailVerificationEnabled: Boolean(env.BREVO_API_KEY), demoEnabled: Boolean(env.DEMO_ACCESS_PASSWORD) });
   if (request.method === "POST" && path === "/api/auth/accept-invite") {
     if (!originAllowed(request, env)) return error("Request origin rejected", 403);
@@ -354,6 +430,40 @@ async function handlePublicAuth(request: Request, env: Env, path: string): Promi
     const session = await createSession(env, row.userId, row.organizationId);
     return cookieResponse({ ok: true }, session);
   }
+  if (request.method === "POST" && path === "/api/auth/2fa/verify") {
+    if (!mobile && !originAllowed(request, env)) return error("Request origin rejected", 403);
+    if (!(await consumeAuthLimit(env, request, "2fa-verify", 12, 15))) return error("Too many verification attempts. Try again later.", 429);
+    const body = await request.json<{ challengeToken?: string; code?: string }>();
+    if (!body.challengeToken || body.challengeToken.length !== 64 || !body.code || body.code.length > 32) return error("Enter your six-digit authenticator code or a recovery code.");
+    const challenge = await env.DB.prepare(`SELECT id, user_id as userId, organization_id as organizationId, is_mobile as isMobile, attempts FROM two_factor_challenges WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP LIMIT 1`)
+      .bind(await hashToken(body.challengeToken)).first<{ id: string; userId: string; organizationId: string; isMobile: number; attempts: number }>();
+    if (!challenge || challenge.isMobile !== (mobile ? 1 : 0)) return error("This sign-in challenge is invalid or expired. Sign in again.", 401);
+    if (challenge.attempts >= 5) { await env.DB.prepare(`DELETE FROM two_factor_challenges WHERE id = ?`).bind(challenge.id).run(); return error("Too many incorrect codes. Sign in again.", 429); }
+    const factor = await env.DB.prepare(`SELECT secret_enc as secretEnc, enabled_at as enabledAt, last_counter as lastCounter FROM user_two_factor WHERE user_id = ?`).bind(challenge.userId).first<{ secretEnc: string | null; enabledAt: string | null; lastCounter: number }>();
+    let valid = false;
+    if (factor?.enabledAt && factor.secretEnc && /^\d{6}$/.test(body.code.replace(/\s+/g, ""))) {
+      const counter = await matchTotp(await decryptTwoFactorSecret(env, factor.secretEnc), body.code);
+      if (counter !== null && counter > factor.lastCounter) {
+        const saved = await env.DB.prepare(`UPDATE user_two_factor SET last_counter = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND last_counter < ? AND enabled_at IS NOT NULL`).bind(counter, challenge.userId, counter).run();
+        valid = saved.meta.changes > 0;
+      }
+    } else if (factor?.enabledAt && !/^\d{6}$/.test(body.code.replace(/\s+/g, ""))) {
+      const normalized = body.code.replace(/-/g, "").trim().toLowerCase();
+      if (/^[a-f0-9]{10}$/.test(normalized)) {
+        const recovery = await env.DB.prepare(`UPDATE two_factor_recovery_codes SET used_at = CURRENT_TIMESTAMP WHERE user_id = ? AND code_hash = ? AND used_at IS NULL`).bind(challenge.userId, await hashToken(normalized)).run();
+        valid = recovery.meta.changes > 0;
+      }
+    }
+    if (!valid) {
+      await env.DB.prepare(`UPDATE two_factor_challenges SET attempts = attempts + 1 WHERE id = ?`).bind(challenge.id).run();
+      return error("The verification code is incorrect or has already been used.", 401);
+    }
+    await env.DB.prepare(`DELETE FROM two_factor_challenges WHERE id = ?`).bind(challenge.id).run();
+    await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type) VALUES (?, ?, ?, 'signed_in_with_two_factor', 'authentication', ?)`)
+      .bind(`audit-${crypto.randomUUID()}`, challenge.organizationId, challenge.userId, mobile ? "mobile_session" : "session").run();
+    const session = await createSession(env, challenge.userId, challenge.organizationId);
+    return mobile ? json({ accessToken: session, tokenType: "Bearer", expiresIn: 43200 }) : cookieResponse({ ok: true }, session);
+  }
   if (request.method === "POST" && path === "/api/auth/login") {
     if (!originAllowed(request, env)) return error("Request origin rejected", 403);
     if (!(await consumeAuthLimit(env, request, "login", 20, 15))) return error("Too many sign-in attempts. Try again later.", 429);
@@ -364,6 +474,8 @@ async function handlePublicAuth(request: Request, env: Env, path: string): Promi
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
     const membership = await env.DB.prepare(`SELECT organization_id as organizationId FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created_at LIMIT 1`).bind(user.id).first<{ organizationId: string }>();
     if (!membership) return error("No active organization is linked to this account.", 403);
+    const factor = await env.DB.prepare(`SELECT enabled_at as enabledAt FROM user_two_factor WHERE user_id = ?`).bind(user.id).first<{ enabledAt: string | null }>();
+    if (factor?.enabledAt) return issueTwoFactorChallenge(env, user.id, membership.organizationId, false);
     await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type) VALUES (?, ?, ?, 'signed_in', 'authentication', 'session')`)
       .bind(`audit-${crypto.randomUUID()}`, membership.organizationId, user.id).run();
     const session = await createSession(env, user.id, membership.organizationId);
@@ -416,6 +528,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
     const membership = await env.DB.prepare(`SELECT organization_id as organizationId FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created_at LIMIT 1`).bind(user.id).first<{ organizationId: string }>();
     if (!membership) return error("No active organization is linked to this account.", 403);
+    const factor = await env.DB.prepare(`SELECT enabled_at as enabledAt FROM user_two_factor WHERE user_id = ?`).bind(user.id).first<{ enabledAt: string | null }>();
+    if (factor?.enabledAt) return issueTwoFactorChallenge(env, user.id, membership.organizationId, true);
     const accessToken = await createSession(env, user.id, membership.organizationId);
     await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type) VALUES (?, ?, ?, 'signed_in', 'authentication', 'mobile_session')`).bind(`audit-${crypto.randomUUID()}`, membership.organizationId, user.id).run();
     return json({ accessToken, tokenType: "Bearer", expiresIn: 43200 });
@@ -427,7 +541,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ ok: true });
   }
 
-  const publicAuth = await handlePublicAuth(request, env, path);
+    const publicAuth = await handlePublicAuth(request, env, path, mobilePath);
   if (publicAuth) return publicAuth;
 
   if (request.method === "POST" && path === "/api/auth/logout") {
@@ -442,6 +556,76 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const context = secured.context;
 
   if (context.isDemo && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return error("The demo sandbox is read-only. Changes are not allowed.", 403);
+
+  if (request.method === "GET" && path === "/api/auth/2fa/status") {
+    const [factor, recovery] = await Promise.all([
+      env.DB.prepare(`SELECT enabled_at as enabledAt FROM user_two_factor WHERE user_id = ?`).bind(context.userId).first<{ enabledAt: string | null }>(),
+      env.DB.prepare(`SELECT COUNT(*) as remaining FROM two_factor_recovery_codes WHERE user_id = ? AND used_at IS NULL`).bind(context.userId).first<{ remaining: number }>(),
+    ]);
+    return json({ enabled: Boolean(factor?.enabledAt), enabledAt: factor?.enabledAt || null, recoveryCodesRemaining: recovery?.remaining || 0 });
+  }
+
+  if (request.method === "POST" && path === "/api/auth/2fa/setup") {
+    const body = await request.json<{ password?: string }>();
+    if (!body.password || body.password.length > 128) return error("Enter your current password to set up two-factor authentication.");
+    const user = await env.DB.prepare(`SELECT password_hash as passwordHash FROM users WHERE id = ? AND status = 'active'`).bind(context.userId).first<{ passwordHash: string | null }>();
+    if (!user?.passwordHash || !(await verifyPassword(body.password, user.passwordHash))) return error("Your current password is incorrect.", 401);
+    const current = await env.DB.prepare(`SELECT enabled_at as enabledAt FROM user_two_factor WHERE user_id = ?`).bind(context.userId).first<{ enabledAt: string | null }>();
+    if (current?.enabledAt) return error("Two-factor authentication is already enabled.", 409);
+    const secret = base32Encode(crypto.getRandomValues(new Uint8Array(20)));
+    const encrypted = await encryptTwoFactorSecret(env, secret);
+    await env.DB.prepare(`INSERT INTO user_two_factor (user_id, pending_secret_enc, pending_expires_at) VALUES (?, ?, datetime('now', '+10 minutes'))
+      ON CONFLICT(user_id) DO UPDATE SET pending_secret_enc = excluded.pending_secret_enc, pending_expires_at = excluded.pending_expires_at, updated_at = CURRENT_TIMESTAMP WHERE user_two_factor.enabled_at IS NULL`)
+      .bind(context.userId, encrypted).run();
+    const account = encodeURIComponent(`${context.email} (Zyntris)`);
+    const issuer = encodeURIComponent("Zyntris");
+    const provisioningUri = `otpauth://totp/${account}?secret=${secret}&issuer=${issuer}&algorithm=SHA1&digits=6&period=30`;
+    await audit(env, context, "two_factor_setup_started", "authentication");
+    return json({ secret, provisioningUri, expiresIn: 600 });
+  }
+
+  if (request.method === "POST" && path === "/api/auth/2fa/enable") {
+    const body = await request.json<{ code?: string }>();
+    const pending = await env.DB.prepare(`SELECT pending_secret_enc as secretEnc FROM user_two_factor WHERE user_id = ? AND enabled_at IS NULL AND pending_expires_at > CURRENT_TIMESTAMP`).bind(context.userId).first<{ secretEnc: string | null }>();
+    if (!pending?.secretEnc || !body.code) return error("Start setup again; the authenticator setup has expired.", 409);
+    const counter = await matchTotp(await decryptTwoFactorSecret(env, pending.secretEnc), body.code);
+    if (counter === null) return error("That code is not valid yet. Check your device time and try again.", 401);
+    const codes = makeRecoveryCodes();
+    const updated = await env.DB.prepare(`UPDATE user_two_factor SET secret_enc = pending_secret_enc, pending_secret_enc = NULL, pending_expires_at = NULL, enabled_at = CURRENT_TIMESTAMP, last_counter = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND enabled_at IS NULL AND pending_secret_enc = ? AND pending_expires_at > CURRENT_TIMESTAMP`)
+      .bind(counter - 1, context.userId, pending.secretEnc).run();
+    if (!updated.meta.changes) return error("Setup expired or was already completed. Start setup again.", 409);
+    const codeHashes = await Promise.all(codes.map((code) => hashToken(code.replace(/-/g, "").toLowerCase())));
+    await env.DB.batch(codes.map((_, index) => env.DB.prepare(`INSERT INTO two_factor_recovery_codes (id, user_id, code_hash) VALUES (?, ?, ?)`)
+      .bind(requestId(), context.userId, codeHashes[index])));
+    await audit(env, context, "two_factor_enabled", "authentication");
+    return json({ ok: true, recoveryCodes: codes });
+  }
+
+  if (request.method === "POST" && path === "/api/auth/2fa/disable") {
+    const body = await request.json<{ password?: string; code?: string }>();
+    const user = await env.DB.prepare(`SELECT password_hash as passwordHash FROM users WHERE id = ? AND status = 'active'`).bind(context.userId).first<{ passwordHash: string | null }>();
+    if (!user?.passwordHash || !(await verifyPassword(body.password || "", user.passwordHash))) return error("Your current password is incorrect.", 401);
+    const factor = await env.DB.prepare(`SELECT secret_enc as secretEnc, enabled_at as enabledAt, last_counter as lastCounter FROM user_two_factor WHERE user_id = ?`).bind(context.userId).first<{ secretEnc: string | null; enabledAt: string | null; lastCounter: number }>();
+    if (!factor?.enabledAt || !factor.secretEnc) return error("Two-factor authentication is not enabled.", 409);
+    let verified = false;
+    if (/^\d{6}$/.test(body.code || "")) {
+      const counter = await matchTotp(await decryptTwoFactorSecret(env, factor.secretEnc), body.code || "");
+      if (counter !== null && counter > factor.lastCounter) {
+        verified = (await env.DB.prepare(`UPDATE user_two_factor SET last_counter = ? WHERE user_id = ? AND last_counter < ?`).bind(counter, context.userId, counter).run()).meta.changes > 0;
+      }
+    } else {
+      const normalized = (body.code || "").replace(/-/g, "").trim().toLowerCase();
+      if (/^[a-f0-9]{10}$/.test(normalized)) verified = (await env.DB.prepare(`UPDATE two_factor_recovery_codes SET used_at = CURRENT_TIMESTAMP WHERE user_id = ? AND code_hash = ? AND used_at IS NULL`).bind(context.userId, await hashToken(normalized)).run()).meta.changes > 0;
+    }
+    if (!verified) return error("Enter a valid unused authenticator or recovery code.", 401);
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM user_two_factor WHERE user_id = ?`).bind(context.userId),
+      env.DB.prepare(`DELETE FROM two_factor_recovery_codes WHERE user_id = ?`).bind(context.userId),
+      env.DB.prepare(`DELETE FROM two_factor_challenges WHERE user_id = ?`).bind(context.userId),
+    ]);
+    await audit(env, context, "two_factor_disabled", "authentication");
+    return json({ ok: true });
+  }
 
   if (request.method === "GET" && path === "/api/notifications") {
     const result = await env.DB.prepare(`SELECT id, type, title, body, read_at as readAt, created_at as createdAt FROM notifications WHERE organization_id = ? AND user_id = ? ORDER BY created_at DESC LIMIT 50`).bind(context.organizationId, context.userId).all();

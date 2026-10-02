@@ -18,6 +18,7 @@ Cloudflare-native operations SaaS for **Zyntris — One Platform. Every Operatio
 - Separate Expo / React Native iOS and Android app in [`mobile/`](mobile/README.md). It uses a mobile-only bearer-token API prefix and does not enter the Cloudflare web build.
 - Read-only platform administration for onboarded organization and audit-activity summaries, restricted to explicitly allowlisted verified accounts.
 - Password-gated, read-only demo sandbox backed only by fictional demo-tenant records.
+- Optional authenticator-app two-factor authentication for web and mobile sign-in, with encrypted TOTP secrets, replay protection and one-use recovery codes.
 - Custom Domain configuration for `app.zyntris.org`.
 
 ## Local development
@@ -75,6 +76,8 @@ The shared demo administrator login has been removed. Account passwords are PBKD
 
 Platform administration is read-only and enabled only for verified email addresses listed in the `PLATFORM_ADMIN_EMAILS` Worker secret (comma-separated for multiple admins). Platform admins still need a normal verified Zyntris account; never add a public/shared demo address to this allowlist. The console excludes the demo tenant and shows organization-level counts plus audit events without payroll or bank data.
 
+Users can enable two-factor authentication from Account security. TOTP secrets are encrypted with `SESSION_SECRET`; sign-in challenges expire after five minutes and allow at most five code attempts. Recovery codes are stored only as hashes and each can be used once. Apply the D1 migration before deploying this feature. Keep `SESSION_SECRET` stable because it protects both payroll bank details and authenticator secrets.
+
 The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in ID `demo@demo.zyntris.invalid`. Set `DEMO_ACCESS_PASSWORD` to a long random value. Demo sessions are marked in D1 and every write request is rejected server-side; demo access cannot read other tenants. Sample payroll rates and amounts are fictional and must not be used for actual payroll.
 
 ## API surface currently wired
@@ -84,6 +87,8 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - `POST /api/auth/register`
 - `POST /api/auth/verify`
 - `POST /api/auth/login`
+- `POST /api/auth/2fa/verify` — complete a password sign-in using an authenticator or recovery code.
+- `/api/auth/2fa/*` — inspect status, begin setup, verify/enable, and disable 2FA for the current account.
 - `POST /api/auth/logout`
 - `GET /api/me`
 - `GET /api/dashboard`
@@ -116,10 +121,10 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - Calendar combines meetings, leave and training events.
 - CRM customer pipeline supports lead, qualified, proposal, negotiation and won stages.
 
-Remaining product phases include MFA, paid-plan checkout, password recovery, and extended talent modules (performance, goals, LMS, recruitment and AI).
+Remaining product phases include paid-plan checkout, password recovery, and extended talent modules (performance, goals, LMS, recruitment and AI).
 
 ## Payroll policy setup
 
 Payroll does not preload statutory tax rates or pension percentages. Configure the organization's effective policy for its country, region and payroll period, then validate it with a local payroll/tax professional before approval. Tax bands are progressive and entered with ascending `upTo` thresholds and a final `null` threshold, for example `[ { "upTo": 1000000, "rate": 0.07 }, { "upTo": null, "rate": 0.1 } ]`. Rates are decimals. Employee base remuneration and recurring amounts are entered per pay period. Admins may store bank details encrypted for record purposes; account numbers are masked on screen and excluded from generated documents/exports. The app documents remuneration, prepares employee payslips and records approval/payment status; actual bank transfers are outside the platform.
 
-Paid-plan checkout, password recovery, MFA and team-member invitation flows are not yet integrated. Trial access is limited to 30 days; organizations must contact Zyntris to arrange a paid plan before expiry.
+Paid-plan checkout, password recovery and extended talent modules are not yet integrated. Trial access is limited to 30 days; organizations must contact Zyntris to arrange a paid plan before expiry.

@@ -2,7 +2,7 @@
 
 This is a standalone Expo / React Native client for iOS and Android. It lives under `mobile/` and is deliberately excluded from the Vite/Cloudflare Worker build, so it does not replace or alter the web application at `app.zyntris.org`.
 
-The client connects to the existing production API. It provides organization sign-in, an operations snapshot, request creation and review, role-gated payroll run review/final approval/payment-status recording, and a persistent in-app notifications inbox. Notifications are scoped to the signed-in user and organization. Request approvers also receive approval-pending email through the existing Brevo Worker integration. Mobile access tokens are hashed in D1, expire after 12 hours, and are stored on device using Expo SecureStore.
+The client connects to the existing production API. It provides organization sign-in (including authenticator/recovery-code verification when 2FA is enabled), an operations snapshot, request creation and review, role-gated payroll run review/final approval/payment-status recording, and a persistent in-app notifications inbox. Notifications are scoped to the signed-in user and organization. Request approvers also receive approval-pending email through the existing Brevo Worker integration. Mobile access tokens are hashed in D1, expire after 12 hours, and are stored on device using Expo SecureStore.
 
 ## Run locally
 

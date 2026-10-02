@@ -1,4 +1,4 @@
-export type PageId = "dashboard" | "employees" | "leave" | "projects" | "tasks" | "expenses" | "requests" | "budgets" | "assets" | "documents" | "vendors" | "helpdesk" | "calendar" | "customers" | "reports" | "payroll" | "settings" | "platform";
+export type PageId = "dashboard" | "employees" | "leave" | "projects" | "tasks" | "expenses" | "requests" | "budgets" | "assets" | "documents" | "vendors" | "helpdesk" | "calendar" | "customers" | "reports" | "payroll" | "settings" | "security" | "platform";
 
 export type Employee = {
   id: string;

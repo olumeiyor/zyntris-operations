@@ -11,7 +11,7 @@ import { OperationalWorkspace } from "./operations";
 import { Onboarding } from "./onboarding";
 import { EmployeePayslips, PayrollWorkspace } from "./payroll";
 import { PlatformAdminWorkspace } from "./platform-admin";
-import { OrganizationSettings } from "./settings";
+import { AccountSecurity, OrganizationSettings } from "./settings";
 import type { DashboardData, Employee, LeaveRequest, PageId, Task } from "./types";
 
 type IconComponent = typeof LayoutDashboard;
@@ -37,6 +37,7 @@ const navItems: NavItem[] = [
   { id: "customers", label: "Customers & CRM", icon: UserRound, section: "Customers" },
   { id: "reports", label: "Reports & analytics", icon: BarChart3, section: "Insights" },
   { id: "settings", label: "Administration", icon: Settings, section: "Workspace" },
+  { id: "security", label: "Account security", icon: ShieldCheck, section: "Workspace" },
   { id: "platform", label: "Platform admin", icon: ShieldCheck, section: "Platform" },
 ];
 
@@ -137,6 +138,7 @@ export default function App() {
   const visibleNavItems = navItems.filter((item) => {
     if (item.id === "platform") return Boolean(user?.isPlatformAdmin);
     if (item.id === "settings") return userPermissions.has("settings.manage");
+    if (item.id === "security") return true;
     if (["employees", "leave"].includes(item.id)) return userPermissions.has("employees.view");
     if (item.id === "payroll") return userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") || userPermissions.has("payroll.self.view");
     if (item.id === "expenses") return userPermissions.has("expenses.view") || userPermissions.has("expenses.manage");
@@ -216,6 +218,7 @@ export default function App() {
           {page === "reports" && <Reports onToast={setToast} />}
           {page === "payroll" && (userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") ? <PayrollWorkspace onToast={setToast} role={user.role} readOnly={Boolean(user.isDemo)} /> : <EmployeePayslips />)}
           {page === "settings" && <OrganizationSettings onToast={setToast} />}
+          {page === "security" && <AccountSecurity onToast={setToast} />}
           {page === "platform" && user.isPlatformAdmin && <PlatformAdminWorkspace />}
         </div>
       </main>

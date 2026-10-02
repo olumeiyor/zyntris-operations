@@ -33,6 +33,8 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("home");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [twoFactorChallenge, setTwoFactorChallenge] = useState("");
+  const [twoFactorCode, setTwoFactorCode] = useState("");
   const [requestTitle, setRequestTitle] = useState("");
   const [requestDetails, setRequestDetails] = useState("");
   const [requestAmount, setRequestAmount] = useState("");
@@ -74,10 +76,15 @@ export default function App() {
   };
 
   const signIn = async () => {
-    if (!email.trim() || !password) return Alert.alert("Sign in", "Enter your work email and password.");
+    if (!twoFactorChallenge && (!email.trim() || !password)) return Alert.alert("Sign in", "Enter your work email and password.");
+    if (twoFactorChallenge && !twoFactorCode.trim()) return Alert.alert("Verification", "Enter your authenticator or recovery code.");
     setBusy(true);
     try {
-      const result = await request<{ accessToken: string }>("/auth/login", undefined, { method: "POST", body: JSON.stringify({ email: email.trim(), password }) });
+      const result = twoFactorChallenge
+        ? await request<{ accessToken: string }>("/auth/2fa/verify", undefined, { method: "POST", body: JSON.stringify({ challengeToken: twoFactorChallenge, code: twoFactorCode }) })
+        : await request<{ accessToken?: string; twoFactorRequired?: boolean; challengeToken?: string }>("/auth/login", undefined, { method: "POST", body: JSON.stringify({ email: email.trim(), password }) });
+      if ("twoFactorRequired" in result && result.twoFactorRequired && result.challengeToken) { setTwoFactorChallenge(result.challengeToken); setPassword(""); return; }
+      if (!result.accessToken) throw new Error("Sign-in could not be completed. Please try again.");
       await SecureStore.setItemAsync(TOKEN_KEY, result.accessToken);
       await loadWorkspace(result.accessToken); setToken(result.accessToken);
     } catch (cause) { await SecureStore.deleteItemAsync(TOKEN_KEY); Alert.alert("Could not sign in", cause instanceof Error ? cause.message : "Please try again."); }
@@ -126,7 +133,7 @@ export default function App() {
   };
 
   if (restoringSession) return <SafeAreaView style={styles.safe}><ExpoStatusBar style="light" /><View style={styles.restore}><Image source={zyntrisMark} style={styles.loginLogo} resizeMode="contain" /><ActivityIndicator color="#D8AA54" /></View></SafeAreaView>;
-  if (!user) return <SafeAreaView style={styles.safe}><ExpoStatusBar style="light" /><KeyboardAvoidingView style={styles.loginWrap} behavior={Platform.OS === "ios" ? "padding" : undefined}><View style={styles.logoPlate}><Image source={zyntrisMark} style={styles.loginLogo} resizeMode="contain" /></View><Text style={styles.brand}>ZYNTRIS</Text><Text style={styles.loginTitle}>Your work, in one place.</Text><Text style={styles.loginCaption}>Sign in with your organization account.</Text><TextInput style={styles.input} autoCapitalize="none" autoComplete="email" keyboardType="email-address" placeholder="Work email" placeholderTextColor="#9BA8AE" value={email} onChangeText={setEmail} /><TextInput style={styles.input} secureTextEntry autoComplete="current-password" placeholder="Password" placeholderTextColor="#9BA8AE" value={password} onChangeText={setPassword} /><Pressable style={styles.primaryButton} onPress={() => void signIn()} disabled={busy}>{busy ? <ActivityIndicator color="#10212B" /> : <Text style={styles.primaryText}>Sign in securely</Text>}</Pressable><Text style={styles.privacy}>Protected organization workspace · 30-day trials supported</Text></KeyboardAvoidingView></SafeAreaView>;
+  if (!user) return <SafeAreaView style={styles.safe}><ExpoStatusBar style="light" /><KeyboardAvoidingView style={styles.loginWrap} behavior={Platform.OS === "ios" ? "padding" : undefined}><View style={styles.logoPlate}><Image source={zyntrisMark} style={styles.loginLogo} resizeMode="contain" /></View><Text style={styles.brand}>ZYNTRIS</Text><Text style={styles.loginTitle}>{twoFactorChallenge ? "Verify it’s you." : "Your work, in one place."}</Text><Text style={styles.loginCaption}>{twoFactorChallenge ? "Enter a current authenticator code, or one unused recovery code." : "Sign in with your organization account."}</Text><TextInput style={styles.input} autoCapitalize="none" autoComplete="email" keyboardType="email-address" placeholder="Work email" placeholderTextColor="#9BA8AE" value={email} onChangeText={setEmail} editable={!twoFactorChallenge} /><TextInput style={styles.input} secureTextEntry autoComplete="current-password" placeholder="Password" placeholderTextColor="#9BA8AE" value={password} onChangeText={setPassword} editable={!twoFactorChallenge} />{twoFactorChallenge && <TextInput style={styles.input} autoCapitalize="characters" autoComplete="one-time-code" keyboardType="default" placeholder="Authenticator or recovery code" placeholderTextColor="#9BA8AE" value={twoFactorCode} onChangeText={setTwoFactorCode} />}<Pressable style={styles.primaryButton} onPress={() => void signIn()} disabled={busy}>{busy ? <ActivityIndicator color="#10212B" /> : <Text style={styles.primaryText}>{twoFactorChallenge ? "Verify and sign in" : "Sign in securely"}</Text>}</Pressable>{twoFactorChallenge && <Pressable onPress={() => { setTwoFactorChallenge(""); setTwoFactorCode(""); }}><Text style={[styles.privacy, { marginTop: 15 }]}>Back to password sign in</Text></Pressable>}<Text style={styles.privacy}>Protected organization workspace · 30-day trials supported</Text></KeyboardAvoidingView></SafeAreaView>;
 
   const unread = notices.filter((item) => !item.readAt).length;
   return <SafeAreaView style={styles.safe}><ExpoStatusBar style="light" /><View style={styles.header}><View style={styles.headerBrand}><View style={styles.headerMark}><Image source={zyntrisMark} style={styles.headerLogo} resizeMode="contain" /></View><View><Text style={styles.headerTitle}>ZYNTRIS</Text><Text style={styles.orgName}>{user.organizationName}</Text></View></View><Pressable onPress={() => void signOut()}><Text style={styles.signOut}>Sign out</Text></Pressable></View><ScrollView contentContainerStyle={styles.content} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor="#D8AA54" />}>

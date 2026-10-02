@@ -5,7 +5,7 @@ type AuthFlowProps = { onAuthenticated: () => void; initialNotice?: string };
 
 async function authRequest(path: string, body: Record<string, string>) {
   const response = await fetch(path, { method: "POST", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  const data = await response.json().catch(() => ({})) as { error?: string; email?: string };
+  const data = await response.json().catch(() => ({})) as { error?: string; email?: string; twoFactorRequired?: boolean; challengeToken?: string };
   if (!response.ok) throw new Error(data.error || "Something went wrong. Please try again.");
   return data;
 }
@@ -18,6 +18,7 @@ export function Onboarding({ onAuthenticated, initialNotice }: AuthFlowProps) {
   const [busy, setBusy] = useState(false);
   const [verificationSent, setVerificationSent] = useState(false);
   const [demoEnabled, setDemoEnabled] = useState(false);
+  const [twoFactorChallenge, setTwoFactorChallenge] = useState("");
 
   useEffect(() => {
     void fetch("/api/auth/config").then((response) => response.json()).then((config: { demoEnabled?: boolean }) => setDemoEnabled(Boolean(config.demoEnabled))).catch(() => setDemoEnabled(false));
@@ -39,7 +40,17 @@ export function Onboarding({ onAuthenticated, initialNotice }: AuthFlowProps) {
         await authRequest("/api/auth/demo", { password: String(body.password || "") });
         onAuthenticated();
       } else {
-        await authRequest("/api/auth/login", body);
+        if (twoFactorChallenge) {
+          await authRequest("/api/auth/2fa/verify", { challengeToken: twoFactorChallenge, code: String(body.code || "") });
+        } else {
+          const result = await authRequest("/api/auth/login", body);
+          if (result.twoFactorRequired && result.challengeToken) {
+            setTwoFactorChallenge(result.challengeToken);
+            setMessage("Enter the current code from your authenticator app. You can also use one unused recovery code.");
+            setBusy(false);
+            return;
+          }
+        }
         onAuthenticated();
       }
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Something went wrong."); }
@@ -57,7 +68,7 @@ export function Onboarding({ onAuthenticated, initialNotice }: AuthFlowProps) {
       {verificationSent ? <div className="verify-state"><span className="verify-icon"><Mail size={24} /></span><div className="auth-kicker">ONE LAST STEP</div><h2>Check your inbox</h2><p>{message}</p><p className="auth-small">The secure link expires in 24 hours. Check your spam folder if it hasn’t arrived.</p><button className="button secondary" onClick={() => { setVerificationSent(false); setMode("login"); }}>Back to sign in</button></div> : <>
         <div className="auth-kicker">{mode === "signup" ? "START YOUR WORKSPACE" : mode === "demo" ? "SANDBOX ACCESS" : mode === "invite" ? "EMPLOYEE ONBOARDING" : "WELCOME BACK"}</div>
         <h2>{mode === "signup" ? "Build better operations." : mode === "demo" ? "Explore the demo workspace." : mode === "invite" ? "Set up your employee access." : "Sign in to Zyntris."}</h2>
-        <p className="auth-intro">{mode === "signup" ? "Create your organization workspace. No card required." : mode === "demo" ? "Fictional organization and payroll records. Demo access is read-only." : mode === "invite" ? "Your HR administrator invited you. Create a password to activate your account." : "Pick up where your team left off."}</p>
+        <p className="auth-intro">{mode === "signup" ? "Create your organization workspace. No card required." : mode === "demo" ? "Fictional organization and payroll records. Demo access is read-only." : mode === "invite" ? "Your HR administrator invited you. Create a password to activate your account." : twoFactorChallenge ? "Verify your identity to finish signing in." : "Pick up where your team left off."}</p>
         {message && <div className="auth-message"><CheckCircle2 size={17} />{message}</div>}
         {error && <div className="auth-error" role="alert">{error}</div>}
         <form className="auth-form" onSubmit={submit}>
@@ -68,11 +79,13 @@ export function Onboarding({ onAuthenticated, initialNotice }: AuthFlowProps) {
           </>}
           {mode === "demo" ? <div className="demo-login-id"><span>Demo sign-in ID</span><strong>demo@demo.zyntris.invalid</strong></div> : mode !== "invite" && <label><span>Work email</span><div className="auth-input"><Mail size={16} /><input name="email" type="email" autoComplete="email" required placeholder="you@company.com" /></div></label>}
           <label><span>{mode === "demo" ? "Demo password" : mode === "invite" ? "Create password" : "Password"} {(mode === "signup" || mode === "invite") && <small>At least 12 characters</small>}</span><div className="auth-input"><LockKeyhole size={16} /><input name="password" type="password" autoComplete={mode === "signup" || mode === "invite" ? "new-password" : "current-password"} minLength={mode === "signup" || mode === "invite" ? 12 : 1} required placeholder={mode === "signup" || mode === "invite" ? "Create a strong password" : mode === "demo" ? "Enter the shared demo password" : "Your password"} /></div></label>
+          {mode === "login" && twoFactorChallenge && <label><span>Authenticator or recovery code</span><div className="auth-input"><ShieldCheck size={16} /><input name="code" inputMode="numeric" autoComplete="one-time-code" autoFocus required placeholder="6-digit code or recovery code" /></div></label>}
           {mode === "signup" && <div className="trial-note"><CheckCircle2 size={16} /><span><strong>30 days free</strong> · Full access during your trial, no card required.</span></div>}
           {mode === "demo" && <div className="trial-note"><ShieldCheck size={16} /><span>Fictional records only. Changes and uploads are disabled.</span></div>}
-          <button className="button primary auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "signup" ? "Create organization" : mode === "demo" ? "Enter demo sandbox" : mode === "invite" ? "Accept invitation" : "Sign in"}<ArrowRight size={16} /></button>
+          <button className="button primary auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "signup" ? "Create organization" : mode === "demo" ? "Enter demo sandbox" : mode === "invite" ? "Accept invitation" : twoFactorChallenge ? "Verify and sign in" : "Sign in"}<ArrowRight size={16} /></button>
         </form>
-        {mode !== "invite" && <div className="auth-switch">{mode === "demo" ? "Have a company account?" : mode === "signup" ? "Already have an account?" : "New to Zyntris?"}<button onClick={() => { setError(""); setMessage(""); setMode(mode === "demo" ? "login" : mode === "signup" ? "login" : "signup"); }}>{mode === "demo" ? "Sign in" : mode === "signup" ? "Sign in" : "Start a 30-day trial"}</button></div>}
+        {mode !== "invite" && !twoFactorChallenge && <div className="auth-switch">{mode === "demo" ? "Have a company account?" : mode === "signup" ? "Already have an account?" : "New to Zyntris?"}<button onClick={() => { setError(""); setMessage(""); setMode(mode === "demo" ? "login" : mode === "signup" ? "login" : "signup"); }}>{mode === "demo" ? "Sign in" : mode === "signup" ? "Sign in" : "Start a 30-day trial"}</button></div>}
+        {twoFactorChallenge && <button className="demo-entry" type="button" onClick={() => { setTwoFactorChallenge(""); setMessage(""); setError(""); }}>Back to password sign in</button>}
         {demoEnabled && mode !== "demo" && mode !== "invite" && <button className="demo-entry" type="button" onClick={() => { setError(""); setMessage(""); setMode("demo"); }}>Explore the read-only demo</button>}
       </>}
       <div className="auth-legal">By continuing, you agree to Zyntris’s terms and privacy policy.</div>
