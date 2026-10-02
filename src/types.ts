@@ -10,6 +10,8 @@ export type Employee = {
   department: string;
   status: "active" | "on_leave" | "inactive";
   onboardingStatus?: "active" | "invited" | "declined";
+  invitationEmailStatus?: "pending" | "accepted" | "failed" | null;
+  invitationEmailError?: string | null;
   accessRole?: string;
   team?: string;
   workLocation: string;

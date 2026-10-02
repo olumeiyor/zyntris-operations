@@ -1,16 +1,19 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { Building2, Check, CheckCircle2, Copy, CreditCard, Globe2, ShieldCheck } from "lucide-react";
+import { Building2, Check, CheckCircle2, Copy, CreditCard, Globe2, Mail, Send, ShieldCheck } from "lucide-react";
 
 type Organization = { id: string; name: string; slug: string; industry: string | null; description: string | null; timezone: string; currency: string; status: string };
 type Subscription = { plan: string; status: string; trialEndsAt: string | null; renewsAt: string | null; employeeLimit: number; storageLimitBytes: number };
 
 async function settingsApi<T>(path: string, init?: RequestInit) { const response = await fetch(path, { credentials: "include", ...init }); if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || "Settings could not be saved."); return response.json() as Promise<T>; }
 
-export function OrganizationSettings({ onToast }: { onToast: (message: string) => void }) {
+export function OrganizationSettings({ onToast, currentEmail }: { onToast: (message: string) => void; currentEmail: string }) {
   const [organization, setOrganization] = useState<Organization | null>(null);
   const [subscription, setSubscription] = useState<Subscription | null>(null);
   const [error, setError] = useState("");
   const [saving, setSaving] = useState(false);
+  const [testingEmail, setTestingEmail] = useState(false);
+  const [emailTestError, setEmailTestError] = useState("");
+  const [emailTestResult, setEmailTestResult] = useState("");
   useEffect(() => { void settingsApi<{ organization: Organization; subscription: Subscription }>("/api/settings/organization").then((data) => { setOrganization(data.organization); setSubscription(data.subscription); }).catch((cause) => setError(cause instanceof Error ? cause.message : "Could not load organization settings.")); }, []);
 
   const save = async (event: FormEvent<HTMLFormElement>) => {
@@ -21,7 +24,17 @@ export function OrganizationSettings({ onToast }: { onToast: (message: string) =
     finally { setSaving(false); }
   };
 
+  const testEmail = async () => {
+    setTestingEmail(true); setEmailTestError(""); setEmailTestResult("");
+    try {
+      const result = await settingsApi<{ accepted: boolean; recipient: string; sender: string }>("/api/settings/email/test", { method: "POST" });
+      setEmailTestResult(`Brevo accepted the test email to ${result.recipient} from ${result.sender}. Check your inbox and spam folder.`);
+    } catch (cause) { setEmailTestError(cause instanceof Error ? cause.message : "Could not send a test email."); }
+    finally { setTestingEmail(false); }
+  };
+
   return <><div className="page-header"><div><div className="eyebrow">WORKSPACE / ADMINISTRATION</div><h1>Organization settings</h1><p>Manage your organization identity, regional defaults and subscription.</p></div></div>{error && <div className="payroll-error">{error}</div>}<div className="settings-layout"><div className="settings-nav card"><button className="active"><Building2 size={16} /> Organization</button><button><ShieldCheck size={16} /> Security & roles</button><button><Globe2 size={16} /> Regional defaults</button><button><CreditCard size={16} /> Subscription</button></div><div className="settings-content"><section className="card settings-panel"><div className="card-heading"><div><h2>Organization profile</h2><p>The workspace details used across your Zyntris instance.</p></div></div>{organization && <form className="settings-form" onSubmit={save}><label>Organization name<input name="name" defaultValue={organization.name} required maxLength={120} /></label><label>Industry<select name="industry" defaultValue={organization.industry || "Other"}><option>Professional services</option><option>Technology</option><option>Financial services</option><option>Healthcare</option><option>Education</option><option>Retail & commerce</option><option>Manufacturing</option><option>Nonprofit</option><option>Other</option></select></label><label>Workspace address<input value={`${window.location.host}/${organization.slug}`} readOnly /></label><label>Time zone<select name="timezone" defaultValue={organization.timezone}><option>Africa/Lagos</option><option>Africa/Accra</option><option>Africa/Nairobi</option><option>Europe/London</option><option>America/New_York</option><option>Asia/Dubai</option></select></label><label>Default currency<select name="currency" defaultValue={organization.currency}><option value="NGN">NGN · Nigerian naira</option><option value="GHS">GHS · Ghanaian cedi</option><option value="KES">KES · Kenyan shilling</option><option value="USD">USD · US dollar</option><option value="GBP">GBP · British pound</option></select></label><label className="full">Company description<textarea name="description" defaultValue={organization.description || ""} placeholder="A short introduction to your organization" /></label><div className="full"><button className="button primary" disabled={saving}><CheckCircle2 size={15} /> {saving ? "Saving…" : "Save changes"}</button></div></form>}<div className="security-note"><ShieldCheck size={17} /><div><strong>Tenant isolation is enabled</strong><span>All organization-owned records are scoped by the Worker from your verified membership.</span></div></div></section>
+      <section className="card settings-panel email-test-panel"><div className="card-heading"><div><h2>Email delivery</h2><p>Test the configured Brevo sender with a message to your signed-in account.</p></div><Mail size={18} /></div><div className="email-test-row"><div><span>Test recipient</span><strong>{currentEmail}</strong></div><button className="button primary" type="button" onClick={() => void testEmail()} disabled={testingEmail}>{testingEmail ? "Sending test…" : <><Send size={14} /> Send test email</>}</button></div>{emailTestError && <div className="email-test-feedback is-error" role="alert">{emailTestError}</div>}{emailTestResult && <div className="email-test-feedback is-success" role="status">{emailTestResult}</div>}<p className="subscription-note">“Accepted” confirms Brevo queued the message, not final inbox delivery. If it doesn’t arrive, check spam and verify your sender plus SPF/DKIM domain authentication in Brevo.</p></section>
       <section className="card settings-panel subscription-card"><div className="card-heading"><div><h2>Subscription</h2><p>Your organization’s plan and trial details.</p></div><span className={`status-badge ${subscription?.status || "trialing"}`}>{subscription?.status || "Loading"}</span></div><div className="subscription-facts"><div><small>Plan</small><strong>{subscription?.plan || "—"}</strong></div><div><small>Employee capacity</small><strong>{subscription?.employeeLimit || "—"}</strong></div><div><small>Trial ends</small><strong>{subscription?.trialEndsAt ? new Date(subscription.trialEndsAt).toLocaleDateString("en-NG", { dateStyle: "long" }) : "—"}</strong></div></div><p className="subscription-note">No payment method is required during the 30-day trial. Contact Zyntris to select a paid plan before it expires.</p></section></div></div></>;
 }
 

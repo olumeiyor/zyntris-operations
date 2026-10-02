@@ -260,20 +260,43 @@ async function sendVerificationEmail(env: Env, email: string, fullName: string, 
   return response.ok;
 }
 
-async function sendEmployeeInviteEmail(env: Env, email: string, fullName: string, organizationName: string, token: string) {
-  if (!env.BREVO_API_KEY) return false;
-  const url = `${env.APP_ORIGIN}/?invite=${encodeURIComponent(token)}`;
-  const safe = (value: string) => value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[char] || char);
+function brevoSender(env: Env) {
   const configuredSender = env.EMAIL_SENDER || "Zyntris <no-reply@zyntris.org>";
   const senderMatch = configuredSender.match(/^\s*(.*?)\s*<([^<>]+)>\s*$/);
-  const sender = senderMatch ? { name: senderMatch[1] || "Zyntris", email: senderMatch[2] } : { name: "Zyntris", email: configuredSender.trim() };
-  const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-    method: "POST", headers: { "api-key": env.BREVO_API_KEY, "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify({ sender, to: [{ email, name: fullName }], subject: `You’re invited to ${organizationName} on Zyntris`,
-      textContent: `Hello ${fullName}, ${organizationName} invited you to its Zyntris workspace. Set up your account here: ${url}. This link expires in 72 hours.`,
-      htmlContent: `<p>Hello ${safe(fullName)},</p><p>${safe(organizationName)} invited you to its Zyntris workspace.</p><p><a href="${url}">Accept invitation and set up your account</a></p><p>This link expires in 72 hours.</p>` }),
-  });
-  return response.ok;
+  return senderMatch ? { name: senderMatch[1] || "Zyntris", email: senderMatch[2] } : { name: "Zyntris", email: configuredSender.trim() };
+}
+
+type InviteEmailResult = { accepted: true; messageId?: string } | { accepted: false; cause: "not_configured" | "provider_rejected" | "network_error"; status?: number };
+
+async function sendEmployeeInviteEmail(env: Env, email: string, fullName: string, organizationName: string, token: string): Promise<InviteEmailResult> {
+  if (!env.BREVO_API_KEY) return { accepted: false, cause: "not_configured" } as const;
+  const url = `${env.APP_ORIGIN}/?invite=${encodeURIComponent(token)}`;
+  const safe = (value: string) => value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[char] || char);
+  try {
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST", headers: { "api-key": env.BREVO_API_KEY, "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ sender: brevoSender(env), to: [{ email, name: fullName }], subject: `You’re invited to ${organizationName} on Zyntris`,
+        textContent: `Hello ${fullName}, ${organizationName} invited you to its Zyntris workspace. Set up your account here: ${url}. This link expires in 72 hours.`,
+        htmlContent: `<p>Hello ${safe(fullName)},</p><p>${safe(organizationName)} invited you to its Zyntris workspace.</p><p><a href="${url}">Accept invitation and set up your account</a></p><p>This link expires in 72 hours.</p>` }),
+    });
+    const result = await response.json().catch(() => ({})) as { messageId?: string; code?: string; message?: string };
+    if (!response.ok) {
+      console.error("Brevo rejected an employee invitation", { status: response.status, code: result.code || "unknown", message: result.message?.slice(0, 240) || "No provider detail" });
+      return { accepted: false, cause: "provider_rejected", status: response.status };
+    }
+    return { accepted: true, messageId: result.messageId };
+  } catch (cause) {
+    console.error("Brevo invitation request failed", cause instanceof Error ? cause.name : "Unknown network error");
+    return { accepted: false, cause: "network_error" };
+  }
+}
+
+function inviteDeliveryError(result: Exclude<InviteEmailResult, { accepted: true }>) {
+  if (result.cause === "not_configured") return "Employee invitation email isn’t configured. Add BREVO_API_KEY to the Worker secrets.";
+  if (result.cause === "network_error") return "Brevo could not be reached, so no invitation was sent. Please retry shortly.";
+  if (result.status === 401 || result.status === 403) return "Brevo rejected its API key. Update BREVO_API_KEY in Cloudflare and try again.";
+  if (result.status === 400) return "Brevo rejected the invitation. Verify the sender in Brevo and check the recipient address.";
+  return `Brevo rejected the invitation (HTTP ${result.status || "unknown"}). Check the verified sender and domain authentication, then retry.`;
 }
 
 async function sendApprovalNotificationEmail(env: Env, email: string, fullName: string, organizationName: string, subject: string, message: string) {
@@ -556,6 +579,34 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const context = secured.context;
 
   if (context.isDemo && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return error("The demo sandbox is read-only. Changes are not allowed.", 403);
+
+  if (request.method === "POST" && path === "/api/settings/email/test") {
+    if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to test email delivery.", 403);
+    if (!env.BREVO_API_KEY) return error("Brevo is not configured. Add the BREVO_API_KEY Worker secret.", 503);
+    const sender = brevoSender(env);
+    try {
+      const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+        method: "POST",
+        headers: { "api-key": env.BREVO_API_KEY, "content-type": "application/json", accept: "application/json" },
+        body: JSON.stringify({
+          sender, to: [{ email: context.email }], subject: "Zyntris email delivery test",
+          textContent: `This test confirms that Zyntris can submit transactional email through Brevo. Sender: ${sender.email}.`,
+          htmlContent: `<p>This test confirms that Zyntris can submit transactional email through Brevo.</p><p>Sender: ${sender.email}.</p>`,
+        }),
+      });
+      const result = await response.json().catch(() => ({})) as { messageId?: string; code?: string; message?: string };
+      if (!response.ok) {
+        console.error("Brevo test email was rejected", { status: response.status, code: result.code || "unknown", message: result.message?.slice(0, 240) || "No provider detail" });
+        if (response.status === 401 || response.status === 403) return error("Brevo rejected its API key. Update the BREVO_API_KEY Worker secret.", 502);
+        if (response.status === 400) return error("Brevo rejected this message. Verify the sender identity and recipient address in Brevo.", 502);
+        return error(`Brevo did not accept the test email (HTTP ${response.status}). Check the sender setup and retry.`, 502);
+      }
+      return json({ accepted: true, recipient: context.email, sender: sender.email, messageId: result.messageId || null });
+    } catch (cause) {
+      console.error("Brevo test email request failed", cause instanceof Error ? cause.name : "Unknown network error");
+      return error("Zyntris could not reach Brevo. Check connectivity and retry.", 502);
+    }
+  }
 
   if (request.method === "GET" && path === "/api/auth/2fa/status") {
     const [factor, recovery] = await Promise.all([
@@ -987,7 +1038,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!hasPermission(context, "employees.view")) return error("You do not have permission to view employee records.", 403);
     const query = url.searchParams.get("q")?.trim();
     const result = await env.DB.prepare(`
-      SELECT e.id, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.email, e.job_title as jobTitle, e.status, e.onboarding_status as onboardingStatus, e.work_location as workLocation, e.start_date as startDate, e.avatar_color as avatarColor, d.name as department, t.name as team, r.name as accessRole
+      SELECT e.id, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.email, e.job_title as jobTitle, e.status, e.onboarding_status as onboardingStatus, (SELECT i.email_status FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) as invitationEmailStatus, (SELECT i.last_error FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) as invitationEmailError, e.work_location as workLocation, e.start_date as startDate, e.avatar_color as avatarColor, d.name as department, t.name as team, r.name as accessRole
       FROM employees e LEFT JOIN departments d ON d.id = e.department_id LEFT JOIN teams t ON t.id = e.team_id LEFT JOIN memberships m ON m.user_id = e.user_id AND m.organization_id = e.organization_id LEFT JOIN roles r ON r.id = m.role_id
       WHERE e.organization_id = ? AND e.deleted_at IS NULL AND (? IS NULL OR e.first_name || ' ' || e.last_name LIKE '%' || ? || '%' OR e.employee_number LIKE '%' || ? || '%')
       ORDER BY e.first_name ASC
@@ -997,7 +1048,6 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "POST" && path === "/api/employees") {
     if (!hasPermission(context, "employees.manage")) return error("HR administrator permission is required to onboard employees.", 403);
-    if (!env.BREVO_API_KEY) return error("Employee invitations are unavailable until the organization email sender is configured.", 503);
     const body = await request.json<{ firstName?: string; lastName?: string; email?: string; jobTitle?: string; departmentName?: string; teamName?: string; roleName?: string; startDate?: string; employmentType?: string; workLocation?: string }>();
     const firstName = body.firstName?.trim(); const lastName = body.lastName?.trim(); const email = body.email?.trim().toLowerCase(); const jobTitle = body.jobTitle?.trim();
     if (!firstName || !lastName || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !jobTitle || !body.startDate || !/^\d{4}-\d{2}-\d{2}$/.test(body.startDate)) return error("Enter a valid name, work email, job title and start date.");
@@ -1027,21 +1077,22 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
         env.DB.prepare(`INSERT INTO memberships (id, organization_id, user_id, role_id, status) VALUES (?, ?, ?, ?, 'invited')`).bind(`mem-${crypto.randomUUID()}`, context.organizationId, userId, role.id),
         env.DB.prepare(`INSERT INTO employees (id, organization_id, user_id, employee_number, first_name, last_name, email, job_title, department_id, team_id, employment_type, work_location, status, onboarding_status, start_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inactive', 'invited', ?)`)
           .bind(id, context.organizationId, userId, employeeNumber, firstName, lastName, email, jobTitle, departmentId, teamId, body.employmentType || "Full-time", body.workLocation || "Hybrid", body.startDate),
-        env.DB.prepare(`INSERT INTO employee_invites (id, organization_id, employee_id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', '+72 hours'))`).bind(inviteId, context.organizationId, id, userId, await hashToken(token)),
+        env.DB.prepare(`INSERT INTO employee_invites (id, organization_id, employee_id, user_id, token_hash, expires_at, email_status) VALUES (?, ?, ?, ?, ?, datetime('now', '+72 hours'), 'pending')`).bind(inviteId, context.organizationId, id, userId, await hashToken(token)),
       ]);
-      if (!await sendEmployeeInviteEmail(env, email, `${firstName} ${lastName}`, organization?.name || "your organization", token)) throw new Error("Brevo rejected invitation email");
     } catch (cause) {
-      console.error("Employee invitation failed", cause);
-      await env.DB.batch([
-        env.DB.prepare(`DELETE FROM employee_invites WHERE id = ?`).bind(inviteId),
-        env.DB.prepare(`DELETE FROM employees WHERE id = ? AND organization_id = ?`).bind(id, context.organizationId),
-        env.DB.prepare(`DELETE FROM memberships WHERE user_id = ? AND organization_id = ?`).bind(userId, context.organizationId),
-        env.DB.prepare(`DELETE FROM users WHERE id = ? AND status = 'invited'`).bind(userId),
-      ]);
-      return error("We couldn’t deliver the onboarding invitation. Confirm the Brevo sender and try again.", 503);
+      console.error("Employee invitation could not be saved", cause);
+      return error("We couldn’t prepare the onboarding invitation. Please retry or contact support.", 500);
     }
+    const delivery = await sendEmployeeInviteEmail(env, email, `${firstName} ${lastName}`, organization?.name || "your organization", token);
+    if (!delivery.accepted) {
+      const deliveryError = inviteDeliveryError(delivery);
+      await env.DB.prepare(`UPDATE employee_invites SET email_status = 'failed', last_error = ?, last_attempt_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(deliveryError, inviteId).run();
+      await audit(env, context, "invitation_email_failed", "employees", id, { employeeNumber, reason: delivery.cause });
+      return json({ id, employeeNumber, onboardingStatus: "invited", accessRole: roleName, invitationEmailAccepted: false, invitationEmailStatus: "failed", invitationEmailError: deliveryError }, { status: 201 });
+    }
+    await env.DB.prepare(`UPDATE employee_invites SET email_status = 'accepted', email_message_id = ?, last_error = NULL, last_attempt_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(delivery.messageId || null, inviteId).run();
     await audit(env, context, "invited", "employees", id, { employeeNumber, role: roleName, department: departmentName || null, team: teamName || null });
-    return json({ id, employeeNumber, onboardingStatus: "invited", accessRole: roleName }, { status: 201 });
+    return json({ id, employeeNumber, onboardingStatus: "invited", accessRole: roleName, invitationEmailAccepted: true, invitationEmailStatus: "accepted", emailMessageId: delivery.messageId || null }, { status: 201 });
   }
 
   const employeeInviteMatch = path.match(/^\/api\/employees\/([^/]+)\/invite$/);
@@ -1050,14 +1101,18 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const employee = await env.DB.prepare(`SELECT e.id, e.user_id as userId, e.email, e.first_name as firstName, e.last_name as lastName, o.name as organizationName FROM employees e JOIN organizations o ON o.id = e.organization_id WHERE e.id = ? AND e.organization_id = ? AND e.onboarding_status = 'invited' AND e.deleted_at IS NULL`).bind(employeeInviteMatch[1], context.organizationId).first<{ id: string; userId: string; email: string; firstName: string; lastName: string; organizationName: string }>();
     if (!employee?.userId) return error("No pending employee invitation was found.", 404);
     const token = randomToken(); const inviteId = `inv-${crypto.randomUUID()}`;
-    await env.DB.prepare(`INSERT INTO employee_invites (id, organization_id, employee_id, user_id, token_hash, expires_at) VALUES (?, ?, ?, ?, ?, datetime('now', '+72 hours'))`).bind(inviteId, context.organizationId, employee.id, employee.userId, await hashToken(token)).run();
-    if (!await sendEmployeeInviteEmail(env, employee.email, `${employee.firstName} ${employee.lastName}`, employee.organizationName, token)) {
-      await env.DB.prepare(`DELETE FROM employee_invites WHERE id = ?`).bind(inviteId).run();
-      return error("We couldn’t deliver the invitation. Confirm the Brevo sender and try again.", 503);
+    await env.DB.prepare(`INSERT INTO employee_invites (id, organization_id, employee_id, user_id, token_hash, expires_at, email_status, last_attempt_at) VALUES (?, ?, ?, ?, ?, datetime('now', '+72 hours'), 'pending', CURRENT_TIMESTAMP)`).bind(inviteId, context.organizationId, employee.id, employee.userId, await hashToken(token)).run();
+    const delivery = await sendEmployeeInviteEmail(env, employee.email, `${employee.firstName} ${employee.lastName}`, employee.organizationName, token);
+    if (!delivery.accepted) {
+      const deliveryError = inviteDeliveryError(delivery);
+      await env.DB.prepare(`UPDATE employee_invites SET email_status = 'failed', last_error = ?, last_attempt_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(deliveryError, inviteId).run();
+      await audit(env, context, "invitation_email_failed", "employees", employee.id, { reason: delivery.cause, resend: true });
+      return json({ ok: true, invitationEmailAccepted: false, invitationEmailStatus: "failed", invitationEmailError: deliveryError });
     }
-    await env.DB.prepare(`UPDATE employee_invites SET accepted_at = CURRENT_TIMESTAMP WHERE employee_id = ? AND id != ? AND accepted_at IS NULL`).bind(employee.id, inviteId).run();
+    await env.DB.prepare(`UPDATE employee_invites SET email_status = 'accepted', email_message_id = ?, last_error = NULL, last_attempt_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(delivery.messageId || null, inviteId).run();
+    await env.DB.prepare(`UPDATE employee_invites SET expires_at = CURRENT_TIMESTAMP WHERE employee_id = ? AND id != ? AND accepted_at IS NULL`).bind(employee.id, inviteId).run();
     await audit(env, context, "invitation_resent", "employees", employee.id);
-    return json({ ok: true });
+    return json({ ok: true, invitationEmailAccepted: true, invitationEmailStatus: "accepted", emailMessageId: delivery.messageId || null });
   }
 
   if (request.method === "GET" && path === "/api/leave") {
