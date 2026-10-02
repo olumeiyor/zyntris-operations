@@ -9,7 +9,7 @@ Cloudflare-native operations SaaS for **Zyntris — One Platform. Every Operatio
 - D1 schema for organizations, memberships, roles, permissions, employees, leave, projects, tasks, expenses, documents, notifications, subscriptions and audit logs.
 - Operational modules for expense claims, approval requests, budgets, assets, vendors, helpdesk, calendar and customer pipeline.
 - Branded Zyntris logo system with SVG favicon, responsive brand lockup and the `One Platform. Every Operation.` visual language.
-- Organization registration with verified-email activation, tenant-specific administrator membership, and a 30-day trial.
+- Organization registration with verified-email activation, tenant-specific administrator membership, and a 15-day trial.
 - Organization profile, time zone, and currency settings stored in D1.
 - Remuneration records: employee compensation profiles, recurring earnings/deductions, configurable tax/contribution bands, draft calculations, review/approval, employee self-service payslips and payroll-register CSV. Payroll-authorized admins can collect bank details encrypted at rest for record keeping (masked in the UI); no payout files or bank transfers are initiated, and “paid” is a manual record status only.
 - HR-controlled employee onboarding with tenant-scoped department/team profiles, assigned access roles, Brevo email invitations, single-use 72-hour account-setup links, and resend support. Requesters receive Brevo email notices when a request or payroll run is approved.
@@ -57,10 +57,11 @@ Set production secrets in Wrangler (the values are entered interactively and mus
 ```bash
 npx wrangler secret put SESSION_SECRET
 npx wrangler secret put BREVO_API_KEY
-npx wrangler secret put PLATFORM_ADMIN_EMAILS
 npx wrangler secret put DEMO_ACCESS_PASSWORD
 npm run deploy
 ```
+
+The allowlisted main administrator email is a non-secret Worker variable in `wrangler.jsonc` (`PLATFORM_ADMIN_EMAILS`). Change that config only when deliberately changing platform-admin access. `Olumeiyor@gmail.com` is the configured main administrator for this deployment.
 
 `EMAIL_SENDER` must be a sender identity registered and verified with Brevo. The Worker sends signup-verification and employee-invitation links through Brevo's transactional email API; these actions fail closed when `BREVO_API_KEY` is absent or delivery fails. Keep the existing `SESSION_SECRET` stable for session security and encryption of stored employee bank details.
 
@@ -74,7 +75,7 @@ Every organization-owned table has an `organization_id`. The Worker derives the 
 
 The shared demo administrator login has been removed. Account passwords are PBKDF2-hashed; verified users receive short-lived HTTP-only, Secure, SameSite cookies backed by hashed D1 session tokens. Organization membership and role permissions determine access. Signup/login attempts are rate-limited in D1.
 
-Platform administration is read-only and enabled only for verified email addresses listed in the `PLATFORM_ADMIN_EMAILS` Worker secret (comma-separated for multiple admins). Platform admins still need a normal verified Zyntris account; never add a public/shared demo address to this allowlist. The console excludes the demo tenant and shows organization-level counts plus audit events without payroll or bank data.
+Platform administration is enabled only for verified email addresses listed in the `PLATFORM_ADMIN_EMAILS` Worker variable (comma-separated for multiple admins). Platform admins still need a normal verified Zyntris account; never add a public/shared demo address to this allowlist. The console lists every tenant, including the protected synthetic demo tenant, with operational counts and audit events but no payroll or bank data. Admins may suspend or enable customer tenant access; re-enabling an expired trial explicitly converts its subscription to active and is recorded in the audit log. Tenant password resets send a one-use, 30-minute link through Brevo and revoke the user's active sessions; admins never see or set the user's password.
 
 Users can enable two-factor authentication from Account security. TOTP secrets are encrypted with `SESSION_SECRET`; sign-in challenges expire after five minutes and allow at most five code attempts. Recovery codes are stored only as hashes and each can be used once. Apply the D1 migration before deploying this feature. Keep `SESSION_SECRET` stable because it protects both payroll bank details and authenticator secrets.
 
@@ -92,7 +93,12 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - `POST /api/auth/logout`
 - `GET /api/me`
 - `GET /api/dashboard`
+- `/api/platform/*` — allowlisted main-administrator tenant controls, session revocation, and one-use Brevo password-reset links.
 - `GET|POST /api/employees`
+- `GET /api/appraisals` and `POST /api/appraisal-cycles` — employee self-reviews, assigned manager feedback, goal and competency scoring, acknowledgment, and cycle tracking.
+- `/api/appraisals/*` and `/api/appraisal-360/*` — KPI scoring, confidential multi-rater feedback, recommendations, and employee acceptance/decline.
+- `/api/hr/talent/*` — scoped KPI administration, improvement plans and check-ins, recruitment requisitions and candidate stages, plus learning assignment/progress.
+- `PATCH /api/employees/:id/manager` — HR-controlled line-manager assignment.
 - `POST /api/employees/:id/invite`
 - `GET /api/hr/options`
 - `POST /api/hr/teams`
@@ -121,10 +127,10 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - Calendar combines meetings, leave and training events.
 - CRM customer pipeline supports lead, qualified, proposal, negotiation and won stages.
 
-Remaining product phases include paid-plan checkout, password recovery, and extended talent modules (performance, goals, LMS, recruitment and AI).
+Implemented HR talent modules include line-manager assignments, organization/team/employee KPI libraries, multi-rater 360 feedback, employee appraisal decisions, PIP plans and check-ins, recruitment candidate pipelines, and course assignment/completion tracking. Paid-plan checkout, password recovery, and AI talent tools remain future work.
 
 ## Payroll policy setup
 
 Payroll does not preload statutory tax rates or pension percentages. Configure the organization's effective policy for its country, region and payroll period, then validate it with a local payroll/tax professional before approval. Tax bands are progressive and entered with ascending `upTo` thresholds and a final `null` threshold, for example `[ { "upTo": 1000000, "rate": 0.07 }, { "upTo": null, "rate": 0.1 } ]`. Rates are decimals. Employee base remuneration and recurring amounts are entered per pay period. Admins may store bank details encrypted for record purposes; account numbers are masked on screen and excluded from generated documents/exports. The app documents remuneration, prepares employee payslips and records approval/payment status; actual bank transfers are outside the platform.
 
-Paid-plan checkout, password recovery and extended talent modules are not yet integrated. Trial access is limited to 30 days; organizations must contact Zyntris to arrange a paid plan before expiry.
+Paid-plan checkout and extended talent modules are not yet integrated. New trials last 15 days from email verification. Expired trials are automatically suspended by the hourly Worker cron and cannot sign in; existing sessions are revoked. Organizations must contact Zyntris to arrange a paid plan before expiry.

@@ -13,13 +13,15 @@ type PayrollRun = { id: string; periodStart: string; periodEnd: string; paymentD
 type Notice = { id: string; title: string; body: string; type: string; readAt: string | null; createdAt: string };
 type Dashboard = { people: { total: number; active: number; onLeave: number }; leave: { pending: number }; projects: { active: number }; tasks: { overdue: number }; expenses: { total: number } };
 
+class ApiError extends Error { constructor(message: string, readonly status: number) { super(message); } }
+
 async function request<T>(path: string, token?: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_URL}/api/mobile${path}`, {
     ...init,
     headers: { ...(init?.body ? { "content-type": "application/json" } : {}), ...(token ? { authorization: `Bearer ${token}` } : {}), ...init?.headers },
   });
   const data = await response.json().catch(() => ({})) as T & { error?: string };
-  if (!response.ok) throw new Error(data.error || "Could not connect to your workspace.");
+  if (!response.ok) throw new ApiError(data.error || "Could not connect to your workspace.", response.status);
   return data;
 }
 
@@ -64,7 +66,15 @@ export default function App() {
 
   useEffect(() => {
     if (!token) return;
-    const interval = setInterval(() => { void loadWorkspace(token).catch(() => undefined); }, 45_000);
+    const interval = setInterval(() => {
+      void loadWorkspace(token).catch(async (cause) => {
+        if (cause instanceof ApiError && cause.status === 401) {
+          await SecureStore.deleteItemAsync(TOKEN_KEY);
+          setToken(null); setUser(null); setDashboard(null); setApprovals([]); setPayrollRuns([]); setNotices([]);
+          Alert.alert("Workspace access ended", "This tenant is no longer active. Contact Zyntris to restore service.");
+        }
+      });
+    }, 45_000);
     return () => clearInterval(interval);
   }, [token, loadWorkspace]);
 
@@ -133,7 +143,7 @@ export default function App() {
   };
 
   if (restoringSession) return <SafeAreaView style={styles.safe}><ExpoStatusBar style="light" /><View style={styles.restore}><Image source={zyntrisMark} style={styles.loginLogo} resizeMode="contain" /><ActivityIndicator color="#D8AA54" /></View></SafeAreaView>;
-  if (!user) return <SafeAreaView style={styles.safe}><ExpoStatusBar style="light" /><KeyboardAvoidingView style={styles.loginWrap} behavior={Platform.OS === "ios" ? "padding" : undefined}><View style={styles.logoPlate}><Image source={zyntrisMark} style={styles.loginLogo} resizeMode="contain" /></View><Text style={styles.brand}>ZYNTRIS</Text><Text style={styles.loginTitle}>{twoFactorChallenge ? "Verify it’s you." : "Your work, in one place."}</Text><Text style={styles.loginCaption}>{twoFactorChallenge ? "Enter a current authenticator code, or one unused recovery code." : "Sign in with your organization account."}</Text><TextInput style={styles.input} autoCapitalize="none" autoComplete="email" keyboardType="email-address" placeholder="Work email" placeholderTextColor="#9BA8AE" value={email} onChangeText={setEmail} editable={!twoFactorChallenge} /><TextInput style={styles.input} secureTextEntry autoComplete="current-password" placeholder="Password" placeholderTextColor="#9BA8AE" value={password} onChangeText={setPassword} editable={!twoFactorChallenge} />{twoFactorChallenge && <TextInput style={styles.input} autoCapitalize="characters" autoComplete="one-time-code" keyboardType="default" placeholder="Authenticator or recovery code" placeholderTextColor="#9BA8AE" value={twoFactorCode} onChangeText={setTwoFactorCode} />}<Pressable style={styles.primaryButton} onPress={() => void signIn()} disabled={busy}>{busy ? <ActivityIndicator color="#10212B" /> : <Text style={styles.primaryText}>{twoFactorChallenge ? "Verify and sign in" : "Sign in securely"}</Text>}</Pressable>{twoFactorChallenge && <Pressable onPress={() => { setTwoFactorChallenge(""); setTwoFactorCode(""); }}><Text style={[styles.privacy, { marginTop: 15 }]}>Back to password sign in</Text></Pressable>}<Text style={styles.privacy}>Protected organization workspace · 30-day trials supported</Text></KeyboardAvoidingView></SafeAreaView>;
+  if (!user) return <SafeAreaView style={styles.safe}><ExpoStatusBar style="light" /><KeyboardAvoidingView style={styles.loginWrap} behavior={Platform.OS === "ios" ? "padding" : undefined}><View style={styles.logoPlate}><Image source={zyntrisMark} style={styles.loginLogo} resizeMode="contain" /></View><Text style={styles.brand}>ZYNTRIS</Text><Text style={styles.loginTitle}>{twoFactorChallenge ? "Verify it’s you." : "Your work, in one place."}</Text><Text style={styles.loginCaption}>{twoFactorChallenge ? "Enter a current authenticator code, or one unused recovery code." : "Sign in with your organization account."}</Text><TextInput style={styles.input} autoCapitalize="none" autoComplete="email" keyboardType="email-address" placeholder="Work email" placeholderTextColor="#9BA8AE" value={email} onChangeText={setEmail} editable={!twoFactorChallenge} /><TextInput style={styles.input} secureTextEntry autoComplete="current-password" placeholder="Password" placeholderTextColor="#9BA8AE" value={password} onChangeText={setPassword} editable={!twoFactorChallenge} />{twoFactorChallenge && <TextInput style={styles.input} autoCapitalize="characters" autoComplete="one-time-code" keyboardType="default" placeholder="Authenticator or recovery code" placeholderTextColor="#9BA8AE" value={twoFactorCode} onChangeText={setTwoFactorCode} />}<Pressable style={styles.primaryButton} onPress={() => void signIn()} disabled={busy}>{busy ? <ActivityIndicator color="#10212B" /> : <Text style={styles.primaryText}>{twoFactorChallenge ? "Verify and sign in" : "Sign in securely"}</Text>}</Pressable>{twoFactorChallenge && <Pressable onPress={() => { setTwoFactorChallenge(""); setTwoFactorCode(""); }}><Text style={[styles.privacy, { marginTop: 15 }]}>Back to password sign in</Text></Pressable>}<Text style={styles.privacy}>Protected organization workspace · 15-day trials supported</Text></KeyboardAvoidingView></SafeAreaView>;
 
   const unread = notices.filter((item) => !item.readAt).length;
   return <SafeAreaView style={styles.safe}><ExpoStatusBar style="light" /><View style={styles.header}><View style={styles.headerBrand}><View style={styles.headerMark}><Image source={zyntrisMark} style={styles.headerLogo} resizeMode="contain" /></View><View><Text style={styles.headerTitle}>ZYNTRIS</Text><Text style={styles.orgName}>{user.organizationName}</Text></View></View><Pressable onPress={() => void signOut()}><Text style={styles.signOut}>Sign out</Text></Pressable></View><ScrollView contentContainerStyle={styles.content} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => void refresh()} tintColor="#D8AA54" />}>

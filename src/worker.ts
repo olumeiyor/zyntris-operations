@@ -92,6 +92,15 @@ function hasPermission(context: AuthContext, permission: string) {
   return context.permissions.has(permission);
 }
 
+async function workspaceAccessError(env: Env, organizationId: string) {
+  const workspace = await env.DB.prepare(`SELECT o.status as organizationStatus, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt FROM organizations o LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE o.id = ?`).bind(organizationId).first<{ organizationStatus: string; subscriptionStatus: string | null; trialEndsAt: string | null }>();
+  if (!workspace) return "The organization workspace is unavailable. Contact Zyntris support.";
+  const trialExpired = workspace.subscriptionStatus === "expired" || (workspace.subscriptionStatus === "trialing" && (!workspace.trialEndsAt || new Date(`${workspace.trialEndsAt.replace(" ", "T")}Z`).getTime() <= Date.now()));
+  if (trialExpired) return "This organization’s trial has ended and its services are off. Contact Zyntris to reactivate the workspace.";
+  if (workspace.organizationStatus === "suspended" || !["active", "trialing"].includes(workspace.subscriptionStatus || "")) return "This organization’s services are currently disabled. Contact your Zyntris administrator.";
+  return null;
+}
+
 function safeEqual(left: string, right: string) {
   if (left.length !== right.length) return false;
   let difference = 0;
@@ -299,6 +308,31 @@ function inviteDeliveryError(result: Exclude<InviteEmailResult, { accepted: true
   return `Brevo rejected the invitation (HTTP ${result.status || "unknown"}). Check the verified sender and domain authentication, then retry.`;
 }
 
+async function sendPasswordResetEmail(env: Env, email: string, fullName: string, organizationName: string, token: string) {
+  if (!env.BREVO_API_KEY) return { accepted: false as const, message: "Password reset email is not configured. Contact Zyntris support." };
+  const url = `${env.APP_ORIGIN}/?reset=${encodeURIComponent(token)}`;
+  const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] || char);
+  try {
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: { "api-key": env.BREVO_API_KEY, "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({
+        sender: brevoSender(env), to: [{ email, name: fullName }], subject: "Reset your Zyntris password",
+        textContent: `A Zyntris platform administrator requested a password reset for your ${organizationName} account. Set a new password here: ${url}. This one-time link expires in 30 minutes. If you did not expect this email, contact your organization administrator.`,
+        htmlContent: `<p>Hello ${escapeHtml(fullName)},</p><p>A Zyntris platform administrator requested a password reset for your <strong>${escapeHtml(organizationName)}</strong> account.</p><p><a href="${url}">Set a new password</a></p><p>This one-time link expires in 30 minutes. If you did not expect this email, contact your organization administrator.</p>`,
+      }),
+    });
+    if (response.ok) return { accepted: true as const };
+    const result = await response.json().catch(() => ({})) as { code?: string; message?: string };
+    console.error("Brevo rejected a platform password reset", { status: response.status, code: result.code || "unknown", message: result.message?.slice(0, 200) || "No provider detail" });
+    if (response.status === 401 || response.status === 403) return { accepted: false as const, message: "Brevo rejected its API key. Update the BREVO_API_KEY Worker secret." };
+    return { accepted: false as const, message: "Brevo did not accept the password reset email. Verify the sender and retry." };
+  } catch (cause) {
+    console.error("Brevo password-reset request failed", cause instanceof Error ? cause.name : "Unknown network error");
+    return { accepted: false as const, message: "Zyntris could not reach Brevo. Retry after checking email service connectivity." };
+  }
+}
+
 async function sendApprovalNotificationEmail(env: Env, email: string, fullName: string, organizationName: string, subject: string, message: string) {
   if (!env.BREVO_API_KEY) return false;
   const escapeHtml = (value: string) => value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[char] || char);
@@ -356,6 +390,8 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     if (!body.token || body.token.length !== 64 || !body.password || body.password.length < 12 || body.password.length > 128) return error("Use a valid invitation and a password of at least 12 characters.");
     const invite = await env.DB.prepare(`SELECT i.id as inviteId, i.user_id as userId, i.organization_id as organizationId, i.employee_id as employeeId FROM employee_invites i JOIN users u ON u.id = i.user_id AND u.status = 'invited' JOIN employees e ON e.id = i.employee_id AND e.onboarding_status = 'invited' WHERE i.token_hash = ? AND i.accepted_at IS NULL AND i.expires_at > CURRENT_TIMESTAMP LIMIT 1`).bind(await hashToken(body.token)).first<{ inviteId: string; userId: string; organizationId: string; employeeId: string }>();
     if (!invite) return error("This invitation is invalid, expired, or already used.", 400);
+    const inviteAccessError = await workspaceAccessError(env, invite.organizationId);
+    if (inviteAccessError) return error(inviteAccessError, 403);
     const claimedInvite = await env.DB.prepare(`UPDATE employee_invites SET accepted_at = CURRENT_TIMESTAMP WHERE id = ? AND accepted_at IS NULL AND expires_at > CURRENT_TIMESTAMP`).bind(invite.inviteId).run();
     if (!claimedInvite.meta.changes) return error("This invitation has already been used.", 409);
     await env.DB.batch([
@@ -415,7 +451,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
         env.DB.prepare(`INSERT INTO roles (id, organization_id, name, description, is_system) VALUES (?, ?, 'Manager', 'Manage team work and submit approvals', 1)`).bind(managerRoleId, orgId),
         env.DB.prepare(`INSERT INTO roles (id, organization_id, name, description, is_system) VALUES (?, ?, 'Employee', 'Standard employee workspace access', 1)`).bind(employeeRoleId, orgId),
         env.DB.prepare(`INSERT INTO memberships (id, organization_id, user_id, role_id) VALUES (?, ?, ?, ?)`).bind(`mem-${crypto.randomUUID()}`, orgId, userId, roleId),
-        env.DB.prepare(`INSERT INTO subscriptions (id, organization_id, plan, status, employee_limit, trial_ends_at) VALUES (?, ?, 'business', 'trialing', 100, datetime('now', '+30 days'))`).bind(subscriptionId, orgId),
+        env.DB.prepare(`INSERT INTO subscriptions (id, organization_id, plan, status, employee_limit, trial_ends_at) VALUES (?, ?, 'business', 'trialing', 100, NULL)`).bind(subscriptionId, orgId),
         env.DB.prepare(`INSERT INTO payroll_settings (organization_id, currency, tax_year) VALUES (?, 'NGN', ?)`).bind(orgId, now.getUTCFullYear()),
         env.DB.prepare(`INSERT INTO email_verification_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, datetime('now', '+24 hours'))`).bind(`evt-${crypto.randomUUID()}`, userId, await hashToken(token)),
         env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions`).bind(roleId),
@@ -449,9 +485,30 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     await env.DB.batch([
       env.DB.prepare(`UPDATE users SET email_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(row.userId),
       env.DB.prepare(`UPDATE email_verification_tokens SET used_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(row.tokenId),
+      env.DB.prepare(`UPDATE subscriptions SET trial_ends_at = datetime('now', '+15 days') WHERE organization_id = ? AND status = 'trialing' AND trial_ends_at IS NULL`).bind(row.organizationId),
     ]);
     const session = await createSession(env, row.userId, row.organizationId);
     return cookieResponse({ ok: true }, session);
+  }
+  if (request.method === "POST" && path === "/api/auth/reset-password") {
+    if (!mobile && !originAllowed(request, env)) return error("Request origin rejected", 403);
+    if (!(await consumeAuthLimit(env, request, "reset-password", 10, 30))) return error("Too many password reset attempts. Try again later.", 429);
+    const body = await request.json<{ token?: string; password?: string }>();
+    if (!body.token || body.token.length !== 64 || !body.password || body.password.length < 12 || body.password.length > 128) return error("Use a valid reset link and a password of at least 12 characters.");
+    const reset = await env.DB.prepare(`SELECT id, user_id as userId FROM password_reset_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP LIMIT 1`).bind(await hashToken(body.token)).first<{ id: string; userId: string }>();
+    if (!reset) return error("This password reset link is invalid, expired, or already used. Ask the platform administrator to send a new one.", 400);
+    const claimId = requestId();
+    const claimed = await env.DB.prepare(`UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP, claim_id = ? WHERE id = ? AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`).bind(claimId, reset.id).run();
+    if (!claimed.meta.changes) return error("This password reset link has already been used. Ask the platform administrator to send a new one.", 409);
+    const saved = await env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'active'`).bind(await passwordHash(body.password), reset.userId).run();
+    if (!saved.meta.changes) return error("This account cannot reset its password. Contact your organization administrator.", 409);
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(reset.userId),
+      env.DB.prepare(`DELETE FROM two_factor_challenges WHERE user_id = ?`).bind(reset.userId),
+      env.DB.prepare(`DELETE FROM password_reset_tokens WHERE user_id = ? AND id != ?`).bind(reset.userId, reset.id),
+      env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id) SELECT ?, organization_id, NULL, 'password_reset_completed', 'authentication', 'user', ? FROM password_reset_tokens WHERE id = ? AND claim_id = ?`).bind(`audit-${crypto.randomUUID()}`, reset.userId, reset.id, claimId),
+    ]);
+    return json({ ok: true });
   }
   if (request.method === "POST" && path === "/api/auth/2fa/verify") {
     if (!mobile && !originAllowed(request, env)) return error("Request origin rejected", 403);
@@ -461,6 +518,8 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     const challenge = await env.DB.prepare(`SELECT id, user_id as userId, organization_id as organizationId, is_mobile as isMobile, attempts FROM two_factor_challenges WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP LIMIT 1`)
       .bind(await hashToken(body.challengeToken)).first<{ id: string; userId: string; organizationId: string; isMobile: number; attempts: number }>();
     if (!challenge || challenge.isMobile !== (mobile ? 1 : 0)) return error("This sign-in challenge is invalid or expired. Sign in again.", 401);
+    const challengeAccessError = await workspaceAccessError(env, challenge.organizationId);
+    if (challengeAccessError) { await env.DB.prepare(`DELETE FROM two_factor_challenges WHERE id = ?`).bind(challenge.id).run(); return error(challengeAccessError, 403); }
     if (challenge.attempts >= 5) { await env.DB.prepare(`DELETE FROM two_factor_challenges WHERE id = ?`).bind(challenge.id).run(); return error("Too many incorrect codes. Sign in again.", 429); }
     const factor = await env.DB.prepare(`SELECT secret_enc as secretEnc, enabled_at as enabledAt, last_counter as lastCounter FROM user_two_factor WHERE user_id = ?`).bind(challenge.userId).first<{ secretEnc: string | null; enabledAt: string | null; lastCounter: number }>();
     let valid = false;
@@ -497,6 +556,8 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
     const membership = await env.DB.prepare(`SELECT organization_id as organizationId FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created_at LIMIT 1`).bind(user.id).first<{ organizationId: string }>();
     if (!membership) return error("No active organization is linked to this account.", 403);
+    const accessError = await workspaceAccessError(env, membership.organizationId);
+    if (accessError) return error(accessError, 403);
     const factor = await env.DB.prepare(`SELECT enabled_at as enabledAt FROM user_two_factor WHERE user_id = ?`).bind(user.id).first<{ enabledAt: string | null }>();
     if (factor?.enabledAt) return issueTwoFactorChallenge(env, user.id, membership.organizationId, false);
     await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type) VALUES (?, ?, ?, 'signed_in', 'authentication', 'session')`)
@@ -516,6 +577,370 @@ async function requireAuth(request: Request, env: Env) {
 async function audit(env: Env, context: AuthContext, action: string, module: string, recordId?: string, newValue?: unknown) {
   await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_id, new_value_json) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .bind(requestId(), context.organizationId, context.userId, action, module, recordId || null, newValue ? JSON.stringify(newValue) : null).run();
+}
+
+function validAppraisalReview(body: Record<string, unknown>) {
+  const overallRating = Number(body.overallRating);
+  const goals = Array.isArray(body.goals) ? body.goals as Array<Record<string, unknown>> : [];
+  const competencies = Array.isArray(body.competencies) ? body.competencies as Array<Record<string, unknown>> : [];
+  const kpiScores = Array.isArray(body.kpiScores) ? body.kpiScores as Array<Record<string, unknown>> : [];
+  const validRating = (value: unknown) => Number.isInteger(Number(value)) && Number(value) >= 1 && Number(value) <= 5;
+  if (!validRating(overallRating) || typeof body.summary !== "string" || !body.summary.trim() || body.summary.length > 4000 || typeof body.strengths !== "string" || typeof body.developmentPlan !== "string") return null;
+  if (goals.length > 12 || competencies.length > 12 || goals.some((goal) => typeof goal.title !== "string" || !goal.title.trim() || goal.title.length > 250 || typeof goal.successMeasure !== "string" || !validRating(goal.rating) || typeof goal.result !== "string") || competencies.some((item) => typeof item.name !== "string" || !item.name.trim() || item.name.length > 160 || !validRating(item.rating) || typeof item.comments !== "string")) return null;
+  if (kpiScores.length > 100 || kpiScores.some((score) => typeof score.kpiId !== "string" || !validRating(score.rating) || typeof score.evidence !== "string" || typeof score.comment !== "string")) return null;
+  return { overallRating, summary: body.summary.trim(), strengths: body.strengths.slice(0, 4000), developmentPlan: body.developmentPlan.slice(0, 4000), recommendation: typeof body.recommendation === "string" ? body.recommendation.slice(0, 4000) : "", goals, competencies, kpiScores };
+}
+
+async function saveAppraisalKpiScores(env: Env, context: AuthContext, appraisalId: string, scores: Array<Record<string, unknown>>, side: "self" | "manager") {
+  const assigned = await env.DB.prepare(`SELECT kpi_id as kpiId FROM appraisal_kpi_scores WHERE organization_id = ? AND appraisal_id = ?`).bind(context.organizationId, appraisalId).all<{ kpiId: string }>();
+  if ((assigned.results || []).length !== scores.length || new Set(scores.map((score) => score.kpiId)).size !== scores.length || (assigned.results || []).some((row) => !scores.some((score) => score.kpiId === row.kpiId))) return false;
+  if (!scores.length) return true;
+  await env.DB.batch(scores.map((score) => side === "self"
+    ? env.DB.prepare(`UPDATE appraisal_kpi_scores SET self_rating = ?, self_result = ? WHERE organization_id = ? AND appraisal_id = ? AND kpi_id = ?`).bind(Number(score.rating), String(score.evidence).slice(0, 2000), context.organizationId, appraisalId, score.kpiId)
+    : env.DB.prepare(`UPDATE appraisal_kpi_scores SET manager_rating = ?, manager_comment = ? WHERE organization_id = ? AND appraisal_id = ? AND kpi_id = ?`).bind(Number(score.rating), String(score.comment).slice(0, 2000), context.organizationId, appraisalId, score.kpiId)));
+  return true;
+}
+
+async function handleAppraisals(request: Request, env: Env, context: AuthContext, path: string): Promise<Response | null> {
+  const canManage = hasPermission(context, "appraisals.manage");
+  const canReview = hasPermission(context, "appraisals.view");
+  const canSelfReview = hasPermission(context, "appraisals.self.view");
+  if (!path.startsWith("/api/appraisals") && !path.startsWith("/api/appraisal-cycles") && !path.startsWith("/api/appraisal-360/")) return null;
+
+  if (path === "/api/appraisals" && request.method === "GET") {
+    if (!canManage && !canReview && !canSelfReview) return error("Appraisal access is not enabled for this account.", 403);
+    const appraisals = await env.DB.prepare(`
+      SELECT a.id, a.cycle_id as cycleId, c.name as cycleName, c.period_start as periodStart, c.period_end as periodEnd,
+        c.self_review_due as selfReviewDue, c.manager_review_due as managerReviewDue, c.status as cycleStatus,
+        a.employee_id as employeeId, e.user_id as employeeUserId, e.first_name || ' ' || e.last_name as employeeName,
+        e.job_title as jobTitle, d.name as department, a.reviewer_user_id as reviewerUserId,
+        ru.full_name as reviewerName, a.status, a.self_review_json as selfReviewJson,
+        a.manager_review_json as managerReviewJson, a.employee_acknowledgment as employeeAcknowledgment,
+        a.employee_decision as employeeDecision, a.decision_note as decisionNote, a.manager_recommendation as managerRecommendation,
+        a.self_submitted_at as selfSubmittedAt, a.manager_submitted_at as managerSubmittedAt,
+        a.acknowledged_at as acknowledgedAt, a.updated_at as updatedAt
+      FROM appraisals a JOIN appraisal_cycles c ON c.id = a.cycle_id AND c.organization_id = a.organization_id
+      JOIN employees e ON e.id = a.employee_id AND e.organization_id = a.organization_id
+      LEFT JOIN departments d ON d.id = e.department_id JOIN users ru ON ru.id = a.reviewer_user_id
+      WHERE a.organization_id = ? AND (? = 1 OR e.user_id = ? OR a.reviewer_user_id = ?)
+      ORDER BY c.created_at DESC, e.first_name, e.last_name
+    `).bind(context.organizationId, canManage ? 1 : 0, context.userId, canReview ? context.userId : "").all();
+    const appraisalKpis = await env.DB.prepare(`
+      SELECT s.appraisal_id as appraisalId, s.kpi_id as kpiId, k.name, k.metric, k.target, k.weight,
+        s.self_rating as selfRating, s.self_result as selfResult, s.manager_rating as managerRating, s.manager_comment as managerComment
+      FROM appraisal_kpi_scores s JOIN appraisals a ON a.id = s.appraisal_id AND a.organization_id = s.organization_id
+      JOIN employees e ON e.id = a.employee_id AND e.organization_id = a.organization_id
+      JOIN performance_kpis k ON k.id = s.kpi_id AND k.organization_id = s.organization_id
+      WHERE s.organization_id = ? AND (? = 1 OR e.user_id = ? OR a.reviewer_user_id = ?)
+      ORDER BY k.name
+    `).bind(context.organizationId, canManage ? 1 : 0, context.userId, canReview ? context.userId : "").all<{ appraisalId: string; kpiId: string; name: string; metric: string; target: string; weight: number; selfRating: number | null; selfResult: string | null; managerRating: number | null; managerComment: string | null }>();
+    const kpiMap = new Map<string, typeof appraisalKpis.results>();
+    for (const score of appraisalKpis.results || []) kpiMap.set(score.appraisalId, [...(kpiMap.get(score.appraisalId) || []), score]);
+    const cycles = await env.DB.prepare(`
+      SELECT c.id, c.name, c.period_start as periodStart, c.period_end as periodEnd,
+        c.self_review_due as selfReviewDue, c.manager_review_due as managerReviewDue, c.status,
+        c.created_at as createdAt, COUNT(a.id) as totalReviews,
+        SUM(CASE WHEN a.status = 'complete' THEN 1 ELSE 0 END) as completedReviews
+      FROM appraisal_cycles c LEFT JOIN appraisals a ON a.cycle_id = c.id AND a.organization_id = c.organization_id
+      WHERE c.organization_id = ? AND (? = 1 OR a.employee_id IN (SELECT id FROM employees WHERE user_id = ?) OR a.reviewer_user_id = ?)
+      GROUP BY c.id ORDER BY c.created_at DESC
+    `).bind(context.organizationId, canManage ? 1 : 0, context.userId, canReview ? context.userId : "").all();
+    return json({ cycles: cycles.results || [], appraisals: (appraisals.results || []).map((item) => ({ ...item, kpis: kpiMap.get(String(item.id)) || [] })), canManage });
+  }
+
+  if (path === "/api/appraisals/360-inbox" && request.method === "GET") {
+    const inbox = await env.DB.prepare(`SELECT f.id, f.relationship, f.status, c.name as cycleName, e.first_name || ' ' || e.last_name as employeeName, e.job_title as jobTitle FROM appraisal_360_feedback f JOIN appraisals a ON a.id = f.appraisal_id AND a.organization_id = f.organization_id JOIN appraisal_cycles c ON c.id = a.cycle_id AND c.organization_id = a.organization_id JOIN employees e ON e.id = a.employee_id AND e.organization_id = a.organization_id WHERE f.organization_id = ? AND f.respondent_user_id = ? ORDER BY f.created_at DESC`).bind(context.organizationId, context.userId).all();
+    return json({ data: inbox.results || [] });
+  }
+
+  const feedbackPath = path.match(/^\/api\/appraisals\/([^/]+)\/360-feedback$/);
+  if (request.method === "GET" && feedbackPath) {
+    const record = await env.DB.prepare(`SELECT a.id, e.user_id as employeeUserId, a.reviewer_user_id as reviewerUserId FROM appraisals a JOIN employees e ON e.id = a.employee_id AND e.organization_id = a.organization_id WHERE a.id = ? AND a.organization_id = ?`).bind(feedbackPath[1], context.organizationId).first<{ id: string; employeeUserId: string | null; reviewerUserId: string }>();
+    if (!record) return error("Appraisal not found.", 404);
+    if (context.userId !== record.employeeUserId && context.userId !== record.reviewerUserId && !canManage) return error("You are not authorized to view this appraisal feedback.", 403);
+    const results = await env.DB.prepare(`SELECT feedback_json as feedbackJson, submitted_at as submittedAt FROM appraisal_360_feedback WHERE organization_id = ? AND appraisal_id = ? AND status = 'submitted' ORDER BY submitted_at`).bind(context.organizationId, record.id).all<{ feedbackJson: string; submittedAt: string }>();
+    const minimumReached = (results.results || []).length >= 3;
+    return json({ submittedCount: (results.results || []).length, minimumRequired: 3, feedback: minimumReached ? (results.results || []).map((row) => ({ ...JSON.parse(row.feedbackJson), submittedAt: row.submittedAt })) : [], anonymous: true });
+  }
+
+  const invite360Path = path.match(/^\/api\/appraisals\/([^/]+)\/360-invitations$/);
+  if (request.method === "POST" && invite360Path) {
+    const body = await request.json<{ respondents?: { employeeId: string; relationship: string }[] }>();
+    const appraisal = await env.DB.prepare(`SELECT a.id, a.status, c.status as cycleStatus, e.user_id as employeeUserId, e.first_name || ' ' || e.last_name as employeeName FROM appraisals a JOIN appraisal_cycles c ON c.id = a.cycle_id AND c.organization_id = a.organization_id JOIN employees e ON e.id = a.employee_id AND e.organization_id = a.organization_id WHERE a.id = ? AND a.organization_id = ?`).bind(invite360Path[1], context.organizationId).first<{ id: string; status: string; cycleStatus: string; employeeUserId: string | null; employeeName: string }>();
+    if (!appraisal) return error("Appraisal not found.", 404);
+    if (!canManage && context.userId !== appraisal.employeeUserId) return error("Only the employee or HR administrator can nominate 360 reviewers.", 403);
+    if (appraisal.cycleStatus !== "open" || appraisal.status !== "self_review") return error("360 reviewers must be nominated before the employee submits their self-review.", 409);
+    if (!body.respondents?.length || body.respondents.length > 8 || body.respondents.some((item) => !['peer','direct_report','cross_functional'].includes(item.relationship))) return error("Choose 1–8 reviewers and classify each relationship.");
+    const eligible: { userId: string; relationship: string }[] = [];
+    for (const respondent of body.respondents) {
+      const person = await env.DB.prepare(`SELECT e.user_id as userId FROM employees e WHERE e.id = ? AND e.organization_id = ? AND e.status = 'active' AND e.deleted_at IS NULL`).bind(respondent.employeeId, context.organizationId).first<{ userId: string | null }>();
+      if (!person?.userId || person.userId === appraisal.employeeUserId) return error("Each 360 reviewer must be a different active employee in this organization.");
+      eligible.push({ userId: person.userId, relationship: respondent.relationship });
+    }
+    if (new Set(eligible.map((item) => item.userId)).size !== eligible.length) return error("Select each 360 reviewer only once.");
+    const statements: D1PreparedStatement[] = [];
+    for (const item of eligible) {
+      statements.push(env.DB.prepare(`INSERT INTO appraisal_360_feedback (id, organization_id, appraisal_id, respondent_user_id, relationship) VALUES (?, ?, ?, ?, ?)`).bind(`360-${crypto.randomUUID()}`, context.organizationId, appraisal.id, item.userId, item.relationship));
+      statements.push(env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'appraisal_360', ?, ?)`).bind(requestId(), context.organizationId, item.userId, "360 feedback requested", `Please provide confidential peer feedback for ${appraisal.employeeName}.`));
+    }
+    await env.DB.batch(statements);
+    await audit(env, context, "360_reviewers_nominated", "appraisals", appraisal.id, { reviewerCount: eligible.length });
+    return json({ invitedCount: eligible.length }, { status: 201 });
+  }
+
+  const feedbackSubmit = path.match(/^\/api\/appraisal-360\/([^/]+)\/submit$/);
+  if (request.method === "POST" && feedbackSubmit) {
+    const assignment = await env.DB.prepare(`SELECT f.id, f.status, a.employee_id as employeeId, a.organization_id as organizationId, e.first_name || ' ' || e.last_name as employeeName, a.reviewer_user_id as reviewerUserId, c.status as cycleStatus FROM appraisal_360_feedback f JOIN appraisals a ON a.id = f.appraisal_id AND a.organization_id = f.organization_id JOIN appraisal_cycles c ON c.id = a.cycle_id AND c.organization_id = a.organization_id JOIN employees e ON e.id = a.employee_id AND e.organization_id = a.organization_id WHERE f.id = ? AND f.organization_id = ? AND f.respondent_user_id = ?`).bind(feedbackSubmit[1], context.organizationId, context.userId).first<{ id: string; status: string; employeeId: string; organizationId: string; employeeName: string; reviewerUserId: string; cycleStatus: string }>();
+    if (!assignment) return error("360 feedback assignment not found.", 404);
+    if (assignment.status !== "assigned" || assignment.cycleStatus !== "open") return error("This 360 feedback request is no longer open.", 409);
+    const body = await request.json<Record<string, unknown>>();
+    if (!Number.isInteger(Number(body.overallRating)) || Number(body.overallRating) < 1 || Number(body.overallRating) > 5 || typeof body.summary !== "string" || body.summary.trim().length < 5 || typeof body.strengths !== "string" || typeof body.improvements !== "string" || typeof body.recommendation !== "string") return error("Provide an overall rating, evidence-based feedback, strengths and growth suggestions.");
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE appraisal_360_feedback SET status = 'submitted', feedback_json = ?, submitted_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND respondent_user_id = ? AND status = 'assigned'`).bind(JSON.stringify({ overallRating: Number(body.overallRating), summary: body.summary.trim().slice(0, 3000), strengths: body.strengths.trim().slice(0, 2000), improvements: body.improvements.trim().slice(0, 2000), recommendation: body.recommendation.trim().slice(0, 2000) }), assignment.id, context.organizationId, context.userId),
+      env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'appraisal_360_received', ?, ?)`).bind(requestId(), context.organizationId, assignment.reviewerUserId, "360 feedback received", `A confidential 360 response for ${assignment.employeeName} has been submitted.`),
+    ]);
+    await audit(env, context, "360_feedback_submitted", "appraisals", assignment.id);
+    return json({ ok: true });
+  }
+
+  if (path === "/api/appraisal-cycles" && request.method === "POST") {
+    if (!canManage) return error("HR or organization administrator access is required to create an appraisal cycle.", 403);
+    const body = await request.json<{ name?: string; periodStart?: string; periodEnd?: string; selfReviewDue?: string; managerReviewDue?: string }>();
+    const name = body.name?.trim();
+    const validDate = (value?: string) => Boolean(value && /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)));
+    if (!name || name.length > 120 || !validDate(body.periodStart) || !validDate(body.periodEnd) || !validDate(body.selfReviewDue) || !validDate(body.managerReviewDue) || body.periodEnd! < body.periodStart! || body.managerReviewDue! < body.selfReviewDue!) return error("Enter a cycle name and valid review-period and deadline dates.");
+    const employeeCount = await env.DB.prepare(`SELECT COUNT(*) as total FROM employees e JOIN users u ON u.id = e.user_id AND u.status = 'active' JOIN memberships m ON m.user_id = u.id AND m.organization_id = e.organization_id AND m.status = 'active' WHERE e.organization_id = ? AND e.deleted_at IS NULL AND e.status = 'active'`).bind(context.organizationId).first<{ total: number }>();
+    if (!employeeCount?.total) return error("No active, onboarded employees are eligible for this appraisal cycle.", 409);
+    const cycleId = `cycle-${crypto.randomUUID()}`;
+    const statements: D1PreparedStatement[] = [
+      env.DB.prepare(`INSERT INTO appraisal_cycles (id, organization_id, name, period_start, period_end, self_review_due, manager_review_due, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(cycleId, context.organizationId, name, body.periodStart, body.periodEnd, body.selfReviewDue, body.managerReviewDue, context.userId),
+      env.DB.prepare(`INSERT INTO appraisals (id, organization_id, cycle_id, employee_id, reviewer_user_id) SELECT 'appraisal-' || lower(hex(randomblob(16))), e.organization_id, ?, e.id, COALESCE(mm.user_id, ?) FROM employees e JOIN users eu ON eu.id = e.user_id AND eu.status = 'active' JOIN memberships em ON em.user_id = eu.id AND em.organization_id = e.organization_id AND em.status = 'active' LEFT JOIN employees manager ON manager.id = e.manager_id AND manager.organization_id = e.organization_id AND manager.deleted_at IS NULL LEFT JOIN users mu ON mu.id = manager.user_id AND mu.status = 'active' LEFT JOIN memberships mm ON mm.user_id = mu.id AND mm.organization_id = e.organization_id AND mm.status = 'active' WHERE e.organization_id = ? AND e.deleted_at IS NULL AND e.status = 'active'`).bind(cycleId, context.userId, context.organizationId),
+      env.DB.prepare(`INSERT INTO appraisal_kpi_scores (id, organization_id, appraisal_id, kpi_id) SELECT 'kpiscore-' || lower(hex(randomblob(16))), a.organization_id, a.id, k.id FROM appraisals a JOIN employees e ON e.id = a.employee_id AND e.organization_id = a.organization_id JOIN performance_kpis k ON k.organization_id = a.organization_id AND k.status = 'active' AND (k.employee_id = e.id OR k.team_id = e.team_id OR (k.employee_id IS NULL AND k.team_id IS NULL)) WHERE a.organization_id = ? AND a.cycle_id = ?`).bind(context.organizationId, cycleId),
+      env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) SELECT 'notif-' || lower(hex(randomblob(16))), e.organization_id, eu.id, 'appraisal_assigned', 'Self-review assigned', ? || ': complete your self-review by ' || ? || '.' FROM employees e JOIN users eu ON eu.id = e.user_id AND eu.status = 'active' JOIN memberships em ON em.user_id = eu.id AND em.organization_id = e.organization_id AND em.status = 'active' WHERE e.organization_id = ? AND e.deleted_at IS NULL AND e.status = 'active'`).bind(name, body.selfReviewDue, context.organizationId),
+      env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) SELECT 'notif-' || lower(hex(randomblob(16))), a.organization_id, a.reviewer_user_id, 'appraisal_assigned', 'Manager reviews assigned', COUNT(*) || ' manager review(s) for ' || c.name || ' are due by ' || c.manager_review_due || '.' FROM appraisals a JOIN appraisal_cycles c ON c.id = a.cycle_id AND c.organization_id = a.organization_id JOIN employees e ON e.id = a.employee_id AND e.organization_id = a.organization_id WHERE a.organization_id = ? AND a.cycle_id = ? AND a.reviewer_user_id != e.user_id GROUP BY a.reviewer_user_id`).bind(context.organizationId, cycleId),
+      env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id, new_value_json) VALUES (?, ?, ?, 'created', 'appraisals', 'appraisal_cycle', ?, ?)`).bind(requestId(), context.organizationId, context.userId, cycleId, JSON.stringify({ name, employeeCount: employeeCount.total, periodStart: body.periodStart, periodEnd: body.periodEnd })),
+    ];
+    await env.DB.batch(statements);
+    return json({ id: cycleId, assignedCount: employeeCount.total }, { status: 201 });
+  }
+
+  const cycleMatch = path.match(/^\/api\/appraisal-cycles\/([^/]+)$/);
+  if (request.method === "PATCH" && cycleMatch) {
+    if (!canManage) return error("HR or organization administrator access is required to close an appraisal cycle.", 403);
+    const body = await request.json<{ status?: string }>();
+    if (body.status !== "closed") return error("Appraisal cycles can only be closed through this action.");
+    const result = await env.DB.prepare(`UPDATE appraisal_cycles SET status = 'closed', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'open'`).bind(cycleMatch[1], context.organizationId).run();
+    if (!result.meta.changes) return error("Open appraisal cycle not found.", 404);
+    await audit(env, context, "closed", "appraisals", cycleMatch[1]);
+    return json({ ok: true, status: "closed" });
+  }
+
+  const actionMatch = path.match(/^\/api\/appraisals\/([^/]+)\/(self-review|manager-review|acknowledge|decision)$/);
+  if (request.method === "POST" && actionMatch) {
+    const [, appraisalId, action] = actionMatch;
+    const appraisal = await env.DB.prepare(`SELECT a.id, e.user_id as employeeUserId, e.first_name || ' ' || e.last_name as employeeName, a.reviewer_user_id as reviewerUserId, a.status, c.name as cycleName, c.status as cycleStatus FROM appraisals a JOIN employees e ON e.id = a.employee_id AND e.organization_id = a.organization_id JOIN appraisal_cycles c ON c.id = a.cycle_id AND c.organization_id = a.organization_id WHERE a.id = ? AND a.organization_id = ?`)
+      .bind(appraisalId, context.organizationId).first<{ id: string; employeeUserId: string; employeeName: string; reviewerUserId: string; status: string; cycleName: string; cycleStatus: string }>();
+    if (!appraisal) return error("Appraisal not found.", 404);
+    if (appraisal.cycleStatus !== "open") return error("This appraisal cycle is closed.", 409);
+    if (action === "self-review") {
+      if (context.userId !== appraisal.employeeUserId || !canSelfReview) return error("Only the assigned employee can submit their self-review.", 403);
+      if (appraisal.status !== "self_review") return error("This self-review has already been submitted.", 409);
+      const review = validAppraisalReview(await request.json<Record<string, unknown>>());
+      if (!review) return error("Complete the 1–5 overall rating, summary, strengths, development plan, and valid goal and competency ratings.");
+      if (!await saveAppraisalKpiScores(env, context, appraisalId, review.kpiScores, "self")) return error("Complete the rating and evidence for every KPI assigned to this appraisal.");
+      await env.DB.batch([
+        env.DB.prepare(`UPDATE appraisals SET self_review_json = ?, status = 'manager_review', self_submitted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'self_review'`).bind(JSON.stringify(review), appraisalId, context.organizationId),
+        env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'appraisal_ready', ?, ?)`).bind(requestId(), context.organizationId, appraisal.reviewerUserId, "Self-review submitted", `${appraisal.employeeName} submitted their self-review for ${appraisal.cycleName}.`),
+      ]);
+    } else if (action === "manager-review") {
+      if (appraisal.reviewerUserId !== context.userId && !canManage) return error("Only the assigned reviewer or HR administrator can submit this manager review.", 403);
+      if (appraisal.status !== "manager_review") return error("The employee must submit their self-review before manager review.", 409);
+      const review = validAppraisalReview(await request.json<Record<string, unknown>>());
+      if (!review) return error("Complete the 1–5 overall rating, summary, strengths, development plan, and valid goal and competency ratings.");
+      if (!await saveAppraisalKpiScores(env, context, appraisalId, review.kpiScores, "manager")) return error("Complete the manager rating and comment for every KPI assigned to this appraisal.");
+      await env.DB.batch([
+        env.DB.prepare(`UPDATE appraisals SET manager_review_json = ?, manager_recommendation = ?, status = 'acknowledgment', manager_submitted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'manager_review'`).bind(JSON.stringify(review), review.recommendation, appraisalId, context.organizationId),
+        env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'appraisal_acknowledgment', ?, ?)`).bind(requestId(), context.organizationId, appraisal.employeeUserId, "Appraisal ready to acknowledge", `Your manager completed the ${appraisal.cycleName} review. Please read and acknowledge it.`),
+      ]);
+    } else {
+      if (context.userId !== appraisal.employeeUserId || !canSelfReview) return error("Only the assigned employee can acknowledge this appraisal.", 403);
+      if (appraisal.status !== "acknowledgment") return error("There is no manager review awaiting acknowledgment.", 409);
+      const body = await request.json<{ acknowledgment?: string; decision?: string; note?: string }>();
+      const decision = action === "acknowledge" ? "accepted" : body.decision;
+      if (!['accepted','declined'].includes(decision || "") || typeof body.note !== "string" || body.note.trim().length < 3 || body.note.length > 2000) return error("Choose accept or decline and include a brief comment.");
+      await env.DB.prepare(`UPDATE appraisals SET employee_acknowledgment = ?, employee_decision = ?, decision_note = ?, status = 'complete', acknowledged_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'acknowledgment'`).bind(body.acknowledgment?.trim() || body.note.trim(), decision, body.note.trim(), appraisalId, context.organizationId).run();
+      await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'appraisal_decision', ?, ?)`).bind(requestId(), context.organizationId, appraisal.reviewerUserId, decision === "accepted" ? "Appraisal accepted" : "Appraisal declined", `${appraisal.employeeName} ${decision} the ${appraisal.cycleName} appraisal.`).run();
+    }
+    await audit(env, context, action.replace("-", "_"), "appraisals", appraisalId, { cycle: appraisal.cycleName });
+    return json({ ok: true });
+  }
+  return error("Appraisal endpoint not found.", 404);
+}
+
+async function handleHRTalent(request: Request, env: Env, context: AuthContext, path: string): Promise<Response | null> {
+  if (!path.startsWith("/api/hr/talent")) return null;
+  const canManage = hasPermission(context, "hr.talent.manage");
+  const canView = hasPermission(context, "hr.talent.view") || canManage;
+  if (!canView) return error("HR talent workspace access is not enabled for this account.", 403);
+  const base = "/api/hr/talent";
+  if (path === base && request.method === "GET") {
+    const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
+    const [departments, teams, kpis, pips, checkins, jobs, candidates, courses, enrollments] = await Promise.all([
+      env.DB.prepare(`SELECT id, name FROM departments WHERE organization_id = ? ORDER BY name`).bind(context.organizationId).all(),
+      env.DB.prepare(`SELECT t.id, t.name, t.department_id as departmentId, d.name as department FROM teams t LEFT JOIN departments d ON d.id = t.department_id WHERE t.organization_id = ? ORDER BY t.name`).bind(context.organizationId).all(),
+      canManage ? env.DB.prepare(`SELECT k.id, k.name, k.description, k.metric, k.target, k.weight, k.team_id as teamId, k.employee_id as employeeId, t.name as team, e.first_name || ' ' || e.last_name as employee, k.status, k.created_at as createdAt FROM performance_kpis k LEFT JOIN teams t ON t.id = k.team_id AND t.organization_id = k.organization_id LEFT JOIN employees e ON e.id = k.employee_id AND e.organization_id = k.organization_id WHERE k.organization_id = ? ORDER BY k.status, k.name`).bind(context.organizationId).all() : Promise.resolve({ results: [] }),
+      env.DB.prepare(`SELECT p.id, p.employee_id as employeeId, p.created_by as createdBy, p.manager_user_id as managerUserId, p.title, p.concern, p.expected_outcomes as expectedOutcomes, p.support_plan as supportPlan, p.start_date as startDate, p.end_date as endDate, p.status, p.outcome_note as outcomeNote, p.employee_acknowledgment as employeeAcknowledgment, p.acknowledged_at as acknowledgedAt, e.user_id as employeeUserId, e.first_name || ' ' || e.last_name as employeeName, e.job_title as jobTitle, creator.full_name as createdByName FROM performance_improvement_plans p JOIN employees e ON e.id = p.employee_id AND e.organization_id = p.organization_id JOIN users creator ON creator.id = p.created_by WHERE p.organization_id = ? AND (? = 1 OR e.user_id = ? OR p.manager_user_id = ?) ORDER BY p.created_at DESC`).bind(context.organizationId, canManage ? 1 : 0, context.userId, context.userId).all(),
+      env.DB.prepare(`SELECT c.id, c.pip_id as pipId, c.check_in_date as checkInDate, c.progress, c.employee_comment as employeeComment, c.next_steps as nextSteps, c.created_by as createdBy, u.full_name as createdByName FROM pip_check_ins c JOIN performance_improvement_plans p ON p.id = c.pip_id AND p.organization_id = c.organization_id JOIN employees e ON e.id = p.employee_id AND e.organization_id = p.organization_id JOIN users u ON u.id = c.created_by WHERE c.organization_id = ? AND (? = 1 OR e.user_id = ? OR p.manager_user_id = ?) ORDER BY c.check_in_date DESC`).bind(context.organizationId, canManage ? 1 : 0, context.userId, context.userId).all(),
+      canManage ? env.DB.prepare(`SELECT j.id, j.title, j.department_id as departmentId, d.name as department, j.description, j.employment_type as employmentType, j.location, j.headcount, j.status, j.target_date as targetDate, (SELECT COUNT(*) FROM job_candidates c WHERE c.job_id = j.id AND c.organization_id = j.organization_id) as candidateCount FROM job_requisitions j LEFT JOIN departments d ON d.id = j.department_id AND d.organization_id = j.organization_id WHERE j.organization_id = ? ORDER BY j.created_at DESC`).bind(context.organizationId).all() : Promise.resolve({ results: [] }),
+      canManage ? env.DB.prepare(`SELECT c.id, c.job_id as jobId, j.title as jobTitle, c.full_name as fullName, c.email, c.phone, c.source, c.stage, c.notes, c.created_at as createdAt FROM job_candidates c JOIN job_requisitions j ON j.id = c.job_id AND j.organization_id = c.organization_id WHERE c.organization_id = ? ORDER BY c.updated_at DESC`).bind(context.organizationId).all() : Promise.resolve({ results: [] }),
+      env.DB.prepare(`SELECT id, title, description, provider, category, duration_hours as durationHours, due_days as dueDays, status FROM learning_courses WHERE organization_id = ? AND status = 'active' ORDER BY title`).bind(context.organizationId).all(),
+      env.DB.prepare(`SELECT n.id, n.course_id as courseId, c.title as courseTitle, n.employee_id as employeeId, e.user_id as employeeUserId, e.first_name || ' ' || e.last_name as employeeName, n.status, n.due_date as dueDate, n.completed_at as completedAt, n.notes FROM learning_enrollments n JOIN learning_courses c ON c.id = n.course_id AND c.organization_id = n.organization_id JOIN employees e ON e.id = n.employee_id AND e.organization_id = n.organization_id WHERE n.organization_id = ? AND (? = 1 OR e.user_id = ? OR e.manager_id = ?) ORDER BY n.due_date`).bind(context.organizationId, canManage ? 1 : 0, context.userId, employee?.id || "").all(),
+    ]);
+    return json({ canManage, employeeId: employee?.id || null, departments: departments.results || [], teams: teams.results || [], kpis: kpis.results || [], pips: pips.results || [], checkins: checkins.results || [], jobs: jobs.results || [], candidates: candidates.results || [], courses: courses.results || [], enrollments: enrollments.results || [] });
+  }
+
+  if (request.method === "POST" && path === `${base}/kpis`) {
+    if (!canManage) return error("HR administrator access is required to define KPIs.", 403);
+    const body = await request.json<{ name?: string; description?: string; metric?: string; target?: string; weight?: number; teamId?: string; employeeId?: string }>();
+    const name = body.name?.trim(), metric = body.metric?.trim(), target = body.target?.trim(), weight = Number(body.weight ?? 100);
+    if (!name || name.length > 140 || !metric || !target || !Number.isInteger(weight) || weight < 1 || weight > 100 || (body.teamId && body.employeeId)) return error("Enter a KPI name, measurement, target, weight (1–100), and at most one team or employee scope.");
+    if (body.teamId && !await env.DB.prepare(`SELECT id FROM teams WHERE id = ? AND organization_id = ?`).bind(body.teamId, context.organizationId).first()) return error("Team not found in this organization.");
+    if (body.employeeId && !await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND deleted_at IS NULL`).bind(body.employeeId, context.organizationId).first()) return error("Employee not found in this organization.");
+    const id = `kpi-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO performance_kpis (id, organization_id, name, description, metric, target, weight, team_id, employee_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, name, body.description?.trim().slice(0, 2000) || null, metric, target, weight, body.teamId || null, body.employeeId || null, context.userId).run();
+    await audit(env, context, "created", "performance_kpis", id, { name, teamId: body.teamId || null, employeeId: body.employeeId || null });
+    return json({ id }, { status: 201 });
+  }
+  const kpiMatch = path.match(/^\/api\/hr\/talent\/kpis\/([^/]+)$/);
+  if (request.method === "PATCH" && kpiMatch) {
+    if (!canManage) return error("HR administrator access is required.", 403);
+    const body = await request.json<{ status?: string }>();
+    if (!['active','archived'].includes(body.status || "")) return error("Choose active or archived.");
+    const result = await env.DB.prepare(`UPDATE performance_kpis SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.status, kpiMatch[1], context.organizationId).run();
+    if (!result.meta.changes) return error("KPI not found.", 404);
+    await audit(env, context, body.status === "archived" ? "archived" : "restored", "performance_kpis", kpiMatch[1]);
+    return json({ ok: true });
+  }
+
+  if (request.method === "POST" && path === `${base}/pips`) {
+    if (!canManage) return error("HR administrator access is required to open a performance improvement plan.", 403);
+    const body = await request.json<{ employeeId?: string; title?: string; concern?: string; expectedOutcomes?: string; supportPlan?: string; startDate?: string; endDate?: string }>();
+    const employee = body.employeeId ? await env.DB.prepare(`SELECT e.id, e.user_id as userId, e.manager_id as managerId, manager.user_id as managerUserId FROM employees e LEFT JOIN employees manager ON manager.id = e.manager_id AND manager.organization_id = e.organization_id WHERE e.id = ? AND e.organization_id = ? AND e.deleted_at IS NULL`).bind(body.employeeId, context.organizationId).first<{ id: string; userId: string | null; managerId: string | null; managerUserId: string | null }>() : null;
+    if (!employee || !body.title?.trim() || !body.concern?.trim() || !body.expectedOutcomes?.trim() || !body.supportPlan?.trim() || !body.startDate || !body.endDate || body.endDate < body.startDate) return error("Choose an employee and enter the concern, measurable outcomes, support plan and valid plan dates.");
+    const id = `pip-${crypto.randomUUID()}`;
+    await env.DB.batch([
+      env.DB.prepare(`INSERT INTO performance_improvement_plans (id, organization_id, employee_id, created_by, manager_user_id, title, concern, expected_outcomes, support_plan, start_date, end_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, employee.id, context.userId, employee.managerUserId || context.userId, body.title.trim(), body.concern.trim(), body.expectedOutcomes.trim(), body.supportPlan.trim(), body.startDate, body.endDate),
+      ...(employee.userId ? [env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'pip_assigned', ?, ?)`).bind(requestId(), context.organizationId, employee.userId, "Performance improvement plan", `${body.title.trim()} is ready for you to review. Please read the support plan and acknowledge it.`)] : []),
+    ]);
+    await audit(env, context, "created", "performance_improvement_plans", id, { employeeId: employee.id, endDate: body.endDate });
+    return json({ id }, { status: 201 });
+  }
+  const pipMatch = path.match(/^\/api\/hr\/talent\/pips\/([^/]+)(?:\/(checkins|acknowledge))?$/);
+  if (pipMatch && request.method === "POST" && pipMatch[2] === "checkins") {
+    const pip = await env.DB.prepare(`SELECT p.id, e.user_id as employeeUserId, p.manager_user_id as managerUserId FROM performance_improvement_plans p JOIN employees e ON e.id = p.employee_id AND e.organization_id = p.organization_id WHERE p.id = ? AND p.organization_id = ?`).bind(pipMatch[1], context.organizationId).first<{ id: string; employeeUserId: string | null; managerUserId: string | null }>();
+    if (!pip) return error("Improvement plan not found.", 404);
+    if (!canManage && context.userId !== pip.managerUserId && context.userId !== pip.employeeUserId) return error("Only HR, the employee or their line manager may add a check-in.", 403);
+    const body = await request.json<{ checkInDate?: string; progress?: string; employeeComment?: string; nextSteps?: string }>();
+    if (!body.checkInDate || !/^\d{4}-\d{2}-\d{2}$/.test(body.checkInDate) || !body.progress?.trim() || !body.nextSteps?.trim()) return error("Enter the check-in date, progress update and next steps.");
+    const id = `pip-checkin-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO pip_check_ins (id, organization_id, pip_id, created_by, check_in_date, progress, employee_comment, next_steps) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, pip.id, context.userId, body.checkInDate, body.progress.trim(), body.employeeComment?.trim() || null, body.nextSteps.trim()).run();
+    await audit(env, context, "created", "pip_check_ins", id, { pipId: pip.id });
+    return json({ id }, { status: 201 });
+  }
+  if (pipMatch && request.method === "POST" && pipMatch[2] === "acknowledge") {
+    const body = await request.json<{ acknowledgment?: string }>();
+    const result = await env.DB.prepare(`UPDATE performance_improvement_plans SET employee_acknowledgment = ?, acknowledged_at = CURRENT_TIMESTAMP, status = CASE WHEN status = 'proposed' THEN 'active' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND employee_id IN (SELECT id FROM employees WHERE user_id = ? AND organization_id = ?)`).bind(body.acknowledgment?.trim() || "Acknowledged", pipMatch[1], context.organizationId, context.userId, context.organizationId).run();
+    if (!result.meta.changes) return error("This improvement plan is not assigned to your employee profile.", 404);
+    await audit(env, context, "employee_acknowledged", "performance_improvement_plans", pipMatch[1]);
+    return json({ ok: true });
+  }
+  if (pipMatch && request.method === "PATCH" && !pipMatch[2]) {
+    if (!canManage) return error("HR administrator access is required to update plan status.", 403);
+    const body = await request.json<{ status?: string; outcomeNote?: string }>();
+    if (!['proposed','active','completed','extended','unsuccessful','cancelled'].includes(body.status || "")) return error("Choose a valid improvement plan status.");
+    const result = await env.DB.prepare(`UPDATE performance_improvement_plans SET status = ?, outcome_note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.status, body.outcomeNote?.trim() || null, pipMatch[1], context.organizationId).run();
+    if (!result.meta.changes) return error("Improvement plan not found.", 404);
+    await audit(env, context, `status_${body.status}`, "performance_improvement_plans", pipMatch[1]);
+    return json({ ok: true });
+  }
+
+  if (request.method === "POST" && path === `${base}/jobs`) {
+    if (!canManage) return error("HR administrator access is required to open a recruitment request.", 403);
+    const body = await request.json<{ title?: string; departmentId?: string; description?: string; employmentType?: string; location?: string; headcount?: number; targetDate?: string }>();
+    const headcount = Number(body.headcount || 1);
+    if (!body.title?.trim() || !body.description?.trim() || !body.employmentType?.trim() || !Number.isInteger(headcount) || headcount < 1 || headcount > 1000) return error("Enter the position, description, employment type and a valid headcount.");
+    if (body.departmentId && !await env.DB.prepare(`SELECT id FROM departments WHERE id = ? AND organization_id = ?`).bind(body.departmentId, context.organizationId).first()) return error("Department not found.");
+    const id = `job-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO job_requisitions (id, organization_id, title, department_id, description, employment_type, location, headcount, owner_user_id, target_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.title.trim(), body.departmentId || null, body.description.trim(), body.employmentType, body.location?.trim() || null, headcount, context.userId, body.targetDate || null).run();
+    await audit(env, context, "opened", "job_requisitions", id, { title: body.title, headcount });
+    return json({ id }, { status: 201 });
+  }
+  const jobMatch = path.match(/^\/api\/hr\/talent\/jobs\/([^/]+)$/);
+  if (request.method === "PATCH" && jobMatch) {
+    if (!canManage) return error("HR administrator access is required.", 403);
+    const body = await request.json<{ status?: string }>();
+    if (!['open','on_hold','closed'].includes(body.status || "")) return error("Choose open, on hold or closed.");
+    const result = await env.DB.prepare(`UPDATE job_requisitions SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.status, jobMatch[1], context.organizationId).run();
+    if (!result.meta.changes) return error("Recruitment requisition not found.", 404);
+    await audit(env, context, `requisition_${body.status}`, "job_requisitions", jobMatch[1]);
+    return json({ ok: true });
+  }
+  const candidateMatch = path.match(/^\/api\/hr\/talent\/candidates\/([^/]+)$/);
+  if (request.method === "POST" && path === `${base}/candidates`) {
+    if (!canManage) return error("HR administrator access is required to add candidates.", 403);
+    const body = await request.json<{ jobId?: string; fullName?: string; email?: string; phone?: string; source?: string; notes?: string }>();
+    const job = body.jobId ? await env.DB.prepare(`SELECT id FROM job_requisitions WHERE id = ? AND organization_id = ? AND status != 'closed'`).bind(body.jobId, context.organizationId).first() : null;
+    if (!job || !body.fullName?.trim() || !body.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) return error("Choose an open role and enter the candidate name and a valid email.");
+    const id = `candidate-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO job_candidates (id, organization_id, job_id, full_name, email, phone, source, notes, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.jobId, body.fullName.trim(), body.email.trim().toLowerCase(), body.phone?.trim() || null, body.source?.trim() || null, body.notes?.trim() || null, context.userId).run();
+    await audit(env, context, "candidate_added", "job_candidates", id, { jobId: body.jobId });
+    return json({ id }, { status: 201 });
+  }
+  if (request.method === "PATCH" && candidateMatch) {
+    if (!canManage) return error("HR administrator access is required.", 403);
+    const body = await request.json<{ stage?: string; notes?: string }>();
+    if (!['applied','screening','interview','assessment','offer','hired','rejected'].includes(body.stage || "")) return error("Choose a valid recruitment stage.");
+    const result = await env.DB.prepare(`UPDATE job_candidates SET stage = ?, notes = COALESCE(?, notes), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.stage, body.notes?.trim() || null, candidateMatch[1], context.organizationId).run();
+    if (!result.meta.changes) return error("Candidate not found.", 404);
+    await audit(env, context, `candidate_${body.stage}`, "job_candidates", candidateMatch[1]);
+    return json({ ok: true });
+  }
+
+  if (request.method === "POST" && path === `${base}/courses`) {
+    if (!canManage) return error("HR administrator access is required to create learning content.", 403);
+    const body = await request.json<{ title?: string; description?: string; provider?: string; category?: string; durationHours?: number; dueDays?: number }>();
+    const hours = Number(body.durationHours || 0), dueDays = body.dueDays ? Number(body.dueDays) : null;
+    if (!body.title?.trim() || !body.description?.trim() || !Number.isFinite(hours) || hours < 0 || (dueDays !== null && (!Number.isInteger(dueDays) || dueDays < 1 || dueDays > 730))) return error("Enter a course title, description and valid duration or deadline.");
+    const id = `course-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO learning_courses (id, organization_id, title, description, provider, category, duration_hours, due_days, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.title.trim(), body.description.trim(), body.provider?.trim() || null, body.category?.trim() || "Professional development", hours, dueDays, context.userId).run();
+    await audit(env, context, "created", "learning_courses", id, { title: body.title });
+    return json({ id }, { status: 201 });
+  }
+  if (request.method === "POST" && path === `${base}/enrollments`) {
+    if (!canManage) return error("HR administrator access is required to assign courses.", 403);
+    const body = await request.json<{ courseId?: string; employeeId?: string; dueDate?: string }>();
+    const valid = body.courseId && body.employeeId && await env.DB.prepare(`SELECT c.id FROM learning_courses c JOIN employees e ON e.id = ? AND e.organization_id = c.organization_id AND e.status = 'active' WHERE c.id = ? AND c.organization_id = ? AND c.status = 'active'`).bind(body.employeeId, body.courseId, context.organizationId).first();
+    if (!valid) return error("Choose an active course and an active employee in this organization.");
+    const id = `learning-${crypto.randomUUID()}`;
+    try { await env.DB.prepare(`INSERT INTO learning_enrollments (id, organization_id, course_id, employee_id, assigned_by, due_date) VALUES (?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.courseId, body.employeeId, context.userId, body.dueDate || null).run(); }
+    catch { return error("This course has already been assigned to that employee.", 409); }
+    const user = await env.DB.prepare(`SELECT user_id as userId FROM employees WHERE id = ? AND organization_id = ?`).bind(body.employeeId, context.organizationId).first<{ userId: string | null }>();
+    if (user?.userId) await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'learning_assigned', ?, ?)`).bind(requestId(), context.organizationId, user.userId, "Learning assigned", "A new learning course is available in your HR workspace.").run();
+    await audit(env, context, "assigned", "learning_enrollments", id, { employeeId: body.employeeId, courseId: body.courseId });
+    return json({ id }, { status: 201 });
+  }
+  const enrollmentMatch = path.match(/^\/api\/hr\/talent\/enrollments\/([^/]+)$/);
+  if (request.method === "PATCH" && enrollmentMatch) {
+    const body = await request.json<{ status?: string; notes?: string }>();
+    const assignment = await env.DB.prepare(`SELECT n.id, e.user_id as employeeUserId FROM learning_enrollments n JOIN employees e ON e.id = n.employee_id AND e.organization_id = n.organization_id WHERE n.id = ? AND n.organization_id = ?`).bind(enrollmentMatch[1], context.organizationId).first<{ id: string; employeeUserId: string | null }>();
+    if (!assignment) return error("Learning assignment not found.", 404);
+    if (!canManage && assignment.employeeUserId !== context.userId) return error("Only HR or the assigned learner may update this course.", 403);
+    if (!['assigned','in_progress','completed','waived'].includes(body.status || "") || (!canManage && body.status === "waived")) return error("Choose a valid course progress status.");
+    await env.DB.prepare(`UPDATE learning_enrollments SET status = ?, completed_at = CASE WHEN ? = 'completed' THEN CURRENT_TIMESTAMP ELSE completed_at END, notes = COALESCE(?, notes), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.status, body.status, body.notes?.trim() || null, assignment.id, context.organizationId).run();
+    await audit(env, context, `learning_${body.status}`, "learning_enrollments", assignment.id);
+    return json({ ok: true });
+  }
+  return error("HR talent endpoint not found.", 404);
 }
 
 async function dashboard(env: Env, organizationId: string) {
@@ -551,6 +976,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
     const membership = await env.DB.prepare(`SELECT organization_id as organizationId FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created_at LIMIT 1`).bind(user.id).first<{ organizationId: string }>();
     if (!membership) return error("No active organization is linked to this account.", 403);
+    const accessError = await workspaceAccessError(env, membership.organizationId);
+    if (accessError) return error(accessError, 403);
     const factor = await env.DB.prepare(`SELECT enabled_at as enabledAt FROM user_two_factor WHERE user_id = ?`).bind(user.id).first<{ enabledAt: string | null }>();
     if (factor?.enabledAt) return issueTwoFactorChallenge(env, user.id, membership.organizationId, true);
     const accessToken = await createSession(env, user.id, membership.organizationId);
@@ -579,6 +1006,11 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const context = secured.context;
 
   if (context.isDemo && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return error("The demo sandbox is read-only. Changes are not allowed.", 403);
+
+  const talentResponse = await handleHRTalent(request, env, context, path);
+  if (talentResponse) return talentResponse;
+  const appraisalResponse = await handleAppraisals(request, env, context, path);
+  if (appraisalResponse) return appraisalResponse;
 
   if (request.method === "POST" && path === "/api/settings/email/test") {
     if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to test email delivery.", 403);
@@ -697,18 +1129,75 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (path.startsWith("/api/platform/")) {
     if (!context.isPlatformAdmin) return error("Platform administrator access is required.", 403);
-    if (request.method !== "GET") return error("Platform console endpoints are read-only.", 405);
+
+    const serviceMatch = path.match(/^\/api\/platform\/organizations\/([^/]+)\/service$/);
+    if (request.method === "PATCH" && serviceMatch) {
+      const body = await request.json<{ enabled?: boolean }>();
+      if (typeof body.enabled !== "boolean") return error("Choose whether tenant services should be enabled or disabled.");
+      const org = await env.DB.prepare(`SELECT o.id, o.name, o.status, o.is_demo as isDemo, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt FROM organizations o LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE o.id = ?`).bind(serviceMatch[1]).first<{ id: string; name: string; status: string; isDemo: number; subscriptionStatus: string | null; trialEndsAt: string | null }>();
+      if (!org) return error("Tenant was not found.", 404);
+      if (org.isDemo) return error("The synthetic demo tenant is protected and cannot be toggled.", 403);
+      if (body.enabled && !org.subscriptionStatus) return error("This tenant has no subscription record; service cannot be enabled.", 409);
+
+      let subscriptionStatus = org.subscriptionStatus;
+      let organizationStatus = "suspended";
+      if (body.enabled) {
+        const trialValid = org.subscriptionStatus === "trialing" && Boolean(org.trialEndsAt) && new Date(`${org.trialEndsAt!.replace(" ", "T")}Z`).getTime() > Date.now();
+        subscriptionStatus = org.subscriptionStatus === "active" || trialValid ? org.subscriptionStatus : "active";
+        organizationStatus = subscriptionStatus === "trialing" ? "trial" : "active";
+      }
+      const platformStatements = [];
+      if (body.enabled) platformStatements.push(env.DB.prepare(`UPDATE subscriptions SET status = ? WHERE organization_id = ?`).bind(subscriptionStatus, org.id));
+      platformStatements.push(env.DB.prepare(`UPDATE organizations SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(organizationStatus, org.id));
+      if (!body.enabled) platformStatements.push(env.DB.prepare(`DELETE FROM sessions WHERE organization_id = ?`).bind(org.id));
+      platformStatements.push(env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id, previous_value_json, new_value_json) VALUES (?, ?, ?, ?, 'platform', 'organization', ?, ?, ?)`)
+        .bind(`audit-${crypto.randomUUID()}`, org.id, context.userId, body.enabled ? "tenant_services_enabled" : "tenant_services_disabled", org.id, JSON.stringify({ organizationStatus: org.status, subscriptionStatus: org.subscriptionStatus }), JSON.stringify({ organizationStatus, subscriptionStatus })));
+      await env.DB.batch(platformStatements);
+      return json({ ok: true, organizationId: org.id, enabled: body.enabled, organizationStatus, subscriptionStatus });
+    }
+
+    const organizationUsersMatch = path.match(/^\/api\/platform\/organizations\/([^/]+)\/users$/);
+    if (request.method === "GET" && organizationUsersMatch) {
+      const org = await env.DB.prepare(`SELECT id FROM organizations WHERE id = ?`).bind(organizationUsersMatch[1]).first<{ id: string }>();
+      if (!org) return error("Tenant was not found.", 404);
+      const users = await env.DB.prepare(`SELECT u.id, u.full_name as fullName, u.email, u.status, u.email_verified_at as emailVerifiedAt, r.name as role, u.created_at as createdAt FROM memberships m JOIN users u ON u.id = m.user_id JOIN roles r ON r.id = m.role_id WHERE m.organization_id = ? ORDER BY CASE WHEN r.name IN ('Organization Admin','CEO') THEN 0 ELSE 1 END, u.full_name LIMIT 250`).bind(org.id).all();
+      return json({ data: users.results || [] });
+    }
+
+    const userResetMatch = path.match(/^\/api\/platform\/users\/([^/]+)\/password-reset$/);
+    if (request.method === "POST" && userResetMatch) {
+      if (!(await consumeAuthLimit(env, request, "platform-password-reset", 15, 60))) return error("The password reset limit has been reached. Wait before sending more reset emails.", 429);
+      const target = await env.DB.prepare(`SELECT u.id, u.email, u.full_name as fullName, o.id as organizationId, o.name as organizationName FROM users u JOIN memberships m ON m.user_id = u.id JOIN organizations o ON o.id = m.organization_id WHERE u.id = ? AND u.status = 'active' AND u.email_verified_at IS NOT NULL AND o.is_demo = 0 ORDER BY m.created_at LIMIT 1`).bind(userResetMatch[1]).first<{ id: string; email: string; fullName: string; organizationId: string; organizationName: string }>();
+      if (!target) return error("No active, verified customer account was found for password reset.", 404);
+      await env.DB.prepare(`DELETE FROM password_reset_tokens WHERE user_id = ?`).bind(target.id).run();
+      const resetToken = randomToken();
+      const resetId = `pwdreset-${crypto.randomUUID()}`;
+      await env.DB.prepare(`INSERT INTO password_reset_tokens (id, user_id, organization_id, token_hash, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+30 minutes'))`).bind(resetId, target.id, target.organizationId, await hashToken(resetToken)).run();
+      const delivery = await sendPasswordResetEmail(env, target.email, target.fullName, target.organizationName, resetToken);
+      if (!delivery.accepted) {
+        await env.DB.prepare(`DELETE FROM password_reset_tokens WHERE id = ?`).bind(resetId).run();
+        return error(delivery.message, 502);
+      }
+      await env.DB.batch([
+        env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(target.id),
+        env.DB.prepare(`DELETE FROM two_factor_challenges WHERE user_id = ?`).bind(target.id),
+        env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id, new_value_json) VALUES (?, ?, ?, 'platform_password_reset_requested', 'platform', 'user', ?, ?)`)
+          .bind(`audit-${crypto.randomUUID()}`, target.organizationId, context.userId, target.id, JSON.stringify({ email: target.email, resetLinkExpiresInMinutes: 30 })),
+      ]);
+      return json({ ok: true, recipient: target.email, expiresIn: 1800, sessionsRevoked: true });
+    }
+
+    if (request.method !== "GET") return error("Platform console endpoint not found.", 404);
 
     if (path === "/api/platform/summary") {
       const summary = await env.DB.prepare(`
         SELECT COUNT(*) as organizations,
-          SUM(CASE WHEN o.status = 'active' THEN 1 ELSE 0 END) as active,
-          SUM(CASE WHEN o.status = 'trial' OR s.status = 'trialing' THEN 1 ELSE 0 END) as trialing,
-          SUM(CASE WHEN o.status = 'suspended' OR s.status = 'suspended' THEN 1 ELSE 0 END) as suspended,
-          (SELECT COUNT(*) FROM users u WHERE EXISTS (SELECT 1 FROM memberships m JOIN organizations o2 ON o2.id = m.organization_id WHERE m.user_id = u.id AND o2.is_demo = 0)) as users,
-          (SELECT COUNT(*) FROM employees e JOIN organizations o3 ON o3.id = e.organization_id WHERE o3.is_demo = 0 AND e.deleted_at IS NULL) as employees
+          SUM(CASE WHEN o.status != 'suspended' AND (s.status = 'active' OR (s.status = 'trialing' AND s.trial_ends_at > CURRENT_TIMESTAMP)) THEN 1 ELSE 0 END) as active,
+          SUM(CASE WHEN s.status = 'trialing' AND s.trial_ends_at > CURRENT_TIMESTAMP AND o.status != 'suspended' THEN 1 ELSE 0 END) as trialing,
+          SUM(CASE WHEN o.status = 'suspended' OR s.status = 'expired' THEN 1 ELSE 0 END) as suspended,
+          (SELECT COUNT(DISTINCT m.user_id) FROM memberships m) as users,
+          (SELECT COUNT(*) FROM employees e WHERE e.deleted_at IS NULL) as employees
         FROM organizations o LEFT JOIN subscriptions s ON s.organization_id = o.id
-        WHERE o.is_demo = 0
       `).first();
       return json(summary || { organizations: 0, active: 0, trialing: 0, suspended: 0, users: 0, employees: 0 });
     }
@@ -717,12 +1206,13 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       const search = url.searchParams.get("search")?.trim().slice(0, 100) || "";
       const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit")) || 50, 100));
       const offset = Math.max(0, Math.min(Number(url.searchParams.get("offset")) || 0, 1000000));
-      const condition = `o.is_demo = 0 AND (? = '' OR o.name LIKE '%' || ? || '%' OR o.slug LIKE '%' || ? || '%' OR COALESCE(o.industry, '') LIKE '%' || ? || '%')`;
+      const condition = `(? = '' OR o.name LIKE '%' || ? || '%' OR o.slug LIKE '%' || ? || '%' OR COALESCE(o.industry, '') LIKE '%' || ? || '%')`;
       const [total, organizations] = await Promise.all([
         env.DB.prepare(`SELECT COUNT(*) as total FROM organizations o WHERE ${condition}`).bind(search, search, search, search).first<{ total: number }>(),
         env.DB.prepare(`
-          SELECT o.id, o.name, o.slug, o.industry, o.status, o.created_at as createdAt,
+          SELECT o.id, o.name, o.slug, o.industry, o.status, o.is_demo as isDemo, o.created_at as createdAt,
             s.plan, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt,
+            CASE WHEN o.status != 'suspended' AND s.status IN ('active','trialing') AND (s.status != 'trialing' OR s.trial_ends_at > CURRENT_TIMESTAMP) THEN 1 ELSE 0 END as serviceEnabled,
             (SELECT COUNT(*) FROM memberships m WHERE m.organization_id = o.id AND m.status = 'active') as members,
             (SELECT COUNT(*) FROM employees e WHERE e.organization_id = o.id AND e.deleted_at IS NULL) as employees,
             (SELECT MAX(a.created_at) FROM audit_logs a WHERE a.organization_id = o.id) as lastActivity
@@ -738,7 +1228,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       const organizationId = url.searchParams.get("organizationId")?.trim() || "";
       const limit = Math.max(1, Math.min(Number(url.searchParams.get("limit")) || 50, 100));
       const offset = Math.max(0, Math.min(Number(url.searchParams.get("offset")) || 0, 1000000));
-      const condition = `o.is_demo = 0 AND (? = '' OR o.id = ?)`;
+      const condition = `(? = '' OR o.id = ?)`;
       const [total, activity] = await Promise.all([
         env.DB.prepare(`SELECT COUNT(*) as total FROM audit_logs a JOIN organizations o ON o.id = a.organization_id WHERE ${condition}`).bind(organizationId, organizationId).first<{ total: number }>(),
         env.DB.prepare(`
@@ -757,7 +1247,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "GET" && path === "/api/me") {
-    const user = await env.DB.prepare(`SELECT u.id, u.email, u.full_name as fullName, r.name as role, o.id as organizationId, o.name as organizationName, s.trial_ends_at as trialEndsAt FROM users u JOIN memberships m ON m.user_id = u.id JOIN roles r ON r.id = m.role_id JOIN organizations o ON o.id = m.organization_id LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE u.id = ? AND o.id = ?`).bind(context.userId, context.organizationId).first();
+    const user = await env.DB.prepare(`SELECT u.id, u.email, u.full_name as fullName, r.name as role, o.id as organizationId, o.name as organizationName, s.trial_ends_at as trialEndsAt, s.status as subscriptionStatus FROM users u JOIN memberships m ON m.user_id = u.id JOIN roles r ON r.id = m.role_id JOIN organizations o ON o.id = m.organization_id LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE u.id = ? AND o.id = ?`).bind(context.userId, context.organizationId).first();
     return json({ ...(user || { id: context.userId, role: context.role, organizationId: context.organizationId }), permissions: [...context.permissions], isPlatformAdmin: context.isPlatformAdmin, isDemo: context.isDemo });
   }
 
@@ -807,7 +1297,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && path === "/api/hr/teams") {
-    if (!hasPermission(context, "teams.manage")) return error("You do not have permission to manage departments and teams.", 403);
+    if (!hasPermission(context, "teams.manage") && !hasPermission(context, "hr.talent.manage")) return error("You do not have permission to manage departments and teams.", 403);
     const body = await request.json<{ name?: string; kind?: string; departmentId?: string }>();
     const name = body.name?.trim();
     if (!name || name.length > 100 || !["department", "team"].includes(body.kind || "")) return error("A valid team or department name is required.");
@@ -1038,20 +1528,37 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!hasPermission(context, "employees.view")) return error("You do not have permission to view employee records.", 403);
     const query = url.searchParams.get("q")?.trim();
     const result = await env.DB.prepare(`
-      SELECT e.id, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.email, e.job_title as jobTitle, e.status, e.onboarding_status as onboardingStatus, (SELECT i.email_status FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) as invitationEmailStatus, (SELECT i.last_error FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) as invitationEmailError, e.work_location as workLocation, e.start_date as startDate, e.avatar_color as avatarColor, d.name as department, t.name as team, r.name as accessRole
-      FROM employees e LEFT JOIN departments d ON d.id = e.department_id LEFT JOIN teams t ON t.id = e.team_id LEFT JOIN memberships m ON m.user_id = e.user_id AND m.organization_id = e.organization_id LEFT JOIN roles r ON r.id = m.role_id
+      SELECT e.id, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.email, e.job_title as jobTitle, e.status, e.onboarding_status as onboardingStatus, (SELECT i.email_status FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) as invitationEmailStatus, (SELECT i.last_error FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) as invitationEmailError, e.work_location as workLocation, e.start_date as startDate, e.avatar_color as avatarColor, d.name as department, t.name as team, e.manager_id as managerId, manager.first_name || ' ' || manager.last_name as managerName, r.name as accessRole
+      FROM employees e LEFT JOIN departments d ON d.id = e.department_id LEFT JOIN teams t ON t.id = e.team_id LEFT JOIN employees manager ON manager.id = e.manager_id AND manager.organization_id = e.organization_id AND manager.deleted_at IS NULL LEFT JOIN memberships m ON m.user_id = e.user_id AND m.organization_id = e.organization_id LEFT JOIN roles r ON r.id = m.role_id
       WHERE e.organization_id = ? AND e.deleted_at IS NULL AND (? IS NULL OR e.first_name || ' ' || e.last_name LIKE '%' || ? || '%' OR e.employee_number LIKE '%' || ? || '%')
       ORDER BY e.first_name ASC
     `).bind(context.organizationId, query || null, query || null, query || null).all();
     return json({ data: result.results || [] });
   }
 
+  const employeeManagerMatch = path.match(/^\/api\/employees\/([^/]+)\/manager$/);
+  if (request.method === "PATCH" && employeeManagerMatch) {
+    if (!hasPermission(context, "employees.manage")) return error("HR administrator permission is required to assign line managers.", 403);
+    const body = await request.json<{ managerId?: string | null }>();
+    const employee = await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND deleted_at IS NULL`).bind(employeeManagerMatch[1], context.organizationId).first<{ id: string }>();
+    if (!employee) return error("Employee not found.", 404);
+    if (body.managerId) {
+      if (body.managerId === employee.id) return error("An employee cannot be their own line manager.");
+      const manager = await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND status = 'active' AND deleted_at IS NULL`).bind(body.managerId, context.organizationId).first();
+      if (!manager) return error("Choose an active line manager in this organization.");
+    }
+    await env.DB.prepare(`UPDATE employees SET manager_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.managerId || null, employee.id, context.organizationId).run();
+    await audit(env, context, "manager_assigned", "employees", employee.id, { managerId: body.managerId || null });
+    return json({ ok: true, managerId: body.managerId || null });
+  }
+
   if (request.method === "POST" && path === "/api/employees") {
     if (!hasPermission(context, "employees.manage")) return error("HR administrator permission is required to onboard employees.", 403);
-    const body = await request.json<{ firstName?: string; lastName?: string; email?: string; jobTitle?: string; departmentName?: string; teamName?: string; roleName?: string; startDate?: string; employmentType?: string; workLocation?: string }>();
+    const body = await request.json<{ firstName?: string; lastName?: string; email?: string; jobTitle?: string; departmentName?: string; teamName?: string; managerId?: string; roleName?: string; startDate?: string; employmentType?: string; workLocation?: string }>();
     const firstName = body.firstName?.trim(); const lastName = body.lastName?.trim(); const email = body.email?.trim().toLowerCase(); const jobTitle = body.jobTitle?.trim();
     if (!firstName || !lastName || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !jobTitle || !body.startDate || !/^\d{4}-\d{2}-\d{2}$/.test(body.startDate)) return error("Enter a valid name, work email, job title and start date.");
     const roleName = body.roleName?.trim() || "Employee";
+    if (body.managerId && !await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND status = 'active' AND deleted_at IS NULL`).bind(body.managerId, context.organizationId).first()) return error("Choose an active line manager in this organization.");
     const elevatedRole = ["CEO", "Organization Admin"].includes(roleName);
     if (elevatedRole && !hasPermission(context, "settings.manage")) return error("Only an organization administrator can assign executive or administrator access.", 403);
     const role = await env.DB.prepare(`SELECT id FROM roles WHERE organization_id = ? AND name = ?`).bind(context.organizationId, roleName).first<{ id: string }>();
@@ -1075,8 +1582,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       await env.DB.batch([
         env.DB.prepare(`INSERT INTO users (id, email, full_name, status) VALUES (?, ?, ?, 'invited')`).bind(userId, email, `${firstName} ${lastName}`),
         env.DB.prepare(`INSERT INTO memberships (id, organization_id, user_id, role_id, status) VALUES (?, ?, ?, ?, 'invited')`).bind(`mem-${crypto.randomUUID()}`, context.organizationId, userId, role.id),
-        env.DB.prepare(`INSERT INTO employees (id, organization_id, user_id, employee_number, first_name, last_name, email, job_title, department_id, team_id, employment_type, work_location, status, onboarding_status, start_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inactive', 'invited', ?)`)
-          .bind(id, context.organizationId, userId, employeeNumber, firstName, lastName, email, jobTitle, departmentId, teamId, body.employmentType || "Full-time", body.workLocation || "Hybrid", body.startDate),
+        env.DB.prepare(`INSERT INTO employees (id, organization_id, user_id, employee_number, first_name, last_name, email, job_title, department_id, team_id, manager_id, employment_type, work_location, status, onboarding_status, start_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inactive', 'invited', ?)`)
+          .bind(id, context.organizationId, userId, employeeNumber, firstName, lastName, email, jobTitle, departmentId, teamId, body.managerId || null, body.employmentType || "Full-time", body.workLocation || "Hybrid", body.startDate),
         env.DB.prepare(`INSERT INTO employee_invites (id, organization_id, employee_id, user_id, token_hash, expires_at, email_status) VALUES (?, ?, ?, ?, ?, datetime('now', '+72 hours'), 'pending')`).bind(inviteId, context.organizationId, id, userId, await hashToken(token)),
       ]);
     } catch (cause) {
@@ -1297,6 +1804,21 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   return error("Not found", 404);
 }
 
+async function expireTrials(env: Env) {
+  const expiredTrials = await env.DB.prepare(`SELECT organization_id as organizationId FROM subscriptions WHERE status = 'trialing' AND trial_ends_at IS NOT NULL AND trial_ends_at <= CURRENT_TIMESTAMP AND organization_id IN (SELECT id FROM organizations WHERE is_demo = 0)`).all<{ organizationId: string }>();
+  const due = expiredTrials.results || [];
+  for (let offset = 0; offset < due.length; offset += 30) {
+    const statements = due.slice(offset, offset + 30).flatMap(({ organizationId }) => [
+      env.DB.prepare(`UPDATE subscriptions SET status = 'expired' WHERE organization_id = ? AND status = 'trialing' AND trial_ends_at <= CURRENT_TIMESTAMP`).bind(organizationId),
+      env.DB.prepare(`UPDATE organizations SET status = 'suspended', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND is_demo = 0 AND EXISTS (SELECT 1 FROM subscriptions WHERE organization_id = ? AND status = 'expired')`).bind(organizationId, organizationId),
+      env.DB.prepare(`DELETE FROM sessions WHERE organization_id = ? AND EXISTS (SELECT 1 FROM organizations o JOIN subscriptions s ON s.organization_id = o.id WHERE o.id = ? AND o.status = 'suspended' AND s.status = 'expired')`).bind(organizationId, organizationId),
+      env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id, new_value_json) SELECT ?, ?, NULL, 'trial_expired_services_disabled', 'platform', 'organization', ?, ? FROM organizations o JOIN subscriptions s ON s.organization_id = o.id WHERE o.id = ? AND o.status = 'suspended' AND s.status = 'expired'`)
+        .bind(`audit-${crypto.randomUUID()}`, organizationId, organizationId, JSON.stringify({ subscriptionStatus: "expired", serviceEnabled: false }), organizationId),
+    ]);
+    if (statements.length) await env.DB.batch(statements);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -1307,5 +1829,8 @@ export default {
       console.error("Unhandled request error", cause);
       return withSecurityHeaders(error("Something went wrong. Please try again.", 500));
     }
+  },
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await expireTrials(env);
   },
 };

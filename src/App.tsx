@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
-  Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, BarChart3, Bell, BriefcaseBusiness, Building2,
+  Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Award, BarChart3, Bell, BriefcaseBusiness, Building2,
   CalendarDays, CheckCircle2, ChevronDown, ChevronLeft, CircleHelp, ClipboardCheck, Clock3, Cloud,
   Command, CreditCard, FileText, FolderKanban, Grid2x2, LayoutDashboard, LifeBuoy, ListTodo, LockKeyhole,
   Menu, MessageSquareText, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Plus, Search, Settings, ShieldCheck,
@@ -12,6 +12,8 @@ import { Onboarding } from "./onboarding";
 import { EmployeePayslips, PayrollWorkspace } from "./payroll";
 import { PlatformAdminWorkspace } from "./platform-admin";
 import { AccountSecurity, OrganizationSettings } from "./settings";
+import { Appraisals } from "./appraisals";
+import { HRTalentWorkspace } from "./hr-talent";
 import type { DashboardData, Employee, LeaveRequest, PageId, Task } from "./types";
 
 type IconComponent = typeof LayoutDashboard;
@@ -22,6 +24,8 @@ type NavItem = { id: PageId; label: string; icon: IconComponent; badge?: string;
 const navItems: NavItem[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "employees", label: "Employees", icon: Users, section: "People" },
+  { id: "appraisals", label: "Performance & appraisals", icon: Award, section: "People" },
+  { id: "talent", label: "Teams & talent", icon: Users, section: "People" },
   { id: "leave", label: "Leave & attendance", icon: CalendarDays, badge: "12", section: "People" },
   { id: "payroll", label: "Payroll", icon: WalletCards, section: "People" },
   { id: "projects", label: "Projects", icon: FolderKanban, section: "Work" },
@@ -45,9 +49,11 @@ const formatNaira = (value: number) => `₦${new Intl.NumberFormat("en-NG", { no
 const initials = (first: string, last: string) => `${first[0]}${last[0]}`.toUpperCase();
 const titleCase = (value: string) => value.replace(/_/g, " ").replace(/\b\w/g, (match) => match.toUpperCase());
 
+class ApiError extends Error { constructor(message: string, readonly status: number) { super(message); } }
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { credentials: "include", ...init });
-  if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || "Request failed");
+  if (!response.ok) throw new ApiError((await response.json().catch(() => null))?.error || "Request failed", response.status);
   return response.json() as Promise<T>;
 }
 
@@ -55,7 +61,7 @@ export default function App() {
   const [page, setPage] = useState<PageId>("dashboard");
   const [collapsed, setCollapsed] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
-  const [user, setUser] = useState<{ id: string; fullName: string; email: string; role: string; organizationId: string; organizationName: string; permissions?: string[]; trialEndsAt?: string | null; isPlatformAdmin?: boolean; isDemo?: boolean } | null>(null);
+  const [user, setUser] = useState<{ id: string; fullName: string; email: string; role: string; organizationId: string; organizationName: string; permissions?: string[]; trialEndsAt?: string | null; subscriptionStatus?: string; isPlatformAdmin?: boolean; isDemo?: boolean } | null>(null);
   const [dashboard, setDashboard] = useState<DashboardData>(demoDashboard);
   const [employees, setEmployees] = useState<Employee[]>(demoEmployees);
   const [leave, setLeave] = useState<LeaveRequest[]>(demoLeave);
@@ -96,7 +102,12 @@ export default function App() {
     try {
       const data = await api<{ data: InboxNotification[]; unread: number }>("/api/notifications");
       setNotifications(data.data); setUnreadNotifications(data.unread);
-    } catch { /* Inbox is unavailable until an authenticated workspace is ready. */ }
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) {
+        setUser(null); setConnected(false); setNotifications([]); setUnreadNotifications(0);
+        setAuthNotice("This workspace is no longer active. Contact Zyntris to restore tenant service.");
+      }
+    }
   };
 
   useEffect(() => {
@@ -141,6 +152,8 @@ export default function App() {
     if (item.id === "security") return true;
     if (["employees", "leave"].includes(item.id)) return userPermissions.has("employees.view");
     if (item.id === "payroll") return userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") || userPermissions.has("payroll.self.view");
+    if (item.id === "appraisals") return userPermissions.has("appraisals.view") || userPermissions.has("appraisals.manage") || userPermissions.has("appraisals.self.view");
+    if (item.id === "talent") return userPermissions.has("hr.talent.view") || userPermissions.has("hr.talent.manage");
     if (item.id === "expenses") return userPermissions.has("expenses.view") || userPermissions.has("expenses.manage");
     if (item.id === "requests") return userPermissions.has("requests.manage") || userPermissions.has("employees.view");
     if (["dashboard", "reports"].includes(item.id)) return userPermissions.has("employees.view") || userPermissions.has("operations.view");
@@ -157,7 +170,8 @@ export default function App() {
     const body = Object.fromEntries(form.entries());
     try {
       const result = await api<{ id: string; employeeNumber: string; onboardingStatus: "invited"; accessRole: string; invitationEmailAccepted: boolean; invitationEmailStatus: "accepted" | "failed"; invitationEmailError?: string }>("/api/employees", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      setEmployees((current) => [{ id: result.id, employeeNumber: result.employeeNumber, firstName: String(body.firstName), lastName: String(body.lastName), email: String(body.email), jobTitle: String(body.jobTitle), department: String(body.departmentName || "Unassigned"), team: String(body.teamName || ""), status: "inactive", onboardingStatus: result.onboardingStatus, invitationEmailStatus: result.invitationEmailStatus, accessRole: result.accessRole, workLocation: String(body.workLocation || "Hybrid"), startDate: String(body.startDate), avatarColor: "#dbeafe" }, ...current]);
+      const manager = employees.find((person) => person.id === body.managerId);
+      setEmployees((current) => [{ id: result.id, employeeNumber: result.employeeNumber, firstName: String(body.firstName), lastName: String(body.lastName), email: String(body.email), jobTitle: String(body.jobTitle), department: String(body.departmentName || "Unassigned"), team: String(body.teamName || ""), managerId: String(body.managerId || "") || null, managerName: manager ? `${manager.firstName} ${manager.lastName}` : null, status: "inactive", onboardingStatus: result.onboardingStatus, invitationEmailStatus: result.invitationEmailStatus, accessRole: result.accessRole, workLocation: String(body.workLocation || "Hybrid"), startDate: String(body.startDate), avatarColor: "#dbeafe" }, ...current]);
       setToast(result.invitationEmailAccepted ? `Brevo accepted the onboarding email for ${String(body.email)}. Ask them to check spam if it doesn’t arrive shortly.` : `Employee added, but the invitation email failed: ${result.invitationEmailError || "unknown email error"} Retry it from the employee list after correcting email settings.`); setShowAddEmployee(false);
     } catch (cause) { setToast(cause instanceof Error ? cause.message : "Could not invite employee"); }
   };
@@ -207,9 +221,11 @@ export default function App() {
 
         <div className="page-wrap">
           {user.isDemo && <div className="trial-banner"><span><ShieldCheck size={16} /> Demo sandbox</span><span>Fictional data · read-only · changes are disabled</span></div>}
-          {user.trialEndsAt && <div className="trial-banner"><span><CheckCircle2 size={16} /> 30-day trial</span><span>Your trial ends {new Date(user.trialEndsAt).toLocaleDateString("en-NG", { dateStyle: "medium" })}. <button onClick={() => openPage("settings")}>Subscription options</button></span></div>}
+          {user.subscriptionStatus === "trialing" && user.trialEndsAt && <div className="trial-banner"><span><CheckCircle2 size={16} /> 15-day trial</span><span>Your trial ends {new Date(user.trialEndsAt).toLocaleDateString("en-NG", { dateStyle: "medium" })}. <button onClick={() => openPage("settings")}>Subscription options</button></span></div>}
           {page === "dashboard" && <Dashboard data={dashboard} user={user} onNavigate={openPage} onToast={setToast} />}
           {page === "employees" && <Employees employees={employees} onAdd={() => setShowAddEmployee(true)} canManage={userPermissions.has("employees.manage")} onToast={setToast} onDeliveryUpdated={(id, status) => setEmployees((current) => current.map((employee) => employee.id === id ? { ...employee, invitationEmailStatus: status } : employee))} />}
+          {page === "appraisals" && <Appraisals user={{ id: user.id, permissions: user.permissions }} onToast={setToast} />}
+          {page === "talent" && <HRTalentWorkspace user={{ id: user.id, permissions: user.permissions || [] }} employees={employees} onToast={setToast} onEmployeesUpdated={async () => { try { const people = await api<{ data: Employee[] }>("/api/employees"); setEmployees(people.data); } catch { /* handled in the workspace */ } }} />}
           {page === "leave" && <Leave requests={leave} onToast={setToast} />}
           {page === "tasks" && <Tasks tasks={tasks} onToast={setToast} />}
           {page === "projects" && <Projects onToast={setToast} />}

@@ -6,8 +6,11 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
-  "workers_dev": true,
-  "preview_urls": false,
+	"workers_dev": true,
+	"preview_urls": false,
+	"triggers": {
+		"crons": ["0 * * * *"]
+	},
 	"routes": [
 		{
 			"pattern": "app.zyntris.org",
@@ -38,6 +41,7 @@
 	],
 	"vars": {
 		"APP_ORIGIN": "https://app.zyntris.org",
-		"ENVIRONMENT": "production"
+		"ENVIRONMENT": "production",
+		"PLATFORM_ADMIN_EMAILS": "olumeiyor@gmail.com"
 	}
 }

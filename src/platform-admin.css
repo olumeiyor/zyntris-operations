@@ -18,6 +18,22 @@
 .platform-status { display: inline-flex; padding: 5px 8px; border-radius: 99px; background: #eef2f3; color: #53656a; font-size: 11px; font-weight: 750; text-transform: capitalize; }
 .platform-status.active, .platform-status.trialing { background: #e8f4ee; color: #247556; }
 .platform-status.suspended { background: #fbebea; color: #a4423b; }
+.platform-status.expired { background: #f7e8e5; color: #9e3f33; }
+.platform-row-actions { display: flex; align-items: center; gap: 9px; white-space: nowrap; }
+.platform-toggle { min-height: 30px; padding: 5px 8px; font-size: 11px; }
+.platform-link-button, .platform-reset-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; padding: 6px 8px; border: 1px solid #dce5e7; border-radius: 6px; background: #fff; color: #174d5c; font-size: 11px; font-weight: 750; white-space: nowrap; }
+.platform-reset-button { color: #30475a; }
+.platform-link-button:disabled, .platform-reset-button:disabled { cursor: not-allowed; opacity: .48; }
+.platform-demo-tag { display: inline-flex; margin-left: 7px; padding: 2px 6px; border-radius: 99px; background: #f3e9d7; color: #76561b; font-size: 9px; font-weight: 800; text-transform: uppercase; vertical-align: middle; }
+.platform-members-cell { padding: 0 !important; background: #f6f9fa; }
+.platform-members { display: grid; gap: 10px; padding: 18px; }
+.platform-members-heading { display: flex; align-items: center; justify-content: space-between; }
+.platform-members-heading > div { display: grid; gap: 3px; }
+.platform-members-heading strong { color: #173642; font-size: 13px; }
+.platform-members-heading span, .platform-reset-note { color: #73858c; font-size: 11px; }
+.platform-members .table-scroll { border: 1px solid #e3ebed; border-radius: 7px; background: #fff; }
+.platform-notice { padding: 12px 14px; border: 1px solid #cce7d6; border-radius: 8px; background: #f0faf4; color: #236848; font-size: 13px; }
+.platform-reset-note { margin: 0; line-height: 1.5; }
 .platform-empty { padding: 26px !important; color: #75858b; text-align: center; }
 .platform-more { display: flex; justify-content: center; padding: 14px; }
 .platform-error { padding: 12px 14px; border: 1px solid #f0c5bf; border-radius: 8px; background: #fff4f2; color: #a1382d; font-size: 13px; }

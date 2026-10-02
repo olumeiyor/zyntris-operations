@@ -1,4 +1,4 @@
-export type PageId = "dashboard" | "employees" | "leave" | "projects" | "tasks" | "expenses" | "requests" | "budgets" | "assets" | "documents" | "vendors" | "helpdesk" | "calendar" | "customers" | "reports" | "payroll" | "settings" | "security" | "platform";
+export type PageId = "dashboard" | "employees" | "leave" | "appraisals" | "talent" | "projects" | "tasks" | "expenses" | "requests" | "budgets" | "assets" | "documents" | "vendors" | "helpdesk" | "calendar" | "customers" | "reports" | "payroll" | "settings" | "security" | "platform";
 
 export type Employee = {
   id: string;
@@ -13,6 +13,8 @@ export type Employee = {
   invitationEmailStatus?: "pending" | "accepted" | "failed" | null;
   invitationEmailError?: string | null;
   accessRole?: string;
+  managerId?: string | null;
+  managerName?: string | null;
   team?: string;
   workLocation: string;
   startDate: string;
