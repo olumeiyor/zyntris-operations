@@ -1420,6 +1420,15 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ departments: departments.results || [], teams: teams.results || [], roles: roles.results || [] });
   }
 
+  if (request.method === "GET" && path === "/api/hr/org-structure") {
+    if (!hasPermission(context, "employees.view")) return error("You do not have permission to view organization structure.", 403);
+    const [departments, teams] = await Promise.all([
+      env.DB.prepare(`SELECT d.id, d.name, COUNT(DISTINCT e.id) as employeeCount, COUNT(DISTINCT t.id) as teamCount FROM departments d LEFT JOIN employees e ON e.department_id = d.id AND e.organization_id = d.organization_id AND e.deleted_at IS NULL LEFT JOIN teams t ON t.department_id = d.id AND t.organization_id = d.organization_id WHERE d.organization_id = ? GROUP BY d.id ORDER BY d.name`).bind(context.organizationId).all(),
+      env.DB.prepare(`SELECT t.id, t.name, t.department_id as departmentId, d.name as department, COUNT(DISTINCT e.id) as employeeCount FROM teams t LEFT JOIN departments d ON d.id = t.department_id AND d.organization_id = t.organization_id LEFT JOIN employees e ON e.team_id = t.id AND e.organization_id = t.organization_id AND e.deleted_at IS NULL WHERE t.organization_id = ? GROUP BY t.id ORDER BY d.name, t.name`).bind(context.organizationId).all(),
+    ]);
+    return json({ departments: departments.results || [], teams: teams.results || [] });
+  }
+
   if (request.method === "POST" && path === "/api/hr/teams") {
     if (!hasPermission(context, "teams.manage") && !hasPermission(context, "hr.talent.manage")) return error("You do not have permission to manage departments and teams.", 403);
     const body = await request.json<{ name?: string; kind?: string; departmentId?: string }>();
