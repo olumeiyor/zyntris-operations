@@ -69,7 +69,8 @@ export function OperationalWorkspace({ page, role, onToast }: OpsProps) {
     event.preventDefault(); const values = Object.fromEntries(new FormData(event.currentTarget).entries());
     const amount = Number(values.amount);
     const local: Expense = { id: `local-${Date.now()}`, employee: "Amaka Okafor", category: String(values.category), amount, currency: "NGN", expenseDate: new Date(String(values.expenseDate)).toLocaleDateString("en-NG", { day: "2-digit", month: "short", year: "numeric" }), description: String(values.description), status: "submitted" };
-    try { const saved = await opsApi<{ id: string }>("/api/expenses", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(values) }); local.id = saved.id; } catch { /* demo mode */ }
+    try { const saved = await opsApi<{ id: string; employee: string }>("/api/expenses", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(values) }); local.id = saved.id; local.employee = saved.employee; }
+    catch (cause) { onToast(cause instanceof Error ? cause.message : "Could not submit expense"); return; }
     setExpenses((current) => [local, ...current]); setRequests((current) => [{ id: `local-request-${Date.now()}`, requestType: "Expense", title: local.description, requester: local.employee, amount, status: "pending", requiredRole: "CEO", createdAt: "Just now" }, ...current]); setModal(null); onToast("Expense submitted for CEO approval");
   };
 
@@ -84,8 +85,10 @@ export function OperationalWorkspace({ page, role, onToast }: OpsProps) {
   };
 
   const reviewRequest = async (item: ApprovalRequest, status: "approved" | "rejected") => {
+    const reason = status === "rejected" ? window.prompt("Give the requester a clear reason for rejecting this request:")?.trim() : "";
+    if (status === "rejected" && !reason) { if (reason !== null) onToast("A rejection reason is required."); return; }
     try {
-      const result = await opsApi<{ status: "approved" | "rejected" | "pending"; requiredRole?: string }>(`/api/requests/${item.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status }) });
+      const result = await opsApi<{ status: "approved" | "rejected" | "pending"; requiredRole?: string }>(`/api/requests/${item.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status, reason }) });
       setRequests((current) => current.map((request) => request.id === item.id ? { ...request, status: result.status, requiredRole: result.requiredRole || request.requiredRole } : request));
       if (item.requestType === "Expense" && result.status !== "pending") setExpenses((current) => current.map((expense) => expense.description === item.title ? { ...expense, status: result.status as Expense["status"] } : expense));
       onToast(result.status === "pending" ? `Request sent to ${result.requiredRole || item.requiredRole} for approval.` : `Request ${status}`);

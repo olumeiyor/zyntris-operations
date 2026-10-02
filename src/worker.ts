@@ -31,6 +31,21 @@ const error = (message: string, status = 400) => json({ error: message }, { stat
 
 const requestId = () => crypto.randomUUID();
 
+// Tenant-owned business data only. Credentials, global identities, sessions, billing,
+// role grants and platform-control tables are intentionally excluded.
+const BACKUP_TABLES = [
+  "organization_settings", "departments", "teams", "employees", "leave_types", "leave_requests", "projects", "tasks",
+  "expenses", "documents", "notifications", "approval_requests", "assets", "asset_history",
+  "vendors", "support_tickets", "calendar_events", "customers", "budgets", "payroll_settings",
+  "employee_pay_profiles", "payroll_components", "employee_pay_components", "payroll_runs",
+  "payroll_run_items", "appraisal_cycles", "appraisals", "performance_kpis", "appraisal_kpi_scores",
+  "appraisal_360_feedback", "performance_improvement_plans", "pip_check_ins", "job_requisitions",
+  "job_candidates", "learning_courses", "learning_enrollments", "audit_logs",
+] as const;
+
+const isoDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+const validTaxBands = (bands: unknown): bands is { upTo: number | null; rate: number }[] => Array.isArray(bands) && bands.length > 0 && bands.length <= 20 && bands.every((band, index) => band && Number.isFinite(band.rate) && band.rate >= 0 && band.rate <= 1 && (band.upTo === null || (Number.isFinite(band.upTo) && band.upTo > 0 && (index === 0 || bands[index - 1].upTo !== null && band.upTo > bands[index - 1].upTo)))) && bands.at(-1)?.upTo === null && bands.slice(0, -1).every((band) => band.upTo !== null);
+
 function withSecurityHeaders(response: Response) {
   const headers = new Headers(response.headers);
   headers.set("x-content-type-options", "nosniff");
@@ -574,9 +589,9 @@ async function requireAuth(request: Request, env: Env) {
   return { context } as const;
 }
 
-async function audit(env: Env, context: AuthContext, action: string, module: string, recordId?: string, newValue?: unknown) {
-  await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_id, new_value_json) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-    .bind(requestId(), context.organizationId, context.userId, action, module, recordId || null, newValue ? JSON.stringify(newValue) : null).run();
+async function audit(env: Env, context: AuthContext, action: string, module: string, recordId?: string, newValue?: unknown, previousValue?: unknown) {
+  await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_id, previous_value_json, new_value_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(requestId(), context.organizationId, context.userId, action, module, recordId || null, previousValue ? JSON.stringify(previousValue) : null, newValue ? JSON.stringify(newValue) : null).run();
 }
 
 function validAppraisalReview(body: Record<string, unknown>) {
@@ -1268,6 +1283,115 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ ok: true });
   }
 
+  if (path === "/api/settings/backups" && request.method === "GET") {
+    if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
+    const backups = await env.DB.prepare(`SELECT id, checksum, size_bytes as sizeBytes, record_count as recordCount, created_at as createdAt FROM tenant_backups WHERE organization_id = ? ORDER BY created_at DESC LIMIT 30`).bind(context.organizationId).all();
+    return json({ data: backups.results || [] });
+  }
+
+  if (path === "/api/settings/backups" && request.method === "POST") {
+    if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
+    const id = `backup-${crypto.randomUUID()}`;
+    const tables: Record<string, unknown[]> = {};
+    let recordCount = 0;
+    const tableSnapshots = await env.DB.batch(BACKUP_TABLES.map((table) => env.DB.prepare(`SELECT * FROM ${table} WHERE organization_id = ?`).bind(context.organizationId)));
+    for (const [index, table] of BACKUP_TABLES.entries()) {
+      const rows = tableSnapshots[index].results || [];
+      tables[table] = rows as unknown[];
+      recordCount += rows.length;
+    }
+    const docs = (tables.documents || []) as { r2_key?: string }[];
+    const files: { originalKey: string; backupKey: string }[] = [];
+    const missingFiles: string[] = [];
+    for (const doc of docs) {
+      if (!doc.r2_key) continue;
+      const source = await env.FILES.get(doc.r2_key);
+      if (!source) { missingFiles.push(doc.r2_key); continue; }
+      const backupKey = `tenant-backups/${context.organizationId}/${id}/files/${await hashToken(doc.r2_key)}`;
+      await env.FILES.put(backupKey, source.body, { httpMetadata: source.httpMetadata, customMetadata: { originalKeyHash: await hashToken(doc.r2_key) } });
+      files.push({ originalKey: doc.r2_key, backupKey });
+    }
+    if (missingFiles.length) return error(`Backup was not completed: ${missingFiles.length} document file(s) are missing from R2. Resolve storage integrity before retrying.`, 409);
+    const payload = JSON.stringify({ schemaVersion: 1, organizationId: context.organizationId, generatedAt: new Date().toISOString(), tables, files });
+    const checksum = await hashToken(payload);
+    const objectKey = `tenant-backups/${context.organizationId}/${id}/snapshot.json`;
+    await env.FILES.put(objectKey, payload, { httpMetadata: { contentType: "application/json" }, customMetadata: { checksum, schemaVersion: "1" } });
+    await env.DB.prepare(`INSERT INTO tenant_backups (id, organization_id, object_key, checksum, size_bytes, record_count, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, objectKey, checksum, new TextEncoder().encode(payload).byteLength, recordCount, context.userId).run();
+    await audit(env, context, "created", "tenant_backups", id, { checksum, recordCount, fileCount: files.length });
+    return json({ id, checksum, recordCount, fileCount: files.length, createdAt: new Date().toISOString() }, { status: 201 });
+  }
+
+  const backupMatch = path.match(/^\/api\/settings\/backups\/([^/]+)(?:\/(download|restore))?$/);
+  if (backupMatch && request.method === "GET" && backupMatch[2] === "download") {
+    if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
+    const backup = await env.DB.prepare(`SELECT object_key as objectKey, checksum FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(backupMatch[1], context.organizationId).first<{ objectKey: string; checksum: string }>();
+    if (!backup) return error("Backup not found.", 404);
+    const object = await env.FILES.get(backup.objectKey);
+    if (!object) return error("Backup file is missing from private storage.", 410);
+    const payload = await object.text();
+    if (await hashToken(payload) !== backup.checksum) return error("Backup integrity verification failed. Do not use this copy for recovery.", 409);
+    await audit(env, context, "downloaded", "tenant_backups", backupMatch[1]);
+    return new Response(payload, { headers: { "content-type": "application/json; charset=utf-8", "content-disposition": `attachment; filename=\"zyntris-backup-${backupMatch[1]}.json\"`, "cache-control": "no-store" } });
+  }
+
+  if (backupMatch && request.method === "POST" && backupMatch[2] === "restore") {
+    if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
+    const body = await request.json<{ dryRun?: boolean; confirmation?: string }>();
+    const backup = await env.DB.prepare(`SELECT object_key as objectKey, checksum FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(backupMatch[1], context.organizationId).first<{ objectKey: string; checksum: string }>();
+    if (!backup) return error("Backup not found.", 404);
+    const object = await env.FILES.get(backup.objectKey);
+    if (!object) return error("Backup file is missing from private storage.", 410);
+    const serialized = await object.text();
+    if (await hashToken(serialized) !== backup.checksum) return error("Backup integrity verification failed. Do not use this copy for recovery.", 409);
+    let snapshot: { schemaVersion?: number; organizationId?: string; tables?: Record<string, unknown[]>; files?: { originalKey: string; backupKey: string }[] };
+    try { snapshot = JSON.parse(serialized); } catch { return error("Backup data is not valid JSON.", 409); }
+    if (snapshot.schemaVersion !== 1 || snapshot.organizationId !== context.organizationId || !snapshot.tables || Array.isArray(snapshot.tables) || (snapshot.files !== undefined && (!Array.isArray(snapshot.files) || snapshot.files.some((file) => !file || typeof file.originalKey !== "string" || typeof file.backupKey !== "string")))) return error("Backup version, tenant identity or file manifest is invalid.", 409);
+    const counts: Record<string, number> = {};
+    for (const [table, rows] of Object.entries(snapshot.tables)) {
+      if (!(BACKUP_TABLES as readonly string[]).includes(table) || !Array.isArray(rows)) return error("Backup includes an unsupported table.", 409);
+      counts[table] = rows.length;
+      if (rows.some((raw) => {
+        if (!raw || typeof raw !== "object") return true;
+        const row = raw as Record<string, unknown>;
+        return row.organization_id !== context.organizationId || Object.keys(row).some((column) => !/^[a-z_]+$/.test(column));
+      })) return error("Backup contains an invalid or out-of-tenant record.", 409);
+    }
+    for (const file of snapshot.files || []) {
+      if (!file.originalKey.startsWith(`${context.organizationId}/`) || !file.backupKey.startsWith(`tenant-backups/${context.organizationId}/${backupMatch[1]}/files/`) || !await env.FILES.head(file.backupKey)) return error("Backup file manifest contains a missing or out-of-tenant object.", 409);
+    }
+    if (body.dryRun) return json({ valid: true, mode: "non-destructive merge", rows: counts, fileCount: snapshot.files?.length || 0, note: "Existing records are never overwritten or deleted. Missing records and files are restored where their references remain valid." });
+    if (body.confirmation !== "RESTORE MERGE") return error("Type RESTORE MERGE to confirm recovery. This is a non-destructive merge; current rows will not be overwritten or deleted.");
+    let restoredCount = 0;
+    try {
+      for (const table of BACKUP_TABLES) {
+        const rows = snapshot.tables[table] || [];
+        for (let offset = 0; offset < rows.length; offset += 100) {
+          const statements = rows.slice(offset, offset + 100).map((raw) => {
+            const row = raw as Record<string, unknown>;
+            const columns = Object.keys(row);
+            if (!columns.length || columns.some((column) => !/^[a-z_]+$/.test(column)) || row.organization_id !== context.organizationId) throw new Error("Unsafe backup row.");
+            return env.DB.prepare(`INSERT OR IGNORE INTO ${table} (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`).bind(...columns.map((column) => row[column] as string | number | null));
+          });
+          const results = await env.DB.batch(statements);
+          restoredCount += results.reduce((sum, result) => sum + result.meta.changes, 0);
+        }
+      }
+      let restoredFiles = 0;
+      for (const file of snapshot.files || []) {
+        if (!file.originalKey.startsWith(`${context.organizationId}/`) || !file.backupKey.startsWith(`tenant-backups/${context.organizationId}/${backupMatch[1]}/files/`)) continue;
+        if (await env.FILES.head(file.originalKey)) continue;
+        const archived = await env.FILES.get(file.backupKey);
+        if (archived) { await env.FILES.put(file.originalKey, archived.body, { httpMetadata: archived.httpMetadata }); restoredFiles += 1; }
+      }
+      await audit(env, context, "restored_merge", "tenant_backups", backupMatch[1], { restoredCount, restoredFiles });
+      return json({ ok: true, mode: "non-destructive merge", restoredCount, restoredFiles });
+    } catch (cause) {
+      console.error("Tenant backup merge restore stopped", cause);
+      await audit(env, context, "restore_merge_failed", "tenant_backups", backupMatch[1], { restoredCount });
+      return error(`Restore stopped after ${restoredCount} records. Existing data was not overwritten or deleted; review the audit log and source backup before retrying.`, 409);
+    }
+  }
+
   if (request.method === "GET" && path === "/api/payroll/my-payslips") {
     if (!hasPermission(context, "payroll.self.view")) return error("Employee payslip access is not enabled for this account.", 403);
     const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
@@ -1321,8 +1445,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (request.method === "PUT" && path === "/api/payroll/settings") {
     if (!hasPermission(context, "payroll.manage")) return error("Payroll administrator permission required.", 403);
     const body = await request.json<{ currency?: string; payFrequency?: string; taxCountry?: string; taxRegion?: string; taxYear?: number; taxFreeAllowance?: number; taxBands?: { upTo: number | null; rate: number }[]; employeePensionRate?: number; employerPensionRate?: number; pensionBasis?: string }>();
-    const validBands = Array.isArray(body.taxBands) && body.taxBands.length <= 20 && body.taxBands.every((band) => Number.isFinite(band.rate) && band.rate >= 0 && band.rate <= 1 && (band.upTo === null || (Number.isFinite(band.upTo) && band.upTo > 0)));
-    if (!body.currency || !/^[A-Z]{3}$/.test(body.currency) || !["weekly", "biweekly", "semimonthly", "monthly"].includes(body.payFrequency || "") || !body.taxCountry || !validBands || !Number.isFinite(body.taxFreeAllowance) || Number(body.taxFreeAllowance) < 0 || !Number.isFinite(body.employeePensionRate) || Number(body.employeePensionRate) < 0 || Number(body.employeePensionRate) > 1 || !Number.isFinite(body.employerPensionRate) || Number(body.employerPensionRate) < 0 || Number(body.employerPensionRate) > 1 || !["base_salary", "gross"].includes(body.pensionBasis || "")) return error("Payroll settings are incomplete or invalid.");
+    if (!body.currency || !/^[A-Z]{3}$/.test(body.currency) || !["weekly", "biweekly", "semimonthly", "monthly"].includes(body.payFrequency || "") || !body.taxCountry || !/^[A-Za-z]{2}$/.test(body.taxCountry) || !validTaxBands(body.taxBands) || !Number.isFinite(body.taxYear) || Number(body.taxYear) < 2000 || Number(body.taxYear) > 2100 || !Number.isFinite(body.taxFreeAllowance) || Number(body.taxFreeAllowance) < 0 || !Number.isFinite(body.employeePensionRate) || Number(body.employeePensionRate) < 0 || Number(body.employeePensionRate) > 1 || !Number.isFinite(body.employerPensionRate) || Number(body.employerPensionRate) < 0 || Number(body.employerPensionRate) > 1 || !["base_salary", "gross"].includes(body.pensionBasis || "")) return error("Payroll settings must include ordered tax bands ending in an unlimited band, a two-letter country code, valid policy year, currency, frequency, allowance and contribution rates.");
     await env.DB.prepare(`INSERT INTO payroll_settings (organization_id, currency, pay_frequency, tax_country, tax_region, tax_year, tax_free_allowance, tax_bands_json, employee_pension_rate, employer_pension_rate, pension_basis) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(organization_id) DO UPDATE SET currency=excluded.currency, pay_frequency=excluded.pay_frequency, tax_country=excluded.tax_country, tax_region=excluded.tax_region, tax_year=excluded.tax_year, tax_free_allowance=excluded.tax_free_allowance, tax_bands_json=excluded.tax_bands_json, employee_pension_rate=excluded.employee_pension_rate, employer_pension_rate=excluded.employer_pension_rate, pension_basis=excluded.pension_basis, updated_at=CURRENT_TIMESTAMP`)
       .bind(context.organizationId, body.currency, body.payFrequency, body.taxCountry.toUpperCase(), body.taxRegion?.trim() || null, Number(body.taxYear) || new Date().getFullYear(), body.taxFreeAllowance, JSON.stringify(body.taxBands), body.employeePensionRate, body.employerPensionRate, body.pensionBasis).run();
     await audit(env, context, "updated", "payroll_settings");
@@ -1351,8 +1474,9 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!hasPermission(context, "payroll.manage")) return error("Payroll administrator permission required.", 403);
     const body = await request.json<{ employeeId?: string; baseSalary?: number; currency?: string; payFrequency?: string; effectiveFrom?: string; bankName?: string; accountName?: string; accountNumber?: string; taxReference?: string; pensionReference?: string }>();
     const salary = Number(body.baseSalary);
-    if (!body.employeeId || !Number.isFinite(salary) || salary < 0 || !body.effectiveFrom || !body.currency || !/^[A-Z]{3}$/.test(body.currency)) return error("Employee, valid salary, currency and effective date are required.");
+    if (!body.employeeId || !Number.isFinite(salary) || salary < 0 || !body.effectiveFrom || !isoDate(body.effectiveFrom) || !["weekly", "biweekly", "semimonthly", "monthly"].includes(body.payFrequency || "monthly") || !body.currency || !/^[A-Z]{3}$/.test(body.currency)) return error("Employee, valid salary, currency, pay frequency and effective date are required.");
     if (!(await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND deleted_at IS NULL`).bind(body.employeeId, context.organizationId).first())) return error("Employee not found.", 404);
+    const previousProfile = await env.DB.prepare(`SELECT base_salary as baseSalary, currency, pay_frequency as payFrequency, effective_from as effectiveFrom, status FROM employee_pay_profiles WHERE employee_id = ? AND organization_id = ?`).bind(body.employeeId, context.organizationId).first<{ baseSalary: number; currency: string; payFrequency: string; effectiveFrom: string; status: string }>();
     let bankDetails: string | null = null;
     if (body.bankName || body.accountName || body.accountNumber) {
       const bankName = body.bankName?.trim() || ""; const accountName = body.accountName?.trim() || ""; const accountNumber = body.accountNumber?.replace(/[\s-]/g, "") || "";
@@ -1362,7 +1486,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     }
     await env.DB.prepare(`INSERT INTO employee_pay_profiles (id, organization_id, employee_id, base_salary, currency, pay_frequency, effective_from, bank_details_enc, tax_reference, pension_reference) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(organization_id, employee_id) DO UPDATE SET base_salary=excluded.base_salary, currency=excluded.currency, pay_frequency=excluded.pay_frequency, effective_from=excluded.effective_from, bank_details_enc=COALESCE(excluded.bank_details_enc, employee_pay_profiles.bank_details_enc), tax_reference=excluded.tax_reference, pension_reference=excluded.pension_reference, status='active', updated_at=CURRENT_TIMESTAMP`)
       .bind(`pay-${crypto.randomUUID()}`, context.organizationId, body.employeeId, salary, body.currency, body.payFrequency || "monthly", body.effectiveFrom, bankDetails, body.taxReference?.trim() || null, body.pensionReference?.trim() || null).run();
-    await audit(env, context, "updated", "employee_pay_profiles", body.employeeId, { baseSalary: salary, currency: body.currency, bankDetailsRecorded: Boolean(bankDetails) });
+    await audit(env, context, previousProfile ? "compensation_changed" : "compensation_created", "employee_pay_profiles", body.employeeId, { baseSalary: salary, currency: body.currency, payFrequency: body.payFrequency || "monthly", effectiveFrom: body.effectiveFrom, bankDetailsRecorded: Boolean(bankDetails) }, previousProfile || undefined);
     return json({ ok: true });
   }
 
@@ -1387,7 +1511,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const amount = Number(body.amount);
     const component = body.componentId ? await env.DB.prepare(`SELECT id FROM payroll_components WHERE id = ? AND organization_id = ?`).bind(body.componentId, context.organizationId).first() : null;
     const employee = body.employeeId ? await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND deleted_at IS NULL`).bind(body.employeeId, context.organizationId).first() : null;
-    if (!employee || !component || !Number.isFinite(amount) || amount < 0 || !body.effectiveFrom) return error("Employee, pay component, non-negative amount and effective date are required.");
+    if (!employee || !component || !Number.isFinite(amount) || amount < 0 || !body.effectiveFrom || !isoDate(body.effectiveFrom)) return error("Employee, pay component, non-negative amount and valid effective date are required.");
     const id = `epc-${crypto.randomUUID()}`;
     await env.DB.prepare(`INSERT INTO employee_pay_components (id, organization_id, employee_id, component_id, amount, effective_from) VALUES (?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.employeeId, body.componentId, amount, body.effectiveFrom).run();
     return json({ id }, { status: 201 });
@@ -1407,18 +1531,31 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (request.method === "POST" && path === "/api/payroll/runs") {
     if (!hasPermission(context, "payroll.run")) return error("Payroll run permission required.", 403);
     const body = await request.json<{ periodStart?: string; periodEnd?: string; paymentDate?: string; adjustments?: { employeeId: string; label: string; kind: "earning" | "deduction"; amount: number }[] }>();
-    if (!body.periodStart || !body.periodEnd || !body.paymentDate || body.periodEnd < body.periodStart || !/^\d{4}-\d{2}-\d{2}$/.test(body.periodStart) || !/^\d{4}-\d{2}-\d{2}$/.test(body.periodEnd)) return error("A valid period and payment date are required.");
-    const config = await env.DB.prepare(`SELECT currency, tax_free_allowance as taxFreeAllowance, tax_bands_json as taxBandsJson, employee_pension_rate as employeePensionRate, employer_pension_rate as employerPensionRate, pension_basis as pensionBasis FROM payroll_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ currency: string; taxFreeAllowance: number; taxBandsJson: string; employeePensionRate: number; employerPensionRate: number; pensionBasis: string }>();
+    if (!body.periodStart || !body.periodEnd || !body.paymentDate || !isoDate(body.periodStart) || !isoDate(body.periodEnd) || !isoDate(body.paymentDate) || body.periodEnd < body.periodStart || body.paymentDate < body.periodEnd) return error("Enter valid payroll dates. The period end must not precede its start, and the intended pay date must be on or after period end.");
+    const periodEnd = body.periodEnd;
+    const overlap = await env.DB.prepare(`SELECT id, status FROM payroll_runs WHERE organization_id = ? AND period_start <= ? AND period_end >= ? LIMIT 1`).bind(context.organizationId, body.periodEnd, body.periodStart).first<{ id: string; status: string }>();
+    if (overlap) return error(`This payroll period overlaps an existing ${overlap.status} record. Review that record; a period cannot be run twice, even after voiding.`, 409);
+    const config = await env.DB.prepare(`SELECT currency, pay_frequency as payFrequency, tax_free_allowance as taxFreeAllowance, tax_bands_json as taxBandsJson, employee_pension_rate as employeePensionRate, employer_pension_rate as employerPensionRate, pension_basis as pensionBasis FROM payroll_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ currency: string; payFrequency: string; taxFreeAllowance: number; taxBandsJson: string; employeePensionRate: number; employerPensionRate: number; pensionBasis: string }>();
     if (!config) return error("Configure payroll settings before running payroll.", 409);
+    const activeStaff = await env.DB.prepare(`SELECT e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.start_date as startDate, p.status as payStatus, p.pay_frequency as payFrequency, p.currency as payCurrency, p.effective_from as effectiveFrom FROM employees e LEFT JOIN employee_pay_profiles p ON p.employee_id = e.id AND p.organization_id = e.organization_id WHERE e.organization_id = ? AND e.status = 'active' AND e.deleted_at IS NULL AND e.start_date <= ?`).bind(context.organizationId, body.periodEnd).all<{ employeeNumber: string; firstName: string; lastName: string; startDate: string; payStatus: string | null; payFrequency: string | null; payCurrency: string | null; effectiveFrom: string | null }>();
+    const blockers = (activeStaff.results || []).flatMap((person) => {
+      const name = `${person.firstName} ${person.lastName} (${person.employeeNumber})`;
+      if (person.payStatus !== "active") return [`${name}: missing active pay profile`];
+      if (person.payFrequency !== config.payFrequency) return [`${name}: pay frequency does not match organization settings`];
+      if (person.payCurrency !== config.currency) return [`${name}: currency does not match organization settings`];
+      if (!person.effectiveFrom || !isoDate(person.effectiveFrom) || person.effectiveFrom > periodEnd) return [`${name}: pay profile is not effective for this period`];
+      return [];
+    });
+    if (blockers.length) return json({ error: `Payroll preflight found ${blockers.length} blocking issue${blockers.length === 1 ? "" : "s"}. No run was created.`, blockers: blockers.slice(0, 50) }, { status: 409 });
     const employees = await env.DB.prepare(`SELECT e.id as employeeId, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.job_title as jobTitle, e.start_date as startDate, p.base_salary as baseSalary, p.currency as payCurrency, c.id as componentId, c.code as componentCode, c.name as componentName, c.kind as componentKind, c.taxable, c.pensionable, ec.amount as componentAmount FROM employees e JOIN employee_pay_profiles p ON p.employee_id = e.id AND p.organization_id = e.organization_id AND p.status = 'active' AND p.pay_frequency = (SELECT pay_frequency FROM payroll_settings WHERE organization_id = e.organization_id) LEFT JOIN employee_pay_components ec ON ec.employee_id = e.id AND ec.organization_id = e.organization_id AND ec.effective_from <= ? AND (ec.effective_to IS NULL OR ec.effective_to >= ?) LEFT JOIN payroll_components c ON c.id = ec.component_id AND c.organization_id = e.organization_id WHERE e.organization_id = ? AND e.status = 'active' AND e.deleted_at IS NULL ORDER BY e.employee_number`).bind(body.periodEnd, body.periodStart, context.organizationId).all<Record<string, unknown>>();
     const byEmployee = new Map<string, Record<string, unknown>[]>();
     for (const employee of employees.results || []) { const list = byEmployee.get(String(employee.employeeId)) || []; list.push(employee); byEmployee.set(String(employee.employeeId), list); }
     if (!byEmployee.size) return error("Add active employees and pay profiles before creating a run.", 409);
     const adjustments = body.adjustments || [];
-    if (adjustments.length > 1000 || adjustments.some((item) => !byEmployee.has(item.employeeId) || !item.label.trim() || !["earning", "deduction"].includes(item.kind) || !Number.isFinite(item.amount) || item.amount < 0)) return error("Payroll adjustments contain invalid employee, type or amount.");
+    if (adjustments.length > 1000 || adjustments.some((item) => !item || !byEmployee.has(item.employeeId) || typeof item.label !== "string" || !item.label.trim() || item.label.length > 120 || !["earning", "deduction"].includes(item.kind) || !Number.isFinite(item.amount) || item.amount < 0 || item.amount > 1_000_000_000_000)) return error("Payroll adjustments contain invalid employee, type, label or amount.");
     let taxBands: { upTo: number | null; rate: number }[];
     try { taxBands = JSON.parse(config.taxBandsJson) as { upTo: number | null; rate: number }[]; } catch { return error("Tax bands are invalid. Save payroll settings again.", 409); }
-    if (!taxBands.length) return error("Add effective tax bands in Payroll settings before running payroll.", 409);
+    if (!validTaxBands(taxBands)) return error("Tax bands must have valid rates, strictly ascending positive thresholds, and exactly one final band with no upper limit.", 409);
     const runId = `pr-${crypto.randomUUID()}`;
     const calculated: { id: string; employeeId: string; employeeNumber: string; employeeName: string; jobTitle: string; baseSalary: number; gross: number; taxable: number; tax: number; employeePension: number; employerPension: number; otherDeductions: number; employerContributions: number; net: number; breakdown: Record<string, unknown> }[] = [];
     for (const [employeeId, rows] of byEmployee) {
@@ -1463,6 +1600,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       if (remaining > 0) return error("Tax bands must include a final band with no upper limit.", 409);
       tax = Math.round(tax * 100) / 100;
       const net = gross - otherDeductions - employeePension - tax;
+      if (![gross, taxable, tax, employeePension, employerPension, otherDeductions, employerContributions, net].every(Number.isFinite) || net < 0) return error(`Payroll calculation for ${employee.firstName} ${employee.lastName} would produce an invalid or negative net amount. Review deductions and policy settings.`, 409);
       const prorationDays = Math.max(0, Math.min(1, (new Date(body.periodEnd).getTime() - new Date(String(employee.startDate)).getTime() + 86400000) / (new Date(body.periodEnd).getTime() - new Date(body.periodStart).getTime() + 86400000)));
       const factor = String(employee.startDate) > body.periodStart ? prorationDays : 1;
       const prorate = (value: number) => Math.round(value * factor * 100) / 100;
@@ -1503,6 +1641,11 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const required = body.action === "review" ? "payroll.run" : "payroll.approve";
     if (!hasPermission(context, required)) return error("You do not have permission for this payroll action.", 403);
     if (body.action === "approve" && context.role !== "CEO") return error("Only the CEO can give final approval to a payroll run.", 403);
+    if (body.action === "review" || body.action === "approve") {
+      const separation = await env.DB.prepare(`SELECT created_by as createdBy, reviewed_by as reviewedBy FROM payroll_runs WHERE id = ? AND organization_id = ?`).bind(payrollRunMatch[1], context.organizationId).first<{ createdBy: string; reviewedBy: string | null }>();
+      if (separation?.createdBy === context.userId) return error("The payroll creator cannot review or finally approve the same run.", 403);
+      if (body.action === "approve" && separation?.reviewedBy === context.userId) return error("The finance reviewer and final CEO approver must be different people.", 403);
+    }
     const actorColumn = body.action === "review" ? "reviewed_by" : body.action === "approve" ? "approved_by" : body.action === "pay" ? "paid_by" : null;
     const next = body.action === "review" ? "reviewed" : body.action === "approve" ? "approved" : body.action === "pay" ? "paid" : "void";
     const result = await env.DB.prepare(`UPDATE payroll_runs SET status = ?, ${actorColumn ? `${actorColumn} = ?,` : ""} updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = ?`)
@@ -1634,7 +1777,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "GET" && path === "/api/expenses") {
     if (!hasPermission(context, "expenses.view")) return error("You do not have permission to view expenses.", 403);
-    const result = await env.DB.prepare(`SELECT x.id, e.first_name || ' ' || e.last_name as employee, x.category, x.amount, x.currency, x.expense_date as expenseDate, x.description, x.status, p.name as project FROM expenses x JOIN employees e ON e.id = x.employee_id LEFT JOIN projects p ON p.id = (SELECT id FROM projects WHERE organization_id = x.organization_id LIMIT 1) WHERE x.organization_id = ? AND (? = 1 OR e.user_id = ?) ORDER BY x.created_at DESC LIMIT 100`).bind(context.organizationId, hasPermission(context, "expenses.manage") ? 1 : 0, context.userId).all();
+    const result = await env.DB.prepare(`SELECT x.id, e.first_name || ' ' || e.last_name as employee, x.category, x.amount, x.currency, x.expense_date as expenseDate, x.description, x.status, p.name as project FROM expenses x JOIN employees e ON e.id = x.employee_id LEFT JOIN approval_requests a ON a.source_record_id = x.id AND a.organization_id = x.organization_id LEFT JOIN projects p ON p.id = json_extract(a.metadata_json, '$.project') AND p.organization_id = x.organization_id WHERE x.organization_id = ? AND (? = 1 OR e.user_id = ?) ORDER BY x.created_at DESC LIMIT 100`).bind(context.organizationId, hasPermission(context, "expenses.manage") ? 1 : 0, context.userId).all();
     return json({ data: result.results || [] });
   }
 
@@ -1642,19 +1785,24 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!hasPermission(context, "employees.view")) return error("Only organization members can submit expense records.", 403);
     const body = await request.json<{ category?: string; amount?: number; expenseDate?: string; description?: string; project?: string }>();
     const amount = Number(body.amount);
-    if (!body.category || !Number.isFinite(amount) || amount <= 0 || !body.expenseDate || !body.description) return error("category, amount, expenseDate and description are required");
-    const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
-    const employeeId = employee?.id || (await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND deleted_at IS NULL ORDER BY created_at LIMIT 1`).bind(context.organizationId).first<{ id: string }>())?.id;
-    if (!employeeId) return error("No active employee profile is available for this request", 409);
-    const id = `expense-${crypto.randomUUID().slice(0, 8)}`;
-    const requestIdValue = `request-${crypto.randomUUID().slice(0, 8)}`;
+    const category = body.category?.trim(); const description = body.description?.trim();
+    if (!category || category.length > 80 || !Number.isFinite(amount) || amount <= 0 || amount > 1_000_000_000_000 || !body.expenseDate || !isoDate(body.expenseDate) || !description || description.length > 1000) return error("Enter a valid category, amount, expense date and description. Amounts must be positive and the expense date must be valid.");
+    if (body.expenseDate > new Date().toISOString().slice(0, 10)) return error("Expense date cannot be in the future.");
+    const employee = await env.DB.prepare(`SELECT id, first_name as firstName, last_name as lastName FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string; firstName: string; lastName: string }>();
+    const employeeId = employee?.id;
+    if (!employeeId) return error("Your account must be linked to an active employee profile before submitting an expense. Ask your HR administrator to complete your profile.", 409);
+    if (body.project && !await env.DB.prepare(`SELECT id FROM projects WHERE id = ? AND organization_id = ?`).bind(body.project, context.organizationId).first()) return error("The selected project was not found in this organization.", 404);
+    const duplicate = await env.DB.prepare(`SELECT id FROM expenses WHERE organization_id = ? AND employee_id = ? AND amount = ? AND expense_date = ? AND lower(category) = lower(?) AND lower(trim(COALESCE(description,''))) = lower(trim(?)) AND status != 'rejected' LIMIT 1`).bind(context.organizationId, employeeId, amount, body.expenseDate, category, description).first<{ id: string }>();
+    if (duplicate) return error("A matching expense is already on file. Check its status before submitting again.", 409);
+    const id = `expense-${crypto.randomUUID()}`;
+    const requestIdValue = `request-${crypto.randomUUID()}`;
     await env.DB.batch([
-      env.DB.prepare(`INSERT INTO expenses (id, organization_id, employee_id, category, amount, currency, expense_date, description, status) VALUES (?, ?, ?, ?, ?, 'NGN', ?, ?, 'submitted')`).bind(id, context.organizationId, employeeId, body.category, amount, body.expenseDate, body.description),
-      env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'CEO', 'pending', 1, ?)`).bind(requestIdValue, context.organizationId, id, body.description, context.userId, amount, JSON.stringify({ category: body.category, project: body.project || null, approvalPolicy: ["CEO"] })),
+      env.DB.prepare(`INSERT INTO expenses (id, organization_id, employee_id, category, amount, currency, expense_date, description, status) VALUES (?, ?, ?, ?, ?, 'NGN', ?, ?, 'submitted')`).bind(id, context.organizationId, employeeId, category, amount, body.expenseDate, description),
+      env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'CEO', 'pending', 1, ?)`).bind(requestIdValue, context.organizationId, id, description, context.userId, amount, JSON.stringify({ category, project: body.project || null, approvalPolicy: ["CEO"] })),
     ]);
-    await audit(env, context, "submitted", "expenses", id, { category: body.category, amount, description: body.description });
-    await notifyApprovers(env, context, "CEO", body.description, `A financial request for ₦${amount.toLocaleString("en-NG")} is pending your approval.`);
-    return json({ id, requestId: requestIdValue, status: "submitted" }, { status: 201 });
+    await audit(env, context, "submitted", "expenses", id, { category, amount, description });
+    await notifyApprovers(env, context, "CEO", description, `A financial request for ₦${amount.toLocaleString("en-NG")} is pending your approval.`);
+    return json({ id, requestId: requestIdValue, status: "submitted", employee: `${employee.firstName} ${employee.lastName}` }, { status: 201 });
   }
 
   const expenseMatch = path.match(/^\/api\/expenses\/([^/]+)$/);
@@ -1693,27 +1841,33 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const requestMatch = path.match(/^\/api\/requests\/([^/]+)$/);
   if (request.method === "PATCH" && requestMatch) {
     if (!hasPermission(context, "requests.manage") && !hasPermission(context, "hr.onboarding.approve")) return error("You do not have permission to approve requests.", 403);
-    const body = await request.json<{ status?: string }>();
+    const body = await request.json<{ status?: string; reason?: string }>();
     if (!body.status || !["approved", "rejected", "paid", "cancelled"].includes(body.status)) return error("A valid request status is required");
     const requestIdValue = requestMatch[1];
     const item = await env.DB.prepare(`SELECT source_record_id as sourceRecordId, requester_id as requesterId, title, request_type as requestType, required_role as requiredRole, amount, current_step as currentStep, status FROM approval_requests WHERE id = ? AND organization_id = ?`).bind(requestIdValue, context.organizationId).first<{ sourceRecordId: string | null; requesterId: string; title: string; requestType: string; requiredRole: string; amount: number | null; currentStep: number; status: string }>();
     if (!item) return error("Request not found.", 404);
-    if (item.status !== "pending") return error("This request has already been decided.", 409);
+    if (item.status !== "pending" && !(body.status === "paid" && item.status === "approved")) return error("This request has already been decided or is not ready for payment recording.", 409);
     const financialTypes = ["expense", "purchase", "budget", "payroll", "reimbursement", "payment", "financial", "asset purchase"];
     const isFinancialRequest = item.amount !== null || financialTypes.includes(item.requestType.trim().toLowerCase());
     const requiredRole = isFinancialRequest ? "CEO" : item.requiredRole;
+    if ((body.status === "approved" || body.status === "rejected") && item.requesterId === context.userId) return error("You cannot approve or reject a request you submitted.", 403);
+    if (body.status === "rejected" && !body.reason?.trim()) return error("A rejection reason is required so the requester has a clear decision record.");
     if (body.status === "approved" || body.status === "rejected") {
       const organizationAdminMayDecide = !isFinancialRequest && context.role === "Organization Admin";
       if (context.role !== requiredRole && !organizationAdminMayDecide) return error(`This request requires approval from ${requiredRole}.`, 403);
     } else if (body.status === "paid" && !hasPermission(context, "expenses.manage")) return error("Finance permission is required to mark a claim as paid.", 403);
-    await env.DB.batch([
-      env.DB.prepare(`UPDATE approval_requests SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'pending'`).bind(body.status, requestIdValue, context.organizationId),
-      ...(item.sourceRecordId ? [env.DB.prepare(`UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.status, item.sourceRecordId, context.organizationId)] : []),
+    const expectedStatus = body.status === "paid" ? "approved" : "pending";
+    const changes = await env.DB.batch([
+      env.DB.prepare(`UPDATE approval_requests SET status = ?, metadata_json = CASE WHEN ? = '' THEN metadata_json ELSE json_set(metadata_json, '$.decisionReason', ?) END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = ?`).bind(body.status, body.reason?.trim() || "", body.reason?.trim() || "", requestIdValue, context.organizationId, expectedStatus),
+      ...(item.sourceRecordId ? [env.DB.prepare(`UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND EXISTS (SELECT 1 FROM approval_requests WHERE id = ? AND organization_id = ? AND status = ?)`).bind(body.status, item.sourceRecordId, context.organizationId, requestIdValue, context.organizationId, body.status)] : []),
     ]);
+    if (!changes[0]?.meta.changes) return error("This request was decided by another approver. Refresh the queue.", 409);
     await audit(env, context, body.status, "requests", requestIdValue, { role: context.role, stage: item.currentStep });
-    if (body.status === "approved") {
+    if (body.status === "approved" || body.status === "rejected") {
       const requester = await env.DB.prepare(`SELECT u.email, u.full_name as fullName, o.name as organizationName FROM users u JOIN organizations o ON o.id = ? WHERE u.id = ?`).bind(context.organizationId, item.requesterId).first<{ email: string; fullName: string; organizationName: string }>();
-      if (requester) await sendApprovalNotificationEmail(env, requester.email, requester.fullName, requester.organizationName, "Your Zyntris request was approved", `Your ${item.requestType.toLowerCase()} request “${item.title}” has been approved.`);
+      const decisionText = body.status === "approved" ? "approved" : `rejected. Reason: ${body.reason!.trim()}`;
+      await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'request_decision', ?, ?)`).bind(requestId(), context.organizationId, item.requesterId, `Request ${body.status}`, `Your ${item.requestType.toLowerCase()} request “${item.title}” was ${decisionText}.`).run();
+      if (requester) await sendApprovalNotificationEmail(env, requester.email, requester.fullName, requester.organizationName, `Your Zyntris request was ${body.status}`, `Your ${item.requestType.toLowerCase()} request “${item.title}” was ${decisionText}.`);
     }
     return json({ ok: true, id: requestIdValue, status: body.status });
   }
