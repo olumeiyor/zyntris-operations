@@ -122,6 +122,8 @@ body { background: #f5f8f9; color: #10212b; }.main-content { background: #f5f8f9
 .demo-entry { width: 100%; margin-top: 14px; padding: 11px; border: 1px solid #d6e1e2; border-radius: 7px; background: #fff; color: #174253; font: inherit; font-size: 13px; font-weight: 750; }
 .demo-entry:hover { border-color: #b7cbd0; background: #f7faf9; }
 .payslip-print-actions { display: flex; align-items: center; gap: 8px; }
+.work-error { margin: 12px 0; padding: 11px 14px; border: 1px solid #f2c9c9; border-radius: 8px; background: #fff5f5; color: #a93636; font-size: 12px; }
+.work-loading,.work-empty { padding: 24px; color: #8491a4; text-align: center; font-size: 12px; }
 @media print {
   body * { visibility: hidden !important; }
   .employee-payslip-print, .employee-payslip-print * { visibility: visible !important; }

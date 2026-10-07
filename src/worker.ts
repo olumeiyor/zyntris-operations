@@ -72,6 +72,23 @@ async function hashToken(value: string) {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
+const escapeIcs = (value: string) => value.replace(/\\/g, "\\\\").replace(/\r?\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
+const icsDate = (value: string) => new Date(value).toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+
+async function publicCalendarFeed(token: string, env: Env) {
+  if (!/^[a-f0-9]{64}$/i.test(token)) return error("Calendar feed not found.", 404);
+  const feed = await env.DB.prepare(`SELECT organization_id as organizationId FROM calendar_feed_tokens WHERE token_hash = ? AND revoked_at IS NULL`).bind(await hashToken(token)).first<{ organizationId: string }>();
+  if (!feed) return error("Calendar feed not found or revoked.", 404);
+  const [organization, events] = await Promise.all([
+    env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`).bind(feed.organizationId).first<{ name: string }>(),
+    env.DB.prepare(`SELECT id, title, event_type as eventType, start_at as startAt, end_at as endAt, location FROM calendar_events WHERE organization_id = ? AND end_at >= datetime('now', '-90 days') ORDER BY start_at LIMIT 1000`).bind(feed.organizationId).all<{ id: string; title: string; eventType: string; startAt: string; endAt: string; location: string | null }>(),
+  ]);
+  const lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Zyntris//Operations Calendar//EN", "CALSCALE:GREGORIAN", "METHOD:PUBLISH", `X-WR-CALNAME:${escapeIcs(organization?.name || "Zyntris")}`];
+  for (const event of events.results || []) lines.push("BEGIN:VEVENT", `UID:${event.id}@zyntris.org`, `DTSTAMP:${icsDate(new Date().toISOString())}`, `DTSTART:${icsDate(event.startAt)}`, `DTEND:${icsDate(event.endAt)}`, `SUMMARY:${escapeIcs(event.title)}`, `CATEGORIES:${escapeIcs(event.eventType)}`, ...(event.location ? [`LOCATION:${escapeIcs(event.location)}`] : []), "END:VEVENT");
+  lines.push("END:VCALENDAR");
+  return new Response(`${lines.join("\r\n")}\r\n`, { headers: { "content-type": "text/calendar; charset=utf-8", "cache-control": "no-store", "content-disposition": "attachment; filename=zyntris-calendar.ics" } });
+}
+
 async function auth(request: Request, env: Env): Promise<AuthContext | null> {
   const mobileRequest = new URL(request.url).pathname.startsWith("/api/mobile/");
   const authorization = mobileRequest ? request.headers.get("authorization") : null;
@@ -1402,10 +1419,50 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (path.startsWith("/api/payroll") && !hasPermission(context, "payroll.view") && !hasPermission(context, "payroll.manage")) return error("You do not have permission to access the payroll administration workspace.", 403);
 
   if (path.startsWith("/api/hr/") && !hasPermission(context, "employees.view")) return error("You do not have permission to access HR records.", 403);
-  const operationsPaths = ["/api/tasks", "/api/projects", "/api/assets", "/api/vendors", "/api/tickets", "/api/calendar", "/api/customers", "/api/files"];
+  const operationsPaths = ["/api/tasks", "/api/projects", "/api/assets", "/api/vendors", "/api/tickets", "/api/calendar", "/api/customers", "/api/files", "/api/budgets", "/api/reports", "/api/operations/members"];
   const operationsPath = operationsPaths.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
   if (operationsPath && !hasPermission(context, "operations.view")) return error("You do not have access to operations modules.", 403);
   if (operationsPath && request.method !== "GET" && !(path === "/api/tickets" && request.method === "POST") && !hasPermission(context, "operations.manage")) return error("Operations manager permission is required for this change.", 403);
+
+  if (path === "/api/approval-workflows") {
+    if (!hasPermission(context, "requests.manage")) return error("Request administration permission is required to configure approval routing.", 403);
+    if (request.method === "GET") {
+      const row = await env.DB.prepare(`SELECT approval_workflows_json as workflowsJson FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ workflowsJson: string }>();
+      let workflows: Record<string, string> = {};
+      try { workflows = JSON.parse(row?.workflowsJson || "{}"); } catch { /* use empty settings */ }
+      return json({ workflows: { Operational: workflows.Operational || "Manager", Access: workflows.Access || "Manager", HR: workflows.HR || "HR Admin", Leave: workflows.Leave || "HR Admin", Other: workflows.Other || "Manager" } });
+    }
+    if (request.method === "PATCH") {
+      const body = await request.json<{ workflows?: Record<string, string> }>(); const workflows = body.workflows;
+      const categories = ["Operational", "Access", "HR", "Leave", "Other"];
+      const allowedRoles = ["Manager", "HR Admin", "CEO"];
+      if (!workflows || categories.some((category) => !allowedRoles.includes(workflows[category]))) return error("Choose Manager, HR Admin, or CEO for each non-financial request category.");
+      await env.DB.prepare(`UPDATE organization_settings SET approval_workflows_json = ?, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(JSON.stringify(Object.fromEntries(categories.map((category) => [category, workflows[category]]))), context.organizationId).run();
+      await audit(env, context, "updated", "approval_workflows", context.organizationId, { workflows });
+      return json({ ok: true, workflows });
+    }
+  }
+
+  if (request.method === "GET" && path === "/api/reports/summary") {
+    const sixMonthsAgo = new Date(); sixMonthsAgo.setUTCDate(1); sixMonthsAgo.setUTCMonth(sixMonthsAgo.getUTCMonth() - 5);
+    const fromDate = sixMonthsAgo.toISOString().slice(0, 10);
+    const [people, expenses, leave, tasks, tickets, approvals, departments, monthlySpend] = await Promise.all([
+      env.DB.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active FROM employees WHERE organization_id = ? AND deleted_at IS NULL`).bind(context.organizationId).first(),
+      env.DB.prepare(`SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total, COALESCE(SUM(CASE WHEN status = 'submitted' THEN amount ELSE 0 END), 0) as pending FROM expenses WHERE organization_id = ? AND expense_date >= ?`).bind(context.organizationId, fromDate).first(),
+      env.DB.prepare(`SELECT SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending, SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved, SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected FROM leave_requests WHERE organization_id = ?`).bind(context.organizationId).first(),
+      env.DB.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed, SUM(CASE WHEN status != 'completed' AND due_date < date('now') THEN 1 ELSE 0 END) as overdue FROM tasks WHERE organization_id = ?`).bind(context.organizationId).first(),
+      env.DB.prepare(`SELECT SUM(CASE WHEN status IN ('open','assigned','in_progress') THEN 1 ELSE 0 END) as open, SUM(CASE WHEN status IN ('resolved','closed') THEN 1 ELSE 0 END) as resolved FROM support_tickets WHERE organization_id = ?`).bind(context.organizationId).first(),
+      env.DB.prepare(`SELECT SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending, SUM(CASE WHEN status IN ('approved','paid') THEN 1 ELSE 0 END) as approved, SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected FROM approval_requests WHERE organization_id = ?`).bind(context.organizationId).first(),
+      env.DB.prepare(`SELECT d.name, COUNT(e.id) as count FROM departments d LEFT JOIN employees e ON e.department_id = d.id AND e.organization_id = d.organization_id AND e.deleted_at IS NULL WHERE d.organization_id = ? GROUP BY d.id ORDER BY count DESC`).bind(context.organizationId).all(),
+      env.DB.prepare(`SELECT strftime('%Y-%m', expense_date) as month, COALESCE(SUM(amount), 0) as amount FROM expenses WHERE organization_id = ? AND expense_date >= ? GROUP BY strftime('%Y-%m', expense_date) ORDER BY month`).bind(context.organizationId, fromDate).all(),
+    ]);
+    return json({ people: people || {}, expenses: expenses || {}, leave: leave || {}, tasks: tasks || {}, tickets: tickets || {}, approvals: approvals || {}, departments: departments.results || [], monthlySpend: monthlySpend.results || [] });
+  }
+
+  if (request.method === "GET" && path === "/api/operations/members") {
+    const members = await env.DB.prepare(`SELECT u.id, u.full_name as fullName, u.email FROM users u JOIN memberships m ON m.user_id = u.id AND m.organization_id = ? AND m.status = 'active' WHERE u.status = 'active' ORDER BY u.full_name`).bind(context.organizationId).all();
+    return json({ data: members.results || [] });
+  }
 
   if (request.method === "GET" && path === "/api/hr/options") {
     if (!hasPermission(context, "employees.manage")) return error("HR administrator permission is required.", 403);
@@ -1774,14 +1831,227 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ ok: true, invitationEmailAccepted: true, invitationEmailStatus: "accepted", emailMessageId: delivery.messageId || null });
   }
 
-  if (request.method === "GET" && path === "/api/leave") {
-    const result = await env.DB.prepare(`SELECT l.id, l.start_date as startDate, l.end_date as endDate, l.days, l.reason, l.status, e.first_name || ' ' || e.last_name as employee, lt.name as leaveType FROM leave_requests l JOIN employees e ON e.id = l.employee_id JOIN leave_types lt ON lt.id = l.leave_type_id WHERE l.organization_id = ? ORDER BY l.created_at DESC LIMIT 50`).bind(context.organizationId).all();
+  if (request.method === "GET" && path === "/api/leave/types") {
+    const result = await env.DB.prepare(`SELECT id, name, days_per_year as daysPerYear, requires_approval as requiresApproval FROM leave_types WHERE organization_id = ? ORDER BY name`).bind(context.organizationId).all();
     return json({ data: result.results || [] });
   }
 
-  if (request.method === "GET" && path === "/api/tasks") {
-    const result = await env.DB.prepare(`SELECT t.id, t.title, t.priority, t.status, t.due_date as dueDate, e.first_name || ' ' || e.last_name as assignee, p.name as project FROM tasks t LEFT JOIN employees e ON e.id = t.assignee_id LEFT JOIN projects p ON p.id = t.project_id WHERE t.organization_id = ? ORDER BY CASE t.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, t.due_date LIMIT 100`).bind(context.organizationId).all();
+  if (path === "/api/leave" && request.method === "GET") {
+    const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
+    const canManageLeave = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve");
+    const result = await env.DB.prepare(`SELECT l.id, l.employee_id as employeeId, e.user_id as employeeUserId, l.leave_type_id as leaveTypeId, l.start_date as startDate, l.end_date as endDate, l.days, l.reason, l.status, e.first_name || ' ' || e.last_name as employee, lt.name as leaveType, e.manager_id as managerId, (e.manager_id = ?) as isLineManager, (e.user_id = ?) as isRequester FROM leave_requests l JOIN employees e ON e.id = l.employee_id AND e.organization_id = l.organization_id JOIN leave_types lt ON lt.id = l.leave_type_id AND lt.organization_id = l.organization_id WHERE l.organization_id = ? AND (? = 1 OR e.user_id = ? OR e.manager_id = ?) ORDER BY CASE l.status WHEN 'pending' THEN 0 ELSE 1 END, l.start_date DESC LIMIT 200`).bind(employee?.id || "", context.userId, context.organizationId, canManageLeave ? 1 : 0, context.userId, employee?.id || "").all<Record<string, unknown>>();
+    return json({ data: (result.results || []).map((row) => ({ ...row, canApprove: canManageLeave || row.isLineManager === 1 || row.isLineManager === true, canCancel: row.isRequester === 1 || row.isRequester === true })) });
+  }
+
+  if (path === "/api/leave" && request.method === "POST") {
+    if (!hasPermission(context, "employees.view")) return error("Organization membership is required to request leave.", 403);
+    const body = await request.json<{ leaveTypeId?: string; startDate?: string; endDate?: string; reason?: string }>();
+    if (!body.leaveTypeId || !body.startDate || !body.endDate || !isoDate(body.startDate) || !isoDate(body.endDate) || body.endDate < body.startDate || !body.reason?.trim() || body.reason.trim().length > 1000) return error("Choose a leave type, valid dates and a short reason.");
+    const today = new Date().toISOString().slice(0, 10);
+    if (body.startDate < today) return error("Leave requests must start today or later.");
+    if ((Date.parse(`${body.endDate}T00:00:00Z`) - Date.parse(`${body.startDate}T00:00:00Z`)) / 86400000 > 366) return error("A single leave request cannot exceed one year.");
+    const employee = await env.DB.prepare(`SELECT e.id, e.first_name as firstName, e.last_name as lastName, e.manager_id as managerId FROM employees e WHERE e.organization_id = ? AND e.user_id = ? AND e.status = 'active' AND e.deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string; firstName: string; lastName: string; managerId: string | null }>();
+    if (!employee) return error("Your account needs an active employee profile before you can request leave. Contact your HR administrator.", 409);
+    const leaveType = await env.DB.prepare(`SELECT id, name, days_per_year as daysPerYear, requires_approval as requiresApproval FROM leave_types WHERE id = ? AND organization_id = ?`).bind(body.leaveTypeId, context.organizationId).first<{ id: string; name: string; daysPerYear: number; requiresApproval: number }>();
+    if (!leaveType) return error("Choose a leave type available to your organization.", 404);
+    const conflict = await env.DB.prepare(`SELECT id FROM leave_requests WHERE organization_id = ? AND employee_id = ? AND status IN ('pending','approved') AND start_date <= ? AND end_date >= ? LIMIT 1`).bind(context.organizationId, employee.id, body.endDate, body.startDate).first();
+    if (conflict) return error("These dates overlap an existing pending or approved leave request.", 409);
+    const settings = await env.DB.prepare(`SELECT working_days_json as workingDaysJson, public_holidays_json as holidaysJson FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ workingDaysJson: string; holidaysJson: string }>();
+    let workingDays = [1, 2, 3, 4, 5]; let holidays: string[] = [];
+    try { if (settings?.workingDaysJson) workingDays = JSON.parse(settings.workingDaysJson) as number[]; } catch { /* use weekday defaults */ }
+    try { if (settings?.holidaysJson) holidays = JSON.parse(settings.holidaysJson) as string[]; } catch { /* use no public holidays */ }
+    const workdaySet = new Set(workingDays.filter((day) => Number.isInteger(day) && day >= 0 && day <= 6));
+    const holidaySet = new Set(holidays.filter((day) => typeof day === "string"));
+    let days = 0;
+    for (let stamp = Date.parse(`${body.startDate}T00:00:00Z`); stamp <= Date.parse(`${body.endDate}T00:00:00Z`); stamp += 86400000) {
+      const date = new Date(stamp); const iso = date.toISOString().slice(0, 10);
+      if (workdaySet.has(date.getUTCDay()) && !holidaySet.has(iso)) days += 1;
+    }
+    if (!days) return error("The selected dates contain no working days under your organization calendar.");
+    const startYear = body.startDate.slice(0, 4);
+    const used = await env.DB.prepare(`SELECT COALESCE(SUM(days), 0) as days FROM leave_requests WHERE organization_id = ? AND employee_id = ? AND leave_type_id = ? AND status = 'approved' AND strftime('%Y', start_date) = ?`).bind(context.organizationId, employee.id, leaveType.id, startYear).first<{ days: number }>();
+    if (leaveType.daysPerYear > 0 && Number(used?.days || 0) + days > leaveType.daysPerYear) return error(`This request would exceed the ${leaveType.daysPerYear}-day annual allowance for ${leaveType.name}. Contact HR if an exception applies.`, 409);
+    const manager = employee.managerId ? await env.DB.prepare(`SELECT user_id as userId FROM employees WHERE id = ? AND organization_id = ? AND deleted_at IS NULL`).bind(employee.managerId, context.organizationId).first<{ userId: string | null }>() : null;
+    const id = `leave-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO leave_requests (id, organization_id, employee_id, leave_type_id, start_date, end_date, days, reason, status, approver_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, employee.id, leaveType.id, body.startDate, body.endDate, days, body.reason.trim(), leaveType.requiresApproval ? "pending" : "approved", manager?.userId || null).run();
+    await audit(env, context, leaveType.requiresApproval ? "submitted" : "auto_approved", "leave_requests", id, { leaveType: leaveType.name, startDate: body.startDate, endDate: body.endDate, days });
+    const approverUserId = manager?.userId;
+    if (leaveType.requiresApproval && approverUserId) {
+      const approver = await env.DB.prepare(`SELECT email, full_name as fullName FROM users WHERE id = ? AND status = 'active'`).bind(approverUserId).first<{ email: string; fullName: string }>();
+      await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'leave_pending', ?, ?)`).bind(requestId(), context.organizationId, approverUserId, "Leave approval pending", `${employee.firstName} ${employee.lastName} requested ${days} working day(s) of ${leaveType.name} (${body.startDate} to ${body.endDate}).`).run();
+      if (approver) await sendApprovalNotificationEmail(env, approver.email, approver.fullName, (await env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`).bind(context.organizationId).first<{ name: string }>())?.name || "your organization", "Leave approval pending", `${employee.firstName} ${employee.lastName} requested ${days} working day(s) of ${leaveType.name} from ${body.startDate} to ${body.endDate}. Sign in to review it.`);
+    } else if (leaveType.requiresApproval) {
+      await notifyApprovers(env, context, "HR Admin", `Leave request · ${employee.firstName} ${employee.lastName}`, `${days} working day(s) of ${leaveType.name} requested from ${body.startDate} to ${body.endDate}.`);
+    } else {
+      await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'leave_approved', ?, ?)`).bind(requestId(), context.organizationId, context.userId, "Leave automatically approved", `Your ${leaveType.name} request for ${days} working day(s) has been approved.`).run();
+    }
+    return json({ id, status: leaveType.requiresApproval ? "pending" : "approved", days }, { status: 201 });
+  }
+
+  const leaveAction = path.match(/^\/api\/leave\/([^/]+)$/);
+  if (leaveAction && request.method === "PATCH") {
+    const body = await request.json<{ status?: string; reason?: string }>();
+    const item = await env.DB.prepare(`SELECT l.id, l.status, l.employee_id as employeeId, l.approver_id as approverId, e.user_id as employeeUserId, e.first_name || ' ' || e.last_name as employeeName, lt.name as leaveType, l.start_date as startDate, l.end_date as endDate FROM leave_requests l JOIN employees e ON e.id = l.employee_id AND e.organization_id = l.organization_id JOIN leave_types lt ON lt.id = l.leave_type_id AND lt.organization_id = l.organization_id WHERE l.id = ? AND l.organization_id = ?`).bind(leaveAction[1], context.organizationId).first<{ id: string; status: string; employeeId: string; approverId: string | null; employeeUserId: string | null; employeeName: string; leaveType: string; startDate: string; endDate: string }>();
+    if (!item) return error("Leave request not found.", 404);
+    if (body.status === "cancelled") {
+      if (item.employeeUserId !== context.userId || item.status !== "pending") return error("Only the requester can cancel a pending leave request.", 403);
+      await env.DB.prepare(`UPDATE leave_requests SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'pending'`).bind(item.id, context.organizationId).run();
+      await audit(env, context, "cancelled", "leave_requests", item.id);
+      return json({ ok: true, status: "cancelled" });
+    }
+    if (!['approved','rejected'].includes(body.status || "") || (body.status === "rejected" && !body.reason?.trim())) return error("Choose approve or reject; a rejection must include a reason.");
+    const canManageLeave = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve");
+    const directManager = await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND user_id = ? AND deleted_at IS NULL`).bind(item.employeeId, context.organizationId, context.userId).first();
+    const reportsToUser = item.approverId === context.userId;
+    if (directManager || (!canManageLeave && !reportsToUser)) return error("You are not authorized to approve this leave request.", 403);
+    if (item.status !== "pending") return error("This leave request is no longer pending.", 409);
+    const decision = body.status as "approved" | "rejected";
+    const changed = await env.DB.prepare(`UPDATE leave_requests SET status = ?, approver_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'pending'`).bind(decision, context.userId, item.id, context.organizationId).run();
+    if (!changed.meta.changes) return error("This request was already updated. Refresh and try again.", 409);
+    await audit(env, context, decision, "leave_requests", item.id, { reason: body.reason?.trim() || null });
+    if (item.employeeUserId) {
+      const message = `Your ${item.leaveType} request for ${item.startDate} to ${item.endDate} was ${decision}${decision === "rejected" ? `: ${body.reason!.trim()}` : ""}.`;
+      await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'leave_decision', ?, ?)`).bind(requestId(), context.organizationId, item.employeeUserId, `Leave request ${decision}`, message).run();
+      const requester = await env.DB.prepare(`SELECT email, full_name as fullName FROM users WHERE id = ?`).bind(item.employeeUserId).first<{ email: string; fullName: string }>();
+      const organization = await env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`).bind(context.organizationId).first<{ name: string }>();
+      if (requester && organization) await sendApprovalNotificationEmail(env, requester.email, requester.fullName, organization.name, `Leave request ${decision}`, message);
+    }
+    return json({ ok: true, status: decision });
+  }
+
+  if (request.method === "GET" && path === "/api/projects") {
+    const result = await env.DB.prepare(`SELECT p.id, p.name, COALESCE(p.description,'') as description, p.status, p.progress, p.start_date as startDate, p.end_date as endDate, p.budget, u.full_name as owner, COUNT(t.id) as taskCount FROM projects p LEFT JOIN users u ON u.id = p.owner_id LEFT JOIN tasks t ON t.project_id = p.id AND t.organization_id = p.organization_id WHERE p.organization_id = ? GROUP BY p.id ORDER BY CASE p.status WHEN 'active' THEN 0 WHEN 'at_risk' THEN 1 WHEN 'planning' THEN 2 ELSE 3 END, p.name LIMIT 200`).bind(context.organizationId).all();
     return json({ data: result.results || [] });
+  }
+
+  if (request.method === "POST" && path === "/api/projects") {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to create a project.", 403);
+    const body = await request.json<{ name?: string; description?: string; status?: string; startDate?: string; endDate?: string; budget?: number }>();
+    if (!body.name?.trim() || body.name.trim().length > 160 || (body.startDate && !isoDate(body.startDate)) || (body.endDate && !isoDate(body.endDate)) || (body.startDate && body.endDate && body.endDate < body.startDate) || (body.budget !== undefined && (!Number.isFinite(Number(body.budget)) || Number(body.budget) < 0))) return error("Enter a project name and valid dates/budget.");
+    const status = body.status || "planning";
+    if (!['planning','active','at_risk','completed','archived'].includes(status)) return error("Choose a valid project status.");
+    const id = `project-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO projects (id, organization_id, name, description, owner_id, status, start_date, end_date, budget) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.name.trim(), body.description?.trim() || null, context.userId, status, body.startDate || null, body.endDate || null, body.budget === undefined ? null : Number(body.budget)).run();
+    await audit(env, context, "created", "projects", id, { name: body.name.trim(), status });
+    return json({ id }, { status: 201 });
+  }
+
+  const projectMatch = path.match(/^\/api\/projects\/([^/]+)$/);
+  if (projectMatch && request.method === "PATCH") {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to update projects.", 403);
+    const body = await request.json<{ name?: string; description?: string; status?: string; progress?: number; startDate?: string | null; endDate?: string | null; budget?: number | null }>();
+    if (body.status !== undefined && !['planning','active','at_risk','completed','archived'].includes(body.status)) return error("Choose a valid project status.");
+    if (body.progress !== undefined && (!Number.isInteger(Number(body.progress)) || Number(body.progress) < 0 || Number(body.progress) > 100)) return error("Progress must be a whole number from 0 to 100.");
+    if (body.startDate && !isoDate(body.startDate) || body.endDate && !isoDate(body.endDate)) return error("Enter valid project dates.");
+    const changed = await env.DB.prepare(`UPDATE projects SET name = COALESCE(?, name), description = COALESCE(?, description), status = COALESCE(?, status), progress = COALESCE(?, progress), start_date = COALESCE(?, start_date), end_date = COALESCE(?, end_date), budget = COALESCE(?, budget), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.name?.trim() || null, body.description === undefined ? null : body.description.trim(), body.status || null, body.progress ?? null, body.startDate || null, body.endDate || null, body.budget ?? null, projectMatch[1], context.organizationId).run();
+    if (!changed.meta.changes) return error("Project not found.", 404);
+    await audit(env, context, "updated", "projects", projectMatch[1], body);
+    return json({ ok: true });
+  }
+
+  if (request.method === "GET" && path === "/api/tasks") {
+    const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
+    const canManageTasks = hasPermission(context, "operations.manage");
+    const result = await env.DB.prepare(`SELECT t.id, t.project_id as projectId, t.title, COALESCE(t.description,'') as description, t.priority, t.status, t.due_date as dueDate, t.assignee_id as assigneeId, e.first_name || ' ' || e.last_name as assignee, p.name as project, t.creator_id as creatorId FROM tasks t LEFT JOIN employees e ON e.id = t.assignee_id AND e.organization_id = t.organization_id LEFT JOIN projects p ON p.id = t.project_id AND p.organization_id = t.organization_id WHERE t.organization_id = ? AND (? = 1 OR t.assignee_id = ? OR t.creator_id = ?) ORDER BY CASE t.priority WHEN 'urgent' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END, t.due_date LIMIT 300`).bind(context.organizationId, canManageTasks ? 1 : 0, employee?.id || "", context.userId).all();
+    return json({ data: result.results || [] });
+  }
+
+  if (request.method === "POST" && path === "/api/tasks") {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to create tasks.", 403);
+    const body = await request.json<{ title?: string; description?: string; projectId?: string; assigneeId?: string; priority?: string; dueDate?: string }>();
+    if (!body.title?.trim() || body.title.trim().length > 180 || (body.dueDate && !isoDate(body.dueDate))) return error("Enter a task title and valid due date.");
+    const priority = body.priority || "medium";
+    if (!['low','medium','high','urgent'].includes(priority)) return error("Choose a valid task priority.");
+    if (body.projectId && !await env.DB.prepare(`SELECT id FROM projects WHERE id = ? AND organization_id = ? AND status != 'archived'`).bind(body.projectId, context.organizationId).first()) return error("Choose a project in this organization.", 404);
+    if (body.assigneeId && !await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND status = 'active' AND deleted_at IS NULL`).bind(body.assigneeId, context.organizationId).first()) return error("Choose an active employee in this organization.", 404);
+    const id = `task-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO tasks (id, organization_id, project_id, title, description, assignee_id, creator_id, priority, due_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.projectId || null, body.title.trim(), body.description?.trim() || null, body.assigneeId || null, context.userId, priority, body.dueDate || null).run();
+    await audit(env, context, "created", "tasks", id, { title: body.title.trim(), assigneeId: body.assigneeId || null, projectId: body.projectId || null });
+    if (body.assigneeId) {
+      const assignee = await env.DB.prepare(`SELECT user_id as userId FROM employees WHERE id = ? AND organization_id = ?`).bind(body.assigneeId, context.organizationId).first<{ userId: string | null }>();
+      if (assignee?.userId) await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'task_assigned', ?, ?)`).bind(requestId(), context.organizationId, assignee.userId, "Task assigned", `You were assigned “${body.title.trim()}”${body.dueDate ? `, due ${body.dueDate}` : ""}.`).run();
+    }
+    return json({ id }, { status: 201 });
+  }
+
+  const taskMatch = path.match(/^\/api\/tasks\/([^/]+)$/);
+  if (taskMatch && request.method === "PATCH") {
+    const body = await request.json<{ title?: string; description?: string; projectId?: string | null; assigneeId?: string | null; priority?: string; status?: string; dueDate?: string | null }>();
+    const task = await env.DB.prepare(`SELECT t.id, t.assignee_id as assigneeId, t.creator_id as creatorId, e.user_id as assigneeUserId FROM tasks t LEFT JOIN employees e ON e.id = t.assignee_id AND e.organization_id = t.organization_id WHERE t.id = ? AND t.organization_id = ?`).bind(taskMatch[1], context.organizationId).first<{ id: string; assigneeId: string | null; creatorId: string | null; assigneeUserId: string | null }>();
+    if (!task) return error("Task not found.", 404);
+    const canManageTasks = hasPermission(context, "operations.manage");
+    const isAssignee = task.assigneeUserId === context.userId;
+    if (!canManageTasks && !isAssignee) return error("Only the task assignee or an operations manager can update this task.", 403);
+    if (!canManageTasks && (body.title !== undefined || body.description !== undefined || body.assigneeId !== undefined || body.projectId !== undefined || body.priority !== undefined || body.dueDate !== undefined)) return error("Only an operations manager can change task details.", 403);
+    if (body.status !== undefined && !['todo','in_progress','review','completed'].includes(body.status)) return error("Choose a valid task status.");
+    if (body.priority !== undefined && !['low','medium','high','urgent'].includes(body.priority)) return error("Choose a valid task priority.");
+    if (body.dueDate && !isoDate(body.dueDate)) return error("Enter a valid due date.");
+    if (body.projectId && !await env.DB.prepare(`SELECT id FROM projects WHERE id = ? AND organization_id = ?`).bind(body.projectId, context.organizationId).first()) return error("Project not found.", 404);
+    if (body.assigneeId && !await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND status = 'active' AND deleted_at IS NULL`).bind(body.assigneeId, context.organizationId).first()) return error("Assignee not found.", 404);
+    const changed = await env.DB.prepare(`UPDATE tasks SET title = COALESCE(?, title), description = COALESCE(?, description), project_id = CASE WHEN ? = 1 THEN ? ELSE project_id END, assignee_id = CASE WHEN ? = 1 THEN ? ELSE assignee_id END, priority = COALESCE(?, priority), status = COALESCE(?, status), due_date = CASE WHEN ? = 1 THEN ? ELSE due_date END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.title?.trim() || null, body.description === undefined ? null : body.description.trim(), body.projectId !== undefined ? 1 : 0, body.projectId || null, body.assigneeId !== undefined ? 1 : 0, body.assigneeId || null, body.priority || null, body.status || null, body.dueDate !== undefined ? 1 : 0, body.dueDate || null, task.id, context.organizationId).run();
+    if (!changed.meta.changes) return error("No task changes were saved.", 409);
+    await audit(env, context, body.status ? `status_${body.status}` : "updated", "tasks", task.id, body);
+    if (body.assigneeId && body.assigneeId !== task.assigneeId) {
+      const assignee = await env.DB.prepare(`SELECT user_id as userId FROM employees WHERE id = ? AND organization_id = ?`).bind(body.assigneeId, context.organizationId).first<{ userId: string | null }>();
+      if (assignee?.userId) await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'task_assigned', ?, ?)`).bind(requestId(), context.organizationId, assignee.userId, "Task assigned", `You were assigned “${body.title?.trim() || "a task"}”.`).run();
+    }
+    return json({ ok: true });
+  }
+
+  if (path === "/api/calendar/feed" && request.method === "GET") {
+    const active = await env.DB.prepare(`SELECT id, created_at as createdAt FROM calendar_feed_tokens WHERE organization_id = ? AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1`).bind(context.organizationId).first<{ id: string; createdAt: string }>();
+    return json({ enabled: Boolean(active), createdAt: active?.createdAt || null });
+  }
+
+  if (path === "/api/calendar/feed" && request.method === "POST") {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to manage calendar subscriptions.", 403);
+    const token = randomToken(32); const id = `calendar-feed-${crypto.randomUUID()}`;
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE calendar_feed_tokens SET revoked_at = CURRENT_TIMESTAMP WHERE organization_id = ? AND revoked_at IS NULL`).bind(context.organizationId),
+      env.DB.prepare(`INSERT INTO calendar_feed_tokens (id, organization_id, token_hash, created_by) VALUES (?, ?, ?, ?)`).bind(id, context.organizationId, await hashToken(token), context.userId),
+    ]);
+    await audit(env, context, "created", "calendar_feed", id, { access: "read-only subscription" });
+    return json({ enabled: true, url: `${new URL(request.url).origin}/calendar/feed/${token}` }, { status: 201 });
+  }
+
+  if (path === "/api/calendar/feed" && request.method === "DELETE") {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to manage calendar subscriptions.", 403);
+    await env.DB.prepare(`UPDATE calendar_feed_tokens SET revoked_at = CURRENT_TIMESTAMP WHERE organization_id = ? AND revoked_at IS NULL`).bind(context.organizationId).run();
+    await audit(env, context, "revoked", "calendar_feed", context.organizationId, {});
+    return json({ enabled: false });
+  }
+
+  if (request.method === "GET" && path === "/api/calendar") {
+    const result = await env.DB.prepare(`SELECT id, title, event_type as eventType, start_at as startAt, end_at as endAt, location, owner_id as ownerId FROM calendar_events WHERE organization_id = ? ORDER BY start_at LIMIT 300`).bind(context.organizationId).all();
+    return json({ data: result.results || [] });
+  }
+
+  if (request.method === "POST" && path === "/api/calendar") {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to add calendar events.", 403);
+    const body = await request.json<{ title?: string; eventType?: string; startAt?: string; endAt?: string; location?: string }>();
+    const start = body.startAt ? new Date(body.startAt) : null; const end = body.endAt ? new Date(body.endAt) : null;
+    if (!body.title?.trim() || body.title.trim().length > 160 || !start || Number.isNaN(start.getTime()) || !end || Number.isNaN(end.getTime()) || end <= start) return error("Enter a title and valid start/end times; the end must be after the start.");
+    const eventType = body.eventType || "Meeting";
+    if (!['Meeting','Deadline','Training','Company','Leave','Other'].includes(eventType)) return error("Choose a valid calendar event type.");
+    const id = `event-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO calendar_events (id, organization_id, title, event_type, start_at, end_at, location, owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.title.trim(), eventType, start.toISOString(), end.toISOString(), body.location?.trim() || null, context.userId).run();
+    await audit(env, context, "created", "calendar_events", id, { title: body.title.trim(), eventType, startAt: start.toISOString(), endAt: end.toISOString() });
+    return json({ id }, { status: 201 });
+  }
+
+  const calendarMatch = path.match(/^\/api\/calendar\/([^/]+)$/);
+  if (calendarMatch && request.method === "PATCH") {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to update calendar events.", 403);
+    const body = await request.json<{ title?: string; eventType?: string; startAt?: string; endAt?: string; location?: string }>();
+    const current = await env.DB.prepare(`SELECT id, start_at as startAt, end_at as endAt FROM calendar_events WHERE id = ? AND organization_id = ?`).bind(calendarMatch[1], context.organizationId).first<{ id: string; startAt: string; endAt: string }>();
+    if (!current) return error("Calendar event not found.", 404);
+    if (body.startAt && Number.isNaN(new Date(body.startAt).getTime()) || body.endAt && Number.isNaN(new Date(body.endAt).getTime())) return error("Enter valid event dates and times.");
+    const startAt = body.startAt ? new Date(body.startAt).toISOString() : current.startAt; const endAt = body.endAt ? new Date(body.endAt).toISOString() : current.endAt;
+    if (new Date(endAt) <= new Date(startAt)) return error("The event end must be after its start.");
+    if (body.eventType && !['Meeting','Deadline','Training','Company','Leave','Other'].includes(body.eventType)) return error("Choose a valid calendar event type.");
+    await env.DB.prepare(`UPDATE calendar_events SET title = COALESCE(?, title), event_type = COALESCE(?, event_type), start_at = ?, end_at = ?, location = COALESCE(?, location) WHERE id = ? AND organization_id = ?`).bind(body.title?.trim() || null, body.eventType || null, startAt, endAt, body.location?.trim() || null, current.id, context.organizationId).run();
+    await audit(env, context, "updated", "calendar_events", current.id, body);
+    return json({ ok: true });
   }
 
   if (request.method === "GET" && path === "/api/expenses") {
@@ -1828,7 +2098,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "POST" && path === "/api/requests") {
     if (!hasPermission(context, "employees.view")) return error("Only organization members can submit requests.", 403);
-    const body = await request.json<{ requestType?: string; title?: string; details?: string; amount?: number | string; approverRole?: string }>();
+    const body = await request.json<{ requestType?: string; title?: string; details?: string; amount?: number | string }>();
     const requestType = body.requestType?.trim() || "Other";
     const title = body.title?.trim();
     const details = body.details?.trim();
@@ -1837,8 +2107,10 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const financialTypes = ["expense", "purchase", "budget", "payroll", "reimbursement", "payment", "financial", "asset purchase"];
     const financial = amount !== null || financialTypes.includes(requestType.toLowerCase());
     if (financial && amount === null) return error("Financial requests must include an amount.");
-    const requiredRole = financial ? "CEO" : body.approverRole?.trim() || "Manager";
-    if (!financial && !["Manager", "HR Admin", "CEO"].includes(requiredRole)) return error("Choose a supported approval role.");
+    const workflowRow = await env.DB.prepare(`SELECT approval_workflows_json as workflowsJson FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ workflowsJson: string }>();
+    let workflowSettings: Record<string, string> = {};
+    try { workflowSettings = JSON.parse(workflowRow?.workflowsJson || "{}"); } catch { /* use defaults */ }
+    const requiredRole = financial ? "CEO" : workflowSettings[requestType] || (requestType === "HR" || requestType === "Leave" ? "HR Admin" : "Manager");
     const id = `request-${crypto.randomUUID()}`;
     await env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, ?, ?, ?, ?, 'NGN', ?, 'pending', 1, ?)`)
       .bind(id, context.organizationId, requestType, title, context.userId, amount, requiredRole, JSON.stringify({ details, approvalPolicy: [requiredRole] })).run();
@@ -1882,8 +2154,38 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "GET" && path === "/api/assets") {
-    const result = await env.DB.prepare(`SELECT a.id, a.asset_tag as assetTag, a.name, a.category, COALESCE(a.serial_number, '') as serialNumber, a.status, e.first_name || ' ' || e.last_name as assignee, a.location, a.current_value as value FROM assets a LEFT JOIN employees e ON e.id = a.assigned_employee_id WHERE a.organization_id = ? ORDER BY a.created_at DESC`).bind(context.organizationId).all();
+    const result = await env.DB.prepare(`SELECT a.id, a.asset_tag as assetTag, a.name, a.category, COALESCE(a.serial_number, '') as serialNumber, a.status, a.assigned_employee_id as assignedEmployeeId, e.first_name || ' ' || e.last_name as assignee, a.location, a.current_value as value FROM assets a LEFT JOIN employees e ON e.id = a.assigned_employee_id WHERE a.organization_id = ? ORDER BY a.created_at DESC`).bind(context.organizationId).all();
     return json({ data: result.results || [] });
+  }
+
+  if (request.method === "GET" && path === "/api/budgets") {
+    const result = await env.DB.prepare(`SELECT id, name, category, period, allocated, spent, status FROM budgets WHERE organization_id = ? ORDER BY created_at DESC`).bind(context.organizationId).all();
+    return json({ data: result.results || [] });
+  }
+
+  if (request.method === "POST" && path === "/api/budgets") {
+    const body = await request.json<{ name?: string; category?: string; period?: string; allocated?: number; spent?: number }>();
+    const allocated = Number(body.allocated); const spent = Number(body.spent || 0);
+    if (!body.name?.trim() || !body.category?.trim() || !body.period?.trim() || !Number.isFinite(allocated) || allocated <= 0 || !Number.isFinite(spent) || spent < 0 || spent > allocated) return error("Enter a name, category, period, and valid allocation/spend amounts.");
+    const id = `budget-${crypto.randomUUID()}`; const status = spent / allocated >= 0.8 ? "watch" : "on_track";
+    await env.DB.prepare(`INSERT INTO budgets (id, organization_id, name, category, period, allocated, spent, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(id, context.organizationId, body.name.trim(), body.category.trim(), body.period.trim(), allocated, spent, status).run();
+    await audit(env, context, "created", "budgets", id, { name: body.name.trim(), allocated, spent, status });
+    return json({ id }, { status: 201 });
+  }
+
+  const budgetMatch = path.match(/^\/api\/budgets\/([^/]+)$/);
+  if (request.method === "PATCH" && budgetMatch) {
+    const body = await request.json<{ name?: string; category?: string; period?: string; allocated?: number; spent?: number }>();
+    const current = await env.DB.prepare(`SELECT id, name, category, period, allocated, spent FROM budgets WHERE id = ? AND organization_id = ?`).bind(budgetMatch[1], context.organizationId).first<{ id: string; name: string; category: string; period: string; allocated: number; spent: number }>();
+    if (!current) return error("Budget not found.", 404);
+    const allocated = body.allocated === undefined ? current.allocated : Number(body.allocated); const spent = body.spent === undefined ? current.spent : Number(body.spent);
+    if (!Number.isFinite(allocated) || allocated <= 0 || !Number.isFinite(spent) || spent < 0 || spent > allocated) return error("Spent amount must be between zero and the allocated amount.");
+    const name = body.name?.trim() || current.name; const category = body.category?.trim() || current.category; const period = body.period?.trim() || current.period;
+    const status = spent / allocated >= 0.8 ? "watch" : "on_track";
+    await env.DB.prepare(`UPDATE budgets SET name = ?, category = ?, period = ?, allocated = ?, spent = ?, status = ? WHERE id = ? AND organization_id = ?`).bind(name, category, period, allocated, spent, status, current.id, context.organizationId).run();
+    await audit(env, context, "updated", "budgets", current.id, { name, category, period, allocated, spent, status });
+    return json({ ok: true });
   }
 
   if (request.method === "POST" && path === "/api/assets") {
@@ -1892,8 +2194,38 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const id = `asset-${crypto.randomUUID().slice(0, 8)}`;
     const tag = `AST-${Math.floor(1000 + Math.random() * 8999)}`;
     await env.DB.prepare(`INSERT INTO assets (id, organization_id, asset_tag, name, category, serial_number, location, purchase_price, current_value) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, tag, body.name, body.category, body.serialNumber || null, body.location || null, Number(body.value || 0), Number(body.value || 0)).run();
+    await env.DB.prepare(`INSERT INTO asset_history (id, organization_id, asset_id, action, employee_id, notes) VALUES (?, ?, ?, 'created', NULL, ?)`).bind(`asset-history-${crypto.randomUUID()}`, context.organizationId, id, "Asset added to the register.").run();
     await audit(env, context, "created", "assets", id, body);
     return json({ id, assetTag: tag }, { status: 201 });
+  }
+
+  const assetHistoryMatch = path.match(/^\/api\/assets\/([^/]+)\/history$/);
+  if (request.method === "GET" && assetHistoryMatch) {
+    const result = await env.DB.prepare(`SELECT h.id, h.action, h.notes, h.created_at as createdAt, e.first_name || ' ' || e.last_name as employee FROM asset_history h LEFT JOIN employees e ON e.id = h.employee_id AND e.organization_id = h.organization_id WHERE h.asset_id = ? AND h.organization_id = ? ORDER BY h.created_at DESC LIMIT 100`).bind(assetHistoryMatch[1], context.organizationId).all();
+    return json({ data: result.results || [] });
+  }
+
+  const assetMatch = path.match(/^\/api\/assets\/([^/]+)$/);
+  if (request.method === "PATCH" && assetMatch) {
+    const body = await request.json<{ name?: string; category?: string; serialNumber?: string | null; location?: string | null; value?: number; status?: string; assignedEmployeeId?: string | null; notes?: string }>();
+    const asset = await env.DB.prepare(`SELECT id, name, status, assigned_employee_id as assignedEmployeeId FROM assets WHERE id = ? AND organization_id = ?`).bind(assetMatch[1], context.organizationId).first<{ id: string; name: string; status: string; assignedEmployeeId: string | null }>();
+    if (!asset) return error("Asset not found.", 404);
+    if (body.status !== undefined && !["available", "assigned", "maintenance", "retired"].includes(body.status)) return error("Choose a valid asset status.");
+    const value = body.value === undefined ? null : Number(body.value);
+    if (value !== null && (!Number.isFinite(value) || value < 0)) return error("Asset value must be zero or greater.");
+    if (body.assignedEmployeeId && !await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND status = 'active' AND deleted_at IS NULL`).bind(body.assignedEmployeeId, context.organizationId).first()) return error("Choose an active employee in this organization.", 404);
+    const status = body.assignedEmployeeId ? "assigned" : body.status || (body.assignedEmployeeId === null ? "available" : asset.status);
+    await env.DB.prepare(`UPDATE assets SET name = COALESCE(?, name), category = COALESCE(?, category), serial_number = CASE WHEN ? = 1 THEN ? ELSE serial_number END, location = CASE WHEN ? = 1 THEN ? ELSE location END, current_value = COALESCE(?, current_value), status = ?, assigned_employee_id = CASE WHEN ? = 1 THEN ? ELSE assigned_employee_id END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`)
+      .bind(body.name?.trim() || null, body.category?.trim() || null, body.serialNumber !== undefined ? 1 : 0, body.serialNumber || null, body.location !== undefined ? 1 : 0, body.location || null, value, status, body.assignedEmployeeId !== undefined ? 1 : 0, body.assignedEmployeeId || null, asset.id, context.organizationId).run();
+    const changedAssignment = body.assignedEmployeeId !== undefined && body.assignedEmployeeId !== asset.assignedEmployeeId;
+    const changedStatus = body.status !== undefined && body.status !== asset.status;
+    if (changedAssignment || changedStatus || body.notes?.trim()) {
+      const action = changedAssignment ? (body.assignedEmployeeId ? "assigned" : "unassigned") : changedStatus ? `status_${status}` : "updated";
+      await env.DB.prepare(`INSERT INTO asset_history (id, organization_id, asset_id, action, employee_id, notes) VALUES (?, ?, ?, ?, ?, ?)`)
+        .bind(`asset-history-${crypto.randomUUID()}`, context.organizationId, asset.id, action, body.assignedEmployeeId || null, body.notes?.trim() || null).run();
+    }
+    await audit(env, context, "updated", "assets", asset.id, body);
+    return json({ ok: true, status });
   }
 
   if (request.method === "GET" && path === "/api/vendors") {
@@ -1910,8 +2242,23 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ id }, { status: 201 });
   }
 
+  const vendorMatch = path.match(/^\/api\/vendors\/([^/]+)$/);
+  if (request.method === "PATCH" && vendorMatch) {
+    const body = await request.json<{ name?: string; category?: string; contactName?: string | null; email?: string | null; status?: string; contractEnd?: string | null; spend?: number }>();
+    const current = await env.DB.prepare(`SELECT id, name, category, contact_name as contactName, email, status, contract_end as contractEnd, spend FROM vendors WHERE id = ? AND organization_id = ?`).bind(vendorMatch[1], context.organizationId).first<{ id: string; name: string; category: string; contactName: string | null; email: string | null; status: string; contractEnd: string | null; spend: number }>();
+    if (!current) return error("Vendor not found.", 404);
+    if (body.status !== undefined && !["active", "review", "expired"].includes(body.status)) return error("Choose a valid vendor status.");
+    if (body.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) return error("Enter a valid vendor email address.");
+    if (body.contractEnd && !isoDate(body.contractEnd)) return error("Enter a valid contract end date.");
+    const spend = body.spend === undefined ? current.spend : Number(body.spend);
+    if (!Number.isFinite(spend) || spend < 0) return error("Vendor spend must be a non-negative amount.");
+    await env.DB.prepare(`UPDATE vendors SET name = ?, category = ?, contact_name = ?, email = ?, status = ?, contract_end = ?, spend = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.name?.trim() || current.name, body.category?.trim() || current.category, body.contactName === undefined ? current.contactName : body.contactName?.trim() || null, body.email === undefined ? current.email : body.email?.trim() || null, body.status || current.status, body.contractEnd === undefined ? current.contractEnd : body.contractEnd || null, spend, current.id, context.organizationId).run();
+    await audit(env, context, "updated", "vendors", current.id, body);
+    return json({ ok: true });
+  }
+
   if (request.method === "GET" && path === "/api/tickets") {
-    const result = await env.DB.prepare(`SELECT t.id, t.ticket_number as ticketNumber, t.subject, t.category, t.priority, t.status, requester.full_name as requester, assignee.full_name as assignee, t.created_at as createdAt FROM support_tickets t JOIN users requester ON requester.id = t.requester_id LEFT JOIN users assignee ON assignee.id = t.assignee_id WHERE t.organization_id = ? ORDER BY t.created_at DESC`).bind(context.organizationId).all();
+    const result = await env.DB.prepare(`SELECT t.id, t.ticket_number as ticketNumber, t.subject, t.category, t.priority, t.status, t.description, t.assignee_id as assigneeId, requester.full_name as requester, assignee.full_name as assignee, t.created_at as createdAt FROM support_tickets t JOIN users requester ON requester.id = t.requester_id LEFT JOIN users assignee ON assignee.id = t.assignee_id WHERE t.organization_id = ? ORDER BY t.created_at DESC`).bind(context.organizationId).all();
     return json({ data: result.results || [] });
   }
 
@@ -1923,6 +2270,21 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     await env.DB.prepare(`INSERT INTO support_tickets (id, organization_id, ticket_number, subject, category, priority, requester_id, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, ticketNumber, body.subject, body.category, body.priority || "medium", context.userId, body.description || null).run();
     await audit(env, context, "created", "helpdesk", id, body);
     return json({ id, ticketNumber }, { status: 201 });
+  }
+
+  const ticketMatch = path.match(/^\/api\/tickets\/([^/]+)$/);
+  if (request.method === "PATCH" && ticketMatch) {
+    const body = await request.json<{ status?: string; assigneeId?: string | null; priority?: string; notes?: string }>();
+    const ticket = await env.DB.prepare(`SELECT id, status, assignee_id as assigneeId FROM support_tickets WHERE id = ? AND organization_id = ?`).bind(ticketMatch[1], context.organizationId).first<{ id: string; status: string; assigneeId: string | null }>();
+    if (!ticket) return error("Support ticket not found.", 404);
+    if (body.status !== undefined && !["open", "assigned", "in_progress", "resolved", "closed"].includes(body.status)) return error("Choose a valid support ticket status.");
+    if (body.priority !== undefined && !["low", "medium", "high", "urgent"].includes(body.priority)) return error("Choose a valid priority.");
+    if (body.assigneeId && !await env.DB.prepare(`SELECT id FROM users WHERE id = ? AND status = 'active' AND EXISTS (SELECT 1 FROM memberships WHERE user_id = users.id AND organization_id = ? AND status = 'active')`).bind(body.assigneeId, context.organizationId).first()) return error("Choose an active member of this organization.", 404);
+    const status = body.status || (body.assigneeId && ticket.status === "open" ? "assigned" : ticket.status);
+    await env.DB.prepare(`UPDATE support_tickets SET status = ?, assignee_id = CASE WHEN ? = 1 THEN ? ELSE assignee_id END, priority = COALESCE(?, priority), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(status, body.assigneeId !== undefined ? 1 : 0, body.assigneeId || null, body.priority || null, ticket.id, context.organizationId).run();
+    if (body.assigneeId !== undefined && body.assigneeId !== ticket.assigneeId && body.assigneeId) await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'ticket_assigned', 'Support ticket assigned', ?)`).bind(requestId(), context.organizationId, body.assigneeId, `A support ticket was assigned to you. Status: ${status}.`).run();
+    await audit(env, context, "updated", "helpdesk", ticket.id, { ...body, status });
+    return json({ ok: true, status });
   }
 
   if (request.method === "GET" && path === "/api/calendar") {
@@ -1947,6 +2309,16 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET" && path === "/api/files") {
     const result = await env.DB.prepare(`SELECT id, name, category, content_type as contentType, size_bytes as sizeBytes, expires_at as expiresAt, created_at as createdAt FROM documents WHERE organization_id = ? ORDER BY created_at DESC LIMIT 100`).bind(context.organizationId).all();
     return json({ data: result.results || [] });
+  }
+
+  const fileMatch = path.match(/^\/api\/files\/([^/]+)$/);
+  if (request.method === "GET" && fileMatch) {
+    const doc = await env.DB.prepare(`SELECT name, r2_key as r2Key, content_type as contentType FROM documents WHERE id = ? AND organization_id = ?`).bind(fileMatch[1], context.organizationId).first<{ name: string; r2Key: string; contentType: string }>();
+    if (!doc) return error("Document not found.", 404);
+    const object = await env.FILES.get(doc.r2Key);
+    if (!object) return error("Document contents are unavailable.", 404);
+    const safeName = doc.name.replace(/[\r\n"\\]/g, "_");
+    return new Response(object.body, { headers: { "content-type": doc.contentType || "application/octet-stream", "content-disposition": `attachment; filename="${safeName}"`, "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
   }
 
   if (request.method === "POST" && path === "/api/files") {
@@ -1986,6 +2358,8 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const url = new URL(request.url);
+      const calendarFeedMatch = url.pathname.match(/^\/calendar\/feed\/([a-f0-9]{64})$/i);
+      if (request.method === "GET" && calendarFeedMatch) return withSecurityHeaders(await publicCalendarFeed(calendarFeedMatch[1], env));
       if (url.pathname.startsWith("/api/")) return withSecurityHeaders(await handleApi(request, env));
       return env.ASSETS.fetch(request);
     } catch (cause) {
