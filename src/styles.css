@@ -124,6 +124,8 @@ body { background: #f5f8f9; color: #10212b; }.main-content { background: #f5f8f9
 .payslip-print-actions { display: flex; align-items: center; gap: 8px; }
 .work-error { margin: 12px 0; padding: 11px 14px; border: 1px solid #f2c9c9; border-radius: 8px; background: #fff5f5; color: #a93636; font-size: 12px; }
 .work-loading,.work-empty { padding: 24px; color: #8491a4; text-align: center; font-size: 12px; }
+.feed-link-panel { display: grid; gap: 8px; margin: 12px; padding: 13px; border: 1px solid var(--line); border-radius: 9px; background: #f8fafc; font-size: 11px; }.feed-link-panel input { min-width: 0; padding: 9px; border: 1px solid var(--line); border-radius: 6px; color: #34445e; background: white; font-size: 10px; }.feed-link-panel small { color: #77859a; line-height: 1.5; }.asset-history-list { display: grid; gap: 8px; max-height: 210px; overflow: auto; padding: 4px 0 12px; }.asset-history-list > div { display: grid; gap: 4px; padding: 9px 10px; border-left: 2px solid #d8e5ee; background: #f8fafc; }.asset-history-list strong { color: #34445e; font-size: 11px; }.asset-history-list span,.asset-history-list small { color: #77859a; font-size: 10px; }
+.report-departments { display: grid; grid-template-columns: repeat(auto-fit,minmax(160px,1fr)); gap: 9px; margin: 12px 0; }.report-departments > div { display: flex; justify-content: space-between; gap: 10px; padding: 11px; border: 1px solid var(--line); border-radius: 7px; color: #67768c; font-size: 11px; }.report-departments strong { color: #22354b; }.report-note { margin: 12px 0 0; color: #77859a; font-size: 10px; line-height: 1.5; }
 @media print {
   body * { visibility: hidden !important; }
   .employee-payslip-print, .employee-payslip-print * { visibility: visible !important; }

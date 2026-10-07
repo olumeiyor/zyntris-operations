@@ -1446,17 +1446,18 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET" && path === "/api/reports/summary") {
     const sixMonthsAgo = new Date(); sixMonthsAgo.setUTCDate(1); sixMonthsAgo.setUTCMonth(sixMonthsAgo.getUTCMonth() - 5);
     const fromDate = sixMonthsAgo.toISOString().slice(0, 10);
-    const [people, expenses, leave, tasks, tickets, approvals, departments, monthlySpend] = await Promise.all([
+    const [people, expenses, leave, tasks, tickets, approvals, appraisals, departments, monthlySpend] = await Promise.all([
       env.DB.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active FROM employees WHERE organization_id = ? AND deleted_at IS NULL`).bind(context.organizationId).first(),
       env.DB.prepare(`SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total, COALESCE(SUM(CASE WHEN status = 'submitted' THEN amount ELSE 0 END), 0) as pending FROM expenses WHERE organization_id = ? AND expense_date >= ?`).bind(context.organizationId, fromDate).first(),
       env.DB.prepare(`SELECT SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending, SUM(CASE WHEN status = 'approved' THEN 1 ELSE 0 END) as approved, SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected FROM leave_requests WHERE organization_id = ?`).bind(context.organizationId).first(),
       env.DB.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed, SUM(CASE WHEN status != 'completed' AND due_date < date('now') THEN 1 ELSE 0 END) as overdue FROM tasks WHERE organization_id = ?`).bind(context.organizationId).first(),
       env.DB.prepare(`SELECT SUM(CASE WHEN status IN ('open','assigned','in_progress') THEN 1 ELSE 0 END) as open, SUM(CASE WHEN status IN ('resolved','closed') THEN 1 ELSE 0 END) as resolved FROM support_tickets WHERE organization_id = ?`).bind(context.organizationId).first(),
       env.DB.prepare(`SELECT SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending, SUM(CASE WHEN status IN ('approved','paid') THEN 1 ELSE 0 END) as approved, SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected FROM approval_requests WHERE organization_id = ?`).bind(context.organizationId).first(),
+      env.DB.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status = 'complete' THEN 1 ELSE 0 END) as completed, SUM(CASE WHEN status != 'complete' THEN 1 ELSE 0 END) as inProgress FROM appraisals WHERE organization_id = ?`).bind(context.organizationId).first(),
       env.DB.prepare(`SELECT d.name, COUNT(e.id) as count FROM departments d LEFT JOIN employees e ON e.department_id = d.id AND e.organization_id = d.organization_id AND e.deleted_at IS NULL WHERE d.organization_id = ? GROUP BY d.id ORDER BY count DESC`).bind(context.organizationId).all(),
       env.DB.prepare(`SELECT strftime('%Y-%m', expense_date) as month, COALESCE(SUM(amount), 0) as amount FROM expenses WHERE organization_id = ? AND expense_date >= ? GROUP BY strftime('%Y-%m', expense_date) ORDER BY month`).bind(context.organizationId, fromDate).all(),
     ]);
-    return json({ people: people || {}, expenses: expenses || {}, leave: leave || {}, tasks: tasks || {}, tickets: tickets || {}, approvals: approvals || {}, departments: departments.results || [], monthlySpend: monthlySpend.results || [] });
+    return json({ people: people || {}, expenses: expenses || {}, leave: leave || {}, tasks: tasks || {}, tickets: tickets || {}, approvals: approvals || {}, appraisals: appraisals || {}, departments: departments.results || [], monthlySpend: monthlySpend.results || [] });
   }
 
   if (request.method === "GET" && path === "/api/operations/members") {
@@ -2011,7 +2012,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       env.DB.prepare(`INSERT INTO calendar_feed_tokens (id, organization_id, token_hash, created_by) VALUES (?, ?, ?, ?)`).bind(id, context.organizationId, await hashToken(token), context.userId),
     ]);
     await audit(env, context, "created", "calendar_feed", id, { access: "read-only subscription" });
-    return json({ enabled: true, url: `${new URL(request.url).origin}/calendar/feed/${token}` }, { status: 201 });
+    return json({ enabled: true, url: `${new URL(request.url).origin}/calendar/feed/${token}.ics` }, { status: 201 });
   }
 
   if (path === "/api/calendar/feed" && request.method === "DELETE") {
@@ -2274,15 +2275,21 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   const ticketMatch = path.match(/^\/api\/tickets\/([^/]+)$/);
   if (request.method === "PATCH" && ticketMatch) {
-    const body = await request.json<{ status?: string; assigneeId?: string | null; priority?: string; notes?: string }>();
-    const ticket = await env.DB.prepare(`SELECT id, status, assignee_id as assigneeId FROM support_tickets WHERE id = ? AND organization_id = ?`).bind(ticketMatch[1], context.organizationId).first<{ id: string; status: string; assigneeId: string | null }>();
+    const body = await request.json<{ status?: string; assigneeId?: string | null; priority?: string; description?: string }>();
+    const ticket = await env.DB.prepare(`SELECT id, ticket_number as ticketNumber, subject, requester_id as requesterId, status, assignee_id as assigneeId FROM support_tickets WHERE id = ? AND organization_id = ?`).bind(ticketMatch[1], context.organizationId).first<{ id: string; ticketNumber: string; subject: string; requesterId: string; status: string; assigneeId: string | null }>();
     if (!ticket) return error("Support ticket not found.", 404);
     if (body.status !== undefined && !["open", "assigned", "in_progress", "resolved", "closed"].includes(body.status)) return error("Choose a valid support ticket status.");
     if (body.priority !== undefined && !["low", "medium", "high", "urgent"].includes(body.priority)) return error("Choose a valid priority.");
     if (body.assigneeId && !await env.DB.prepare(`SELECT id FROM users WHERE id = ? AND status = 'active' AND EXISTS (SELECT 1 FROM memberships WHERE user_id = users.id AND organization_id = ? AND status = 'active')`).bind(body.assigneeId, context.organizationId).first()) return error("Choose an active member of this organization.", 404);
     const status = body.status || (body.assigneeId && ticket.status === "open" ? "assigned" : ticket.status);
-    await env.DB.prepare(`UPDATE support_tickets SET status = ?, assignee_id = CASE WHEN ? = 1 THEN ? ELSE assignee_id END, priority = COALESCE(?, priority), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(status, body.assigneeId !== undefined ? 1 : 0, body.assigneeId || null, body.priority || null, ticket.id, context.organizationId).run();
+    await env.DB.prepare(`UPDATE support_tickets SET status = ?, assignee_id = CASE WHEN ? = 1 THEN ? ELSE assignee_id END, priority = COALESCE(?, priority), description = COALESCE(?, description), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(status, body.assigneeId !== undefined ? 1 : 0, body.assigneeId || null, body.priority || null, body.description?.trim() || null, ticket.id, context.organizationId).run();
     if (body.assigneeId !== undefined && body.assigneeId !== ticket.assigneeId && body.assigneeId) await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'ticket_assigned', 'Support ticket assigned', ?)`).bind(requestId(), context.organizationId, body.assigneeId, `A support ticket was assigned to you. Status: ${status}.`).run();
+    if (body.status && body.status !== ticket.status) {
+      const requester = await env.DB.prepare(`SELECT email, full_name as fullName FROM users WHERE id = ?`).bind(ticket.requesterId).first<{ email: string; fullName: string }>();
+      const orgName = await env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`).bind(context.organizationId).first<{ name: string }>();
+      await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'ticket_status', ?, ?)`).bind(requestId(), context.organizationId, ticket.requesterId, `Ticket ${status.replace("_", " ")}`, `${ticket.ticketNumber} — ${ticket.subject} is now ${status.replace("_", " ")}.`).run();
+      if (requester) await sendApprovalNotificationEmail(env, requester.email, requester.fullName, orgName?.name || "your organization", `Support ticket ${ticket.ticketNumber} updated`, `Your ticket “${ticket.subject}” is now ${status.replace("_", " ")}.`);
+    }
     await audit(env, context, "updated", "helpdesk", ticket.id, { ...body, status });
     return json({ ok: true, status });
   }
@@ -2358,7 +2365,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
       const url = new URL(request.url);
-      const calendarFeedMatch = url.pathname.match(/^\/calendar\/feed\/([a-f0-9]{64})$/i);
+      const calendarFeedMatch = url.pathname.match(/^\/calendar\/feed\/([a-f0-9]{64})(?:\.ics)?$/i);
       if (request.method === "GET" && calendarFeedMatch) return withSecurityHeaders(await publicCalendarFeed(calendarFeedMatch[1], env));
       if (url.pathname.startsWith("/api/")) return withSecurityHeaders(await handleApi(request, env));
       return env.ASSETS.fetch(request);
