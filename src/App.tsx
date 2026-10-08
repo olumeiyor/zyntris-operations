@@ -3,7 +3,7 @@ import {
   Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Award, BarChart3, Bell, BriefcaseBusiness, Building2,
   CalendarDays, CheckCircle2, ChevronDown, ChevronLeft, CircleHelp, ClipboardCheck, Clock3, Cloud,
   Command, CreditCard, FileText, FolderKanban, Grid2x2, LayoutDashboard, LifeBuoy, ListTodo, LockKeyhole,
-  Menu, MessageSquareText, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Plus, Search, Settings, ShieldCheck,
+  Menu, MessageSquareText, Megaphone, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Plus, Search, Settings, ShieldCheck, Target,
   Sparkles, TrendingUp, UploadCloud, UserRound, Users, WalletCards, X,
 } from "lucide-react";
 import { demoDashboard, demoEmployees, demoUser } from "./data/demo";
@@ -14,17 +14,20 @@ import { PlatformAdminWorkspace } from "./platform-admin";
 import { AccountSecurity, OrganizationSettings } from "./settings";
 import { Appraisals } from "./appraisals";
 import { HRTalentWorkspace } from "./hr-talent";
+import { AnnouncementsWorkspace, GoalsWorkspace } from "./company-modules";
 import { WorkCalendarWorkspace, WorkLeaveWorkspace, WorkProjectsWorkspace, WorkTasksWorkspace } from "./workspaces";
 import type { DashboardData, Employee, LeaveRequest, PageId, Task } from "./types";
 
 type IconComponent = typeof LayoutDashboard;
 type InboxNotification = { id: string; type: string; title: string; body: string; readAt: string | null; createdAt: string };
+type GlobalSearchResult = { id: string; title: string; subtitle: string; module: string };
 
 type NavItem = { id: PageId; label: string; icon: IconComponent; badge?: string; section?: string; soon?: boolean };
 
 const navItems: NavItem[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
   { id: "employees", label: "Employees", icon: Users, section: "People" },
+  { id: "goals", label: "Goals & OKRs", icon: Target, section: "People" },
   { id: "appraisals", label: "Performance & appraisals", icon: Award, section: "People" },
   { id: "talent", label: "Teams & talent", icon: Users, section: "People" },
   { id: "leave", label: "Leave & attendance", icon: CalendarDays, badge: "12", section: "People" },
@@ -41,6 +44,7 @@ const navItems: NavItem[] = [
   { id: "helpdesk", label: "Helpdesk", icon: LifeBuoy, section: "Operations" },
   { id: "calendar", label: "Calendar", icon: CalendarDays, section: "Work" },
   { id: "customers", label: "Customers & CRM", icon: UserRound, section: "Customers" },
+  { id: "announcements", label: "Announcements", icon: Megaphone, section: "Communication" },
   { id: "reports", label: "Reports & analytics", icon: BarChart3, section: "Insights" },
   { id: "settings", label: "Administration", icon: Settings, section: "Workspace" },
   { id: "security", label: "Account security", icon: ShieldCheck, section: "Workspace" },
@@ -77,6 +81,10 @@ export default function App() {
   const [notifications, setNotifications] = useState<InboxNotification[]>([]);
   const [unreadNotifications, setUnreadNotifications] = useState(0);
   const [notificationOpen, setNotificationOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<GlobalSearchResult[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
 
   useEffect(() => {
     const load = async () => {
@@ -104,6 +112,16 @@ export default function App() {
     };
     void load();
   }, []);
+
+  useEffect(() => {
+    const keyboard = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setSearchOpen(true); } if (event.key === "Escape") setSearchOpen(false); };
+    window.addEventListener("keydown", keyboard); return () => window.removeEventListener("keydown", keyboard);
+  }, []);
+  useEffect(() => {
+    if (!searchOpen || searchQuery.trim().length < 2) { setSearchResults([]); setSearchLoading(false); return; }
+    let active = true; setSearchLoading(true); const timeout = window.setTimeout(() => { void api<{ data: GlobalSearchResult[] }>(`/api/search?q=${encodeURIComponent(searchQuery.trim())}`).then((result) => { if (active) setSearchResults(result.data); }).catch((cause) => { if (active) setToast(cause instanceof Error ? cause.message : "Search is unavailable."); }).finally(() => { if (active) setSearchLoading(false); }); }, 220);
+    return () => { active = false; window.clearTimeout(timeout); };
+  }, [searchOpen, searchQuery]);
 
   const refreshNotifications = async () => {
     try {
@@ -166,6 +184,8 @@ export default function App() {
     if (item.id === "payroll") return userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") || userPermissions.has("payroll.self.view");
     if (item.id === "appraisals") return userPermissions.has("appraisals.view") || userPermissions.has("appraisals.manage") || userPermissions.has("appraisals.self.view");
     if (item.id === "talent") return userPermissions.has("hr.talent.view") || userPermissions.has("hr.talent.manage");
+    if (item.id === "goals") return userPermissions.has("goals.view");
+    if (item.id === "announcements") return userPermissions.has("announcements.view");
     if (item.id === "expenses") return userPermissions.has("expenses.view") || userPermissions.has("expenses.manage");
     if (item.id === "requests") return userPermissions.has("requests.manage") || userPermissions.has("employees.view");
     if (["dashboard", "reports"].includes(item.id)) return userPermissions.has("employees.view") || userPermissions.has("operations.view");
@@ -174,6 +194,11 @@ export default function App() {
   const openPage = (next: PageId) => {
     if (next === "platform") { window.location.assign("/admin"); return; }
     setPage(next); setMobileNav(false);
+  };
+
+  const openSearchResult = (result: GlobalSearchResult) => {
+    const destinations: Record<string, PageId> = { employees: "employees", projects: "projects", tasks: "tasks", documents: "documents", customers: "customers", vendors: "vendors", helpdesk: "helpdesk", talent: "talent", goals: "goals" };
+    const destination = destinations[result.module]; if (destination) openPage(destination); setSearchOpen(false); setSearchQuery("");
   };
 
   if (authLoading) return <main className="auth-loading"><img src="/zyntris-mark.png" alt="" /><span>Opening your secure workspace…</span></main>;
@@ -237,7 +262,7 @@ export default function App() {
       <main className="main-content">
         <header className="topbar">
           <div className="topbar-left"><button className="icon-button mobile-menu" onClick={() => setMobileNav(true)}><Menu size={20} /></button><button className="collapse-button" onClick={() => setCollapsed(!collapsed)} aria-label="Toggle sidebar">{collapsed ? <PanelLeftOpen size={18} /> : <PanelLeftClose size={18} />}</button><div className="breadcrumb"><span>Workspace</span><ChevronLeft size={14} className="breadcrumb-chevron" /><strong>{currentLabel}</strong></div></div>
-          <div className="topbar-actions"><button className="search-trigger" onClick={() => setToast("Global search is ready for employees, tasks, documents and more")}><Search size={17} /><span>Search anything</span><kbd>⌘ K</kbd></button><div className="notification-wrap"><button className="icon-button notification-button" aria-label={`Notifications, ${unreadNotifications} unread`} aria-expanded={notificationOpen} onClick={() => { setNotificationOpen(!notificationOpen); if (!notificationOpen) void refreshNotifications(); }}><Bell size={18} />{unreadNotifications > 0 && <span className="notification-count">{unreadNotifications > 9 ? "9+" : unreadNotifications}</span>}</button>{notificationOpen && <section className="notification-popover"><div className="notification-heading"><div><strong>Notifications</strong><span>{unreadNotifications ? `${unreadNotifications} unread` : "All caught up"}</span></div>{unreadNotifications > 0 && <button onClick={() => void markAllNotificationsRead()}>Mark all read</button>}</div><div className="notification-list">{notifications.length ? notifications.map((item) => <button className={`notification-item ${item.readAt ? "is-read" : ""}`} key={item.id} onClick={() => { if (!item.readAt) void markNotificationRead(item.id); }}><span className="notification-indicator"><Bell size={14} /></span><span className="notification-copy"><strong>{item.title}</strong><span>{item.body}</span><small>{new Date(item.createdAt).toLocaleString()}</small></span></button>) : <div className="notification-empty">No notifications yet. New approvals will appear here.</div>}</div></section>}</div><div className="topbar-divider"></div><button className="profile-chip" onClick={async () => { await api("/api/auth/logout", { method: "POST" }); setUser(null); }}><div className="avatar avatar-sm">{user.fullName.split(/\s+/).slice(0, 2).map((part) => part[0]).join("").toUpperCase()}</div><span>{user.fullName.split(" ")[0]}</span><ChevronDown size={14} /></button></div>
+          <div className="topbar-actions"><button className="search-trigger" onClick={() => setSearchOpen(true)}><Search size={17} /><span>Search anything</span><kbd>⌘ K</kbd></button><div className="notification-wrap"><button className="icon-button notification-button" aria-label={`Notifications, ${unreadNotifications} unread`} aria-expanded={notificationOpen} onClick={() => { setNotificationOpen(!notificationOpen); if (!notificationOpen) void refreshNotifications(); }}><Bell size={18} />{unreadNotifications > 0 && <span className="notification-count">{unreadNotifications > 9 ? "9+" : unreadNotifications}</span>}</button>{notificationOpen && <section className="notification-popover"><div className="notification-heading"><div><strong>Notifications</strong><span>{unreadNotifications ? `${unreadNotifications} unread` : "All caught up"}</span></div>{unreadNotifications > 0 && <button onClick={() => void markAllNotificationsRead()}>Mark all read</button>}</div><div className="notification-list">{notifications.length ? notifications.map((item) => <button className={`notification-item ${item.readAt ? "is-read" : ""}`} key={item.id} onClick={() => { if (!item.readAt) void markNotificationRead(item.id); }}><span className="notification-indicator"><Bell size={14} /></span><span className="notification-copy"><strong>{item.title}</strong><span>{item.body}</span><small>{new Date(item.createdAt).toLocaleString()}</small></span></button>) : <div className="notification-empty">No notifications yet. New approvals will appear here.</div>}</div></section>}</div><div className="topbar-divider"></div><button className="profile-chip" onClick={async () => { await api("/api/auth/logout", { method: "POST" }); setUser(null); }}><div className="avatar avatar-sm">{user.fullName.split(/\s+/).slice(0, 2).map((part) => part[0]).join("").toUpperCase()}</div><span>{user.fullName.split(" ")[0]}</span><ChevronDown size={14} /></button></div>
         </header>
 
         <div className="page-wrap">
@@ -249,6 +274,8 @@ export default function App() {
           {page === "talent" && <HRTalentWorkspace user={{ id: user.id, permissions: user.permissions || [] }} employees={employees} onToast={setToast} onEmployeesUpdated={async () => { try { const people = await api<{ data: Employee[] }>("/api/employees"); setEmployees(people.data); } catch { /* handled in the workspace */ } }} />}
           {page === "leave" && <WorkLeaveWorkspace canManage={userPermissions.has("employees.manage") || userPermissions.has("hr.onboarding.approve")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "attendance" && <AttendanceWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
+          {page === "goals" && <GoalsWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
+          {page === "announcements" && <AnnouncementsWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "tasks" && <WorkTasksWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "projects" && <WorkProjectsWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "calendar" && <WorkCalendarWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
@@ -264,6 +291,7 @@ export default function App() {
 
       {showAddEmployee && <Modal title="Onboard employee" onClose={() => setShowAddEmployee(false)}><form className="modal-form" onSubmit={createEmployee}><div className="security-note"><ShieldCheck size={17} /><div><strong>HR-controlled onboarding</strong><span>We’ll create the employee profile, assign the selected least-privilege role and email a one-time setup link.</span></div></div><div className="form-grid"><label>First name<input name="firstName" required placeholder="e.g. Ada" /></label><label>Last name<input name="lastName" required placeholder="e.g. Nwosu" /></label></div><label>Work email<input type="email" name="email" required placeholder="ada@company.com" /></label><div className="form-grid"><label>Job title<input name="jobTitle" required placeholder="e.g. Product Manager" /></label><label>Access level<select name="roleName" defaultValue="Employee"><option>Employee</option><option>Manager</option><option>Finance Admin</option><option>HR Admin</option>{user.role === "Organization Admin" && <><option>CEO</option><option>Organization Admin</option></>}</select></label></div><div className="form-grid"><label>Department<input name="departmentName" placeholder="e.g. Operations" /></label><label>Team<input name="teamName" placeholder="e.g. Customer Success" /></label></div><div className="form-grid"><label>Employment type<select name="employmentType" defaultValue="Full-time"><option>Full-time</option><option>Part-time</option><option>Contract</option><option>Temporary</option><option>Intern</option></select></label><label>Work location<select name="workLocation" defaultValue="Hybrid"><option>Office</option><option>Hybrid</option><option>Remote</option></select></label></div><label>Start date<input type="date" name="startDate" required /></label><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setShowAddEmployee(false)}>Cancel</button><button className="button primary" type="submit"><Plus size={16} /> Send onboarding invite</button></div></form></Modal>}
       {showUpload && <Modal title="Upload document" onClose={() => setShowUpload(false)}><form className="modal-form" onSubmit={uploadDocument}><label>Document category<select name="category" defaultValue="Policy"><option>Policy</option><option>Employee document</option><option>Vendor contract</option><option>Finance</option></select></label><label className="file-drop"><UploadCloud size={24} /><span>Choose a file or drop it here</span><small>Private R2 storage · 10MB max</small><input name="file" type="file" required /></label><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setShowUpload(false)}>Cancel</button><button className="button primary" type="submit"><UploadCloud size={16} /> Upload securely</button></div></form></Modal>}
+      {searchOpen && <div className="modal-backdrop search-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSearchOpen(false); }}><section className="modal global-search-modal"><div className="global-search-input"><Search size={18} /><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search authorized workspace records…" /><kbd>ESC</kbd><button className="icon-button" aria-label="Close search" onClick={() => setSearchOpen(false)}><X size={16} /></button></div><div className="global-search-results">{searchQuery.trim().length < 2 ? <div className="work-empty">Search across records you’re authorized to access.</div> : searchLoading ? <div className="work-loading">Searching…</div> : searchResults.length ? searchResults.map((result) => <button key={`${result.module}-${result.id}`} onClick={() => openSearchResult(result)}><span className="search-result-icon"><Search size={14} /></span><span><strong>{result.title}</strong><small>{titleCase(result.module)} · {result.subtitle}</small></span><ArrowUpRight size={14} /></button>) : <div className="work-empty">No matching records found.</div>}</div></section></div>}
       {toast && <div className="toast"><CheckCircle2 size={18} /><span>{toast}</span><button className="toast-close" onClick={() => setToast(null)}><X size={14} /></button></div>}
     </div>
   );

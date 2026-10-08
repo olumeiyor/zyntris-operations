@@ -15,6 +15,8 @@ Cloudflare-native operations SaaS for **Zyntris — One Platform. Every Operatio
 - HR-controlled employee onboarding with tenant-scoped department/team profiles, assigned access roles, Brevo email invitations, single-use 72-hour account-setup links, and resend support. Requesters receive Brevo email notices when a request or payroll run is approved.
 - Server-enforced role/permission access for HR and operations modules, with employee self-scoping on expense/request records; every financial request requires CEO approval.
 - Persistent user-and-tenant-scoped in-app notifications and Brevo email to each assigned approver when an expense, operational request, or payroll review is awaiting action.
+- Goals & OKRs with company/department/team/individual scopes, measurable key results, progress tracking, and tenant-enforced permissions; announcements target the whole organization or a selected department, team, or employee and generate in-app notifications.
+- Global search (`⌘K` / `Ctrl+K`) queries tenant-scoped records the signed-in user is authorized to see.
 - Separate Expo / React Native iOS and Android app in [`mobile/`](mobile/README.md). It uses a mobile-only bearer-token API prefix and does not enter the Cloudflare web build.
 - Read-only platform administration for onboarded organization and audit-activity summaries, restricted to explicitly allowlisted verified accounts.
 - Password-gated, read-only demo sandbox backed only by fictional demo-tenant records.
@@ -107,6 +109,9 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - `POST /api/auth/accept-invite`
 - `GET /api/leave`
 - `GET /api/tasks`
+- `GET|POST /api/goals`, `PATCH /api/goals/:id`, and `PATCH /api/goals/key-results/:id` — scoped objectives, measurable results and progress.
+- `GET|POST /api/announcements` and `POST /api/announcements/:id/read` — targeted company updates and read tracking.
+- `GET /api/search?q=...` — permission-filtered, tenant-scoped global search.
 - `GET|POST /api/expenses`, `GET /api/expenses/export`, `GET /api/expenses/:id/receipt`, and `GET|PATCH /api/expense-policy` — tenant-scoped CSV and private R2 receipts, with enforced claim limits and receipt requirements.
 - `GET|POST /api/requests`, `GET /api/requests/:id/history`, and `PATCH /api/requests/:id` — filterable approvals and tenant-scoped audit history.
 - `/api/attendance/*` — employee time-clock, HR shift schedules, and manager review of submitted time records.
@@ -134,6 +139,8 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - CRM customer pipeline supports lead, qualified, proposal, negotiation and won stages.
 
 Implemented HR talent modules include line-manager assignments, organization/team/employee KPI libraries, multi-rater 360 feedback, employee appraisal decisions, PIP plans and check-ins, recruitment candidate pipelines, and course assignment/completion tracking. Self-service password recovery is implemented with Brevo and an enumeration-safe response. Paid subscription onboarding is sales-led and manual; there is no online checkout or automatic bank transfer. Google/Outlook two-way calendar sync remains unconfigured pending provider selection and OAuth credentials. The Expo app is separate from the web deployment; store submission and OS push notifications still require the organization’s Apple/Google/EAS accounts and push credentials.
+
+Goals/OKRs and internal announcements are available in the workspace. Larger proposal items still requiring separate implementation or external setup include configurable event-driven automation, Zyntris AI/provider configuration, Google/Outlook calendar OAuth sync, and mobile store/push-notification release work. Compliance flow is intentionally out of scope for this change.
 
 ## Payroll policy setup
 

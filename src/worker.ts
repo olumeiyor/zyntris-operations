@@ -487,11 +487,11 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
         env.DB.prepare(`INSERT INTO payroll_settings (organization_id, currency, tax_year) VALUES (?, 'NGN', ?)`).bind(orgId, now.getUTCFullYear()),
         env.DB.prepare(`INSERT INTO email_verification_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, datetime('now', '+24 hours'))`).bind(`evt-${crypto.randomUUID()}`, userId, await hashToken(token)),
         env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions`).bind(roleId),
-        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','employees.manage','payroll.view','payroll.manage','payroll.run','hr.onboarding.approve','roles.manage','teams.manage','operations.view')`).bind(hrRoleId),
-        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','payroll.view','payroll.approve','requests.manage','hr.onboarding.approve','operations.view','operations.manage','expenses.view','expenses.manage')`).bind(ceoRoleId),
-        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('payroll.view','payroll.run','payroll.approve','expenses.view','expenses.manage','requests.manage','operations.view','operations.manage')`).bind(financeRoleId),
-        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','operations.view','expenses.view','payroll.self.view')`).bind(employeeRoleId),
-        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','operations.view','operations.manage','expenses.view','requests.manage','payroll.self.view')`).bind(managerRoleId),
+        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','employees.manage','payroll.view','payroll.manage','payroll.run','hr.onboarding.approve','roles.manage','teams.manage','operations.view','goals.view','goals.manage','announcements.view','announcements.manage')`).bind(hrRoleId),
+        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','payroll.view','payroll.approve','requests.manage','hr.onboarding.approve','operations.view','operations.manage','expenses.view','expenses.manage','goals.view','goals.manage','announcements.view','announcements.manage')`).bind(ceoRoleId),
+        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('payroll.view','payroll.run','payroll.approve','expenses.view','expenses.manage','requests.manage','operations.view','operations.manage','goals.view','announcements.view')`).bind(financeRoleId),
+        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','operations.view','expenses.view','payroll.self.view','goals.view','announcements.view')`).bind(employeeRoleId),
+        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','operations.view','operations.manage','expenses.view','requests.manage','payroll.self.view','goals.view','goals.manage','announcements.view')`).bind(managerRoleId),
         env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id, new_value_json) VALUES (?, ?, ?, 'created', 'organization', 'organization', ?, ?)`).bind(`audit-${crypto.randomUUID()}`, orgId, userId, orgId, JSON.stringify({ industry: body.industry?.trim() || null, onboardingStatus: "email_verification_pending" })),
       ]);
     } catch (cause) {
@@ -1061,6 +1061,27 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (context.isDemo && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return error("The demo sandbox is read-only. Changes are not allowed.", 403);
 
+  if (request.method === "GET" && path === "/api/search") {
+    const query = new URL(request.url).searchParams.get("q")?.trim().slice(0, 100) || "";
+    if (query.length < 2) return json({ data: [] });
+    const like = `%${query}%`; const data: { id: string; title: string; subtitle: string; module: string }[] = [];
+    const add = (rows: { results?: unknown[] }) => data.push(...(rows.results || []) as typeof data);
+    if (hasPermission(context, "employees.view")) add(await env.DB.prepare(`SELECT e.id, e.first_name || ' ' || e.last_name as title, e.job_title || ' · ' || COALESCE(d.name,'No department') as subtitle, 'employees' as module FROM employees e LEFT JOIN departments d ON d.id = e.department_id AND d.organization_id = e.organization_id WHERE e.organization_id = ? AND e.deleted_at IS NULL AND (e.first_name LIKE ? OR e.last_name LIKE ? OR e.email LIKE ? OR e.job_title LIKE ? OR d.name LIKE ?) ORDER BY e.first_name LIMIT 8`).bind(context.organizationId, like, like, like, like, like).all());
+    if (hasPermission(context, "operations.view")) {
+      const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
+      const canManage = hasPermission(context, "operations.manage");
+      add(await env.DB.prepare(`SELECT t.id, t.title, COALESCE(p.name,'Task') || ' · ' || t.status as subtitle, 'tasks' as module FROM tasks t LEFT JOIN projects p ON p.id = t.project_id AND p.organization_id = t.organization_id WHERE t.organization_id = ? AND (? = 1 OR t.assignee_id = ? OR t.creator_id = ?) AND (t.title LIKE ? OR COALESCE(t.description,'') LIKE ?) ORDER BY t.updated_at DESC LIMIT 8`).bind(context.organizationId, canManage ? 1 : 0, employee?.id || "", context.userId, like, like).all());
+      add(await env.DB.prepare(`SELECT id, name as title, COALESCE(description,'') || ' · ' || status as subtitle, 'projects' as module FROM projects WHERE organization_id = ? AND (name LIKE ? OR COALESCE(description,'') LIKE ?) ORDER BY updated_at DESC LIMIT 8`).bind(context.organizationId, like, like).all());
+      add(await env.DB.prepare(`SELECT id, name as title, category || ' · ' || status as subtitle, 'vendors' as module FROM vendors WHERE organization_id = ? AND (name LIKE ? OR category LIKE ? OR COALESCE(contact_name,'') LIKE ?) ORDER BY updated_at DESC LIMIT 8`).bind(context.organizationId, like, like, like).all());
+      add(await env.DB.prepare(`SELECT id, subject as title, ticket_number || ' · ' || status as subtitle, 'helpdesk' as module FROM support_tickets WHERE organization_id = ? AND (subject LIKE ? OR ticket_number LIKE ? OR COALESCE(description,'') LIKE ?) ORDER BY updated_at DESC LIMIT 8`).bind(context.organizationId, like, like, like).all());
+      add(await env.DB.prepare(`SELECT id, name as title, category as subtitle, 'documents' as module FROM documents WHERE organization_id = ? AND (name LIKE ? OR category LIKE ?) ORDER BY created_at DESC LIMIT 8`).bind(context.organizationId, like, like).all());
+      add(await env.DB.prepare(`SELECT id, COALESCE(company,name) as title, name || ' · ' || stage as subtitle, 'customers' as module FROM customers WHERE organization_id = ? AND (name LIKE ? OR company LIKE ? OR email LIKE ?) ORDER BY updated_at DESC LIMIT 8`).bind(context.organizationId, like, like, like).all());
+    }
+    if (hasPermission(context, "hr.talent.view") || hasPermission(context, "hr.talent.manage")) add(await env.DB.prepare(`SELECT id, title, category as subtitle, 'talent' as module FROM learning_courses WHERE organization_id = ? AND status = 'active' AND (title LIKE ? OR description LIKE ?) ORDER BY updated_at DESC LIMIT 8`).bind(context.organizationId, like, like).all());
+    if (hasPermission(context, "goals.view")) add(await env.DB.prepare(`SELECT id, title, level || ' goal · ' || status as subtitle, 'goals' as module FROM goals WHERE organization_id = ? AND title LIKE ? ORDER BY updated_at DESC LIMIT 8`).bind(context.organizationId, like).all());
+    return json({ data: data.slice(0, 50) });
+  }
+
   const talentResponse = await handleHRTalent(request, env, context, path);
   if (talentResponse) return talentResponse;
   const appraisalResponse = await handleAppraisals(request, env, context, path);
@@ -1484,6 +1505,88 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       env.DB.prepare(`SELECT strftime('%Y-%m', expense_date) as month, COALESCE(SUM(amount), 0) as amount FROM expenses WHERE organization_id = ? AND expense_date >= ? GROUP BY strftime('%Y-%m', expense_date) ORDER BY month`).bind(context.organizationId, fromDate).all(),
     ]);
     return json({ people: people || {}, expenses: expenses || {}, leave: leave || {}, tasks: tasks || {}, tickets: tickets || {}, approvals: approvals || {}, appraisals: appraisals || {}, departments: departments.results || [], monthlySpend: monthlySpend.results || [] });
+  }
+
+  if (path === "/api/goals" && request.method === "GET") {
+    if (!hasPermission(context, "goals.view")) return error("You do not have permission to view goals.", 403);
+    const employee = await env.DB.prepare(`SELECT department_id as departmentId, team_id as teamId FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ departmentId: string | null; teamId: string | null }>();
+    const canManage = hasPermission(context, "goals.manage");
+    const goals = await env.DB.prepare(`SELECT g.id, g.parent_goal_id as parentGoalId, g.level, g.department_id as departmentId, d.name as department, g.team_id as teamId, t.name as team, g.owner_user_id as ownerUserId, u.full_name as owner, g.title, g.description, g.start_date as startDate, g.due_date as dueDate, g.weight, g.progress, g.status, g.created_at as createdAt FROM goals g LEFT JOIN departments d ON d.id = g.department_id AND d.organization_id = g.organization_id LEFT JOIN teams t ON t.id = g.team_id AND t.organization_id = g.organization_id LEFT JOIN users u ON u.id = g.owner_user_id WHERE g.organization_id = ? AND (? = 1 OR g.level = 'company' OR g.owner_user_id = ? OR (g.level = 'department' AND g.department_id = ?) OR (g.level = 'team' AND g.team_id = ?)) ORDER BY CASE g.level WHEN 'company' THEN 0 WHEN 'department' THEN 1 WHEN 'team' THEN 2 ELSE 3 END, g.due_date, g.created_at DESC LIMIT 300`).bind(context.organizationId, canManage ? 1 : 0, context.userId, employee?.departmentId || "", employee?.teamId || "").all();
+    const results = await env.DB.prepare(`SELECT kr.id, kr.goal_id as goalId, kr.title, kr.unit, kr.target_value as targetValue, kr.current_value as currentValue, CASE WHEN ? = 1 OR g.owner_user_id = ? THEN 1 ELSE 0 END as canUpdate FROM goal_key_results kr JOIN goals g ON g.id = kr.goal_id AND g.organization_id = kr.organization_id WHERE kr.organization_id = ? ORDER BY kr.created_at`).bind(canManage ? 1 : 0, context.userId, context.organizationId).all();
+    const visibleIds = new Set((goals.results || []).map((goal) => (goal as { id: string }).id));
+    return json({ data: goals.results || [], keyResults: (results.results || []).filter((item) => visibleIds.has((item as { goalId: string }).goalId)), canManage, departments: (await env.DB.prepare(`SELECT id, name FROM departments WHERE organization_id = ? ORDER BY name`).bind(context.organizationId).all()).results || [], teams: (await env.DB.prepare(`SELECT id, name, department_id as departmentId FROM teams WHERE organization_id = ? ORDER BY name`).bind(context.organizationId).all()).results || [], employees: canManage ? (await env.DB.prepare(`SELECT e.user_id as userId, e.first_name || ' ' || e.last_name as name FROM employees e WHERE e.organization_id = ? AND e.user_id IS NOT NULL AND e.deleted_at IS NULL ORDER BY name`).bind(context.organizationId).all()).results || [] : [] });
+  }
+
+  if (path === "/api/goals" && request.method === "POST") {
+    if (!hasPermission(context, "goals.manage")) return error("Goal management permission is required.", 403);
+    const body = await request.json<{ parentGoalId?: string; level?: string; departmentId?: string; teamId?: string; ownerUserId?: string; title?: string; description?: string; startDate?: string; dueDate?: string; weight?: number; keyResults?: { title: string; unit?: string; targetValue: number }[] }>();
+    const level = body.level || "company"; const weight = Number(body.weight || 100);
+    if (!body.title?.trim() || body.title.trim().length > 160 || !["company", "department", "team", "individual"].includes(level) || !Number.isInteger(weight) || weight < 1 || weight > 100 || body.startDate && !isoDate(body.startDate) || body.dueDate && !isoDate(body.dueDate) || body.startDate && body.dueDate && body.dueDate < body.startDate || (body.keyResults || []).length > 20 || (body.keyResults || []).some((result) => !result.title?.trim() || result.title.length > 180 || !Number.isFinite(Number(result.targetValue)) || Number(result.targetValue) <= 0)) return error("Enter a valid goal, scope, dates, weight and key results.");
+    if (level === "department" && (!body.departmentId || !await env.DB.prepare(`SELECT id FROM departments WHERE id = ? AND organization_id = ?`).bind(body.departmentId, context.organizationId).first())) return error("Choose a department in this organization.");
+    if (level === "team" && (!body.teamId || !await env.DB.prepare(`SELECT id FROM teams WHERE id = ? AND organization_id = ?`).bind(body.teamId, context.organizationId).first())) return error("Choose a team in this organization.");
+    if (level === "individual" && (!body.ownerUserId || !await env.DB.prepare(`SELECT user_id FROM employees WHERE user_id = ? AND organization_id = ? AND deleted_at IS NULL`).bind(body.ownerUserId, context.organizationId).first())) return error("Choose an employee in this organization.");
+    if (body.parentGoalId && !await env.DB.prepare(`SELECT id FROM goals WHERE id = ? AND organization_id = ?`).bind(body.parentGoalId, context.organizationId).first()) return error("Choose a parent goal in this organization.");
+    const id = `goal-${crypto.randomUUID()}`;
+    const statements = [env.DB.prepare(`INSERT INTO goals (id, organization_id, parent_goal_id, level, department_id, team_id, owner_user_id, title, description, start_date, due_date, weight, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.parentGoalId || null, level, level === "department" ? body.departmentId : null, level === "team" ? body.teamId : null, level === "individual" ? body.ownerUserId : null, body.title.trim(), body.description?.trim() || null, body.startDate || null, body.dueDate || null, weight, context.userId)];
+    for (const result of body.keyResults || []) statements.push(env.DB.prepare(`INSERT INTO goal_key_results (id, organization_id, goal_id, title, unit, target_value) VALUES (?, ?, ?, ?, ?, ?)`).bind(`kr-${crypto.randomUUID()}`, context.organizationId, id, result.title.trim(), result.unit?.trim().slice(0, 30) || "%", Number(result.targetValue)));
+    await env.DB.batch(statements); await audit(env, context, "created", "goals", id, { title: body.title, level, keyResultCount: body.keyResults?.length || 0 });
+    return json({ id }, { status: 201 });
+  }
+
+  const goalMatch = path.match(/^\/api\/goals\/([^/]+)$/);
+  if (request.method === "PATCH" && goalMatch) {
+    const body = await request.json<{ progress?: number; status?: string; title?: string; description?: string; dueDate?: string | null }>();
+    const current = await env.DB.prepare(`SELECT id, owner_user_id as ownerUserId FROM goals WHERE id = ? AND organization_id = ?`).bind(goalMatch[1], context.organizationId).first<{ id: string; ownerUserId: string | null }>();
+    if (!current) return error("Goal not found.", 404);
+    const canManage = hasPermission(context, "goals.manage");
+    if (!canManage && current.ownerUserId !== context.userId) return error("You can update progress only on a goal assigned to you.", 403);
+    if (body.progress !== undefined && (!Number.isInteger(Number(body.progress)) || Number(body.progress) < 0 || Number(body.progress) > 100) || body.status !== undefined && !["not_started", "in_progress", "at_risk", "completed", "cancelled"].includes(body.status) || body.dueDate && !isoDate(body.dueDate) || !canManage && (body.title !== undefined || body.description !== undefined || body.dueDate !== undefined)) return error("Enter valid goal progress or status details.");
+    await env.DB.prepare(`UPDATE goals SET title = COALESCE(?, title), description = COALESCE(?, description), due_date = CASE WHEN ? = 1 THEN ? ELSE due_date END, progress = COALESCE(?, progress), status = COALESCE(?, status), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(body.title?.trim() || null, body.description === undefined ? null : body.description.trim(), body.dueDate === null ? 1 : body.dueDate ? 1 : 0, body.dueDate || null, body.progress ?? null, body.status || null, current.id, context.organizationId).run();
+    await audit(env, context, "updated", "goals", current.id, body); return json({ ok: true });
+  }
+
+  const keyResultMatch = path.match(/^\/api\/goals\/key-results\/([^/]+)$/);
+  if (request.method === "PATCH" && keyResultMatch) {
+    const body = await request.json<{ currentValue?: number }>(); const value = Number(body.currentValue);
+    if (!Number.isFinite(value) || value < 0 || value > 1_000_000_000_000) return error("Enter a valid key result value.");
+    const result = await env.DB.prepare(`SELECT kr.id, kr.goal_id as goalId, g.owner_user_id as ownerUserId FROM goal_key_results kr JOIN goals g ON g.id = kr.goal_id AND g.organization_id = kr.organization_id WHERE kr.id = ? AND kr.organization_id = ?`).bind(keyResultMatch[1], context.organizationId).first<{ id: string; goalId: string; ownerUserId: string | null }>();
+    if (!result) return error("Key result not found.", 404);
+    if (!hasPermission(context, "goals.manage") && result.ownerUserId !== context.userId) return error("You can update only key results on goals assigned to you.", 403);
+    await env.DB.prepare(`UPDATE goal_key_results SET current_value = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(value, result.id, context.organizationId).run();
+    const aggregate = await env.DB.prepare(`SELECT CAST(AVG(CASE WHEN target_value > 0 THEN MIN(100, current_value * 100.0 / target_value) ELSE 0 END) AS INTEGER) as progress FROM goal_key_results WHERE organization_id = ? AND goal_id = ?`).bind(context.organizationId, result.goalId).first<{ progress: number }>();
+    await env.DB.prepare(`UPDATE goals SET progress = ?, status = CASE WHEN ? >= 100 THEN 'completed' WHEN status = 'not_started' AND ? > 0 THEN 'in_progress' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(aggregate?.progress || 0, aggregate?.progress || 0, aggregate?.progress || 0, result.goalId, context.organizationId).run();
+    await audit(env, context, "key_result_updated", "goals", result.goalId, { keyResultId: result.id, currentValue: value, progress: aggregate?.progress || 0 }); return json({ ok: true, progress: aggregate?.progress || 0 });
+  }
+
+  if (path === "/api/announcements" && request.method === "GET") {
+    if (!hasPermission(context, "announcements.view")) return error("You do not have permission to view announcements.", 403);
+    const employee = await env.DB.prepare(`SELECT id, department_id as departmentId, team_id as teamId FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string; departmentId: string | null; teamId: string | null }>();
+    const result = await env.DB.prepare(`SELECT a.id, a.title, a.body, a.target_type as targetType, a.status, a.created_at as createdAt, u.full_name as author, r.read_at as readAt FROM announcements a LEFT JOIN users u ON u.id = a.created_by LEFT JOIN announcement_reads r ON r.announcement_id = a.id AND r.user_id = ? WHERE a.organization_id = ? AND a.status = 'published' AND (a.target_type = 'all' OR (a.target_type = 'department' AND a.target_id = ?) OR (a.target_type = 'team' AND a.target_id = ?) OR (a.target_type = 'employee' AND a.target_id = ?)) ORDER BY a.created_at DESC LIMIT 100`).bind(context.userId, context.organizationId, employee?.departmentId || "", employee?.teamId || "", employee?.id || "").all();
+    return json({ data: result.results || [], canManage: hasPermission(context, "announcements.manage"), departments: hasPermission(context, "announcements.manage") ? (await env.DB.prepare(`SELECT id, name FROM departments WHERE organization_id = ? ORDER BY name`).bind(context.organizationId).all()).results || [] : [], teams: hasPermission(context, "announcements.manage") ? (await env.DB.prepare(`SELECT id, name FROM teams WHERE organization_id = ? ORDER BY name`).bind(context.organizationId).all()).results || [] : [], employees: hasPermission(context, "announcements.manage") ? (await env.DB.prepare(`SELECT id, first_name || ' ' || last_name as name FROM employees WHERE organization_id = ? AND deleted_at IS NULL ORDER BY name`).bind(context.organizationId).all()).results || [] : [] });
+  }
+
+  if (path === "/api/announcements" && request.method === "POST") {
+    if (!hasPermission(context, "announcements.manage")) return error("Announcement management permission is required.", 403);
+    const body = await request.json<{ title?: string; body?: string; targetType?: string; targetId?: string }>();
+    const targetType = body.targetType || "all";
+    if (!body.title?.trim() || body.title.trim().length > 160 || !body.body?.trim() || body.body.trim().length > 5000 || !["all", "department", "team", "employee"].includes(targetType)) return error("Enter a title and message and choose a valid audience.");
+    const targetTable = targetType === "department" ? "departments" : targetType === "team" ? "teams" : targetType === "employee" ? "employees" : "";
+    if (targetTable && (!body.targetId || !await env.DB.prepare(`SELECT id FROM ${targetTable} WHERE id = ? AND organization_id = ?`).bind(body.targetId, context.organizationId).first())) return error("Choose an audience in this organization.", 404);
+    const id = `announcement-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO announcements (id, organization_id, title, body, target_type, target_id, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.title.trim(), body.body.trim(), targetType, body.targetId || null, context.userId).run();
+    const audienceSql = targetType === "all" ? `SELECT m.user_id FROM memberships m JOIN users u ON u.id = m.user_id WHERE m.organization_id = ? AND m.status = 'active' AND u.status = 'active'` : targetType === "department" ? `SELECT e.user_id FROM employees e JOIN memberships m ON m.user_id = e.user_id AND m.organization_id = e.organization_id AND m.status = 'active' WHERE e.organization_id = ? AND e.department_id = ? AND e.user_id IS NOT NULL AND e.deleted_at IS NULL` : targetType === "team" ? `SELECT e.user_id FROM employees e JOIN memberships m ON m.user_id = e.user_id AND m.organization_id = e.organization_id AND m.status = 'active' WHERE e.organization_id = ? AND e.team_id = ? AND e.user_id IS NOT NULL AND e.deleted_at IS NULL` : `SELECT e.user_id FROM employees e JOIN memberships m ON m.user_id = e.user_id AND m.organization_id = e.organization_id AND m.status = 'active' WHERE e.organization_id = ? AND e.id = ? AND e.user_id IS NOT NULL AND e.deleted_at IS NULL`;
+    const notice = await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) SELECT lower(hex(randomblob(16))), ?, audience.user_id, 'announcement', ?, ? FROM (${audienceSql}) audience WHERE audience.user_id IS NOT NULL`).bind(context.organizationId, body.title.trim(), body.body.trim(), context.organizationId, ...(targetType === "all" ? [] : [body.targetId])).run();
+    await audit(env, context, "published", "announcements", id, { title: body.title.trim(), targetType, notificationCount: notice.meta.changes });
+    return json({ id, notificationCount: notice.meta.changes }, { status: 201 });
+  }
+
+  const announcementReadMatch = path.match(/^\/api\/announcements\/([^/]+)\/read$/);
+  if (request.method === "POST" && announcementReadMatch) {
+    const employee = await env.DB.prepare(`SELECT id, department_id as departmentId, team_id as teamId FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string; departmentId: string | null; teamId: string | null }>();
+    const visible = await env.DB.prepare(`SELECT id FROM announcements WHERE id = ? AND organization_id = ? AND status = 'published' AND (target_type = 'all' OR (target_type = 'department' AND target_id = ?) OR (target_type = 'team' AND target_id = ?) OR (target_type = 'employee' AND target_id = ?))`).bind(announcementReadMatch[1], context.organizationId, employee?.departmentId || "", employee?.teamId || "", employee?.id || "").first();
+    if (!visible) return error("Announcement not found.", 404);
+    await env.DB.prepare(`INSERT INTO announcement_reads (announcement_id, user_id) VALUES (?, ?) ON CONFLICT(announcement_id, user_id) DO UPDATE SET read_at = CURRENT_TIMESTAMP`).bind(announcementReadMatch[1], context.userId).run();
+    return json({ ok: true });
   }
 
   if (request.method === "GET" && path === "/api/operations/members") {
