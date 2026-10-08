@@ -21,6 +21,7 @@ export function PlatformAdminWorkspace() {
   const [organizations, setOrganizations] = useState<Organization[]>([]);
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [tenantUsers, setTenantUsers] = useState<TenantUser[]>([]);
+  const [tenantActivity, setTenantActivity] = useState<ActivityEntry[]>([]);
   const [selectedOrg, setSelectedOrg] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [query, setQuery] = useState("");
@@ -67,12 +68,15 @@ export function PlatformAdminWorkspace() {
   };
 
   const manageTenant = async (org: Organization) => {
-    if (selectedOrg === org.id) { setSelectedOrg(null); setTenantUsers([]); return; }
-    setSelectedOrg(org.id); setTenantUsers([]); setError("");
+    if (selectedOrg === org.id) { setSelectedOrg(null); setTenantUsers([]); setTenantActivity([]); return; }
+    setSelectedOrg(org.id); setTenantUsers([]); setTenantActivity([]); setError("");
     try {
-      const result = await platformApi<{ data: TenantUser[] }>(`/api/platform/organizations/${encodeURIComponent(org.id)}/users`);
-      setTenantUsers(result.data);
-    } catch (cause) { setError(cause instanceof Error ? cause.message : "Tenant members could not be loaded."); }
+      const [users, events] = await Promise.all([
+        platformApi<{ data: TenantUser[] }>(`/api/platform/organizations/${encodeURIComponent(org.id)}/users`),
+        platformApi<{ data: ActivityEntry[] }>(`/api/platform/activity?organizationId=${encodeURIComponent(org.id)}&limit=20&offset=0`),
+      ]);
+      setTenantUsers(users.data); setTenantActivity(events.data);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Tenant maintenance details could not be loaded."); }
   };
 
   const toggleTenant = async (org: Organization) => {
@@ -90,12 +94,14 @@ export function PlatformAdminWorkspace() {
     finally { setBusyAction(""); }
   };
 
-  const sendPasswordReset = async (user: TenantUser) => {
-    if (!window.confirm(`Send a one-time password reset link to ${user.email}? This immediately signs out their existing sessions.`)) return;
+  const sendPasswordReset = async (org: Organization, user: TenantUser) => {
+    if (!window.confirm(`Send a one-time hard-reset link to ${user.role} ${user.email} for ${org.name}? Their existing sessions will be signed out after Brevo accepts the email.`)) return;
     setBusyAction(`reset:${user.id}`); setError(""); setNotice("");
     try {
-      const result = await platformApi<{ recipient: string; expiresIn: number; sessionsRevoked: boolean }>(`/api/platform/users/${encodeURIComponent(user.id)}/password-reset`, { method: "POST", body: "{}" });
-      setNotice(`Brevo accepted a 30-minute password-reset link for ${result.recipient}; their existing sessions were revoked.`);
+      const result = await platformApi<{ recipient: string; expiresIn: number; sessionsRevoked: boolean }>(`/api/platform/organizations/${encodeURIComponent(org.id)}/users/${encodeURIComponent(user.id)}/password-reset`, { method: "POST", body: "{}" });
+      setNotice(`Brevo accepted a 30-minute hard-reset link for ${result.recipient}; their existing sessions were revoked.`);
+      const events = await platformApi<{ data: ActivityEntry[] }>(`/api/platform/activity?organizationId=${encodeURIComponent(org.id)}&limit=20&offset=0`);
+      if (selectedOrg === org.id) setTenantActivity(events.data);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "The password reset email could not be sent."); }
     finally { setBusyAction(""); }
   };
@@ -117,7 +123,7 @@ export function PlatformAdminWorkspace() {
     <section className="card platform-card">
       <div className="card-heading"><div><h2>All tenants</h2><p>{orgTotal.toLocaleString()} workspaces, including the protected demo tenant</p></div><form className="platform-search" onSubmit={(event) => { event.preventDefault(); setOrgOffset(0); setQuery(search.trim()); }}><Search size={16} /><input aria-label="Search tenants" placeholder="Search tenants" value={search} onChange={(event) => setSearch(event.target.value)} /><button type="submit">Search</button></form></div>
       <div className="table-scroll"><table><thead><tr><th>Tenant</th><th>Subscription</th><th>Service access</th><th>Plan</th><th>Members</th><th>Employees</th><th>Last activity</th><th>Onboarded</th><th>Manage</th></tr></thead><tbody>
-        {organizations.map((org) => <TenantRows key={org.id} org={org} selected={selectedOrg === org.id} users={tenantUsers} busyAction={busyAction} onManage={() => void manageTenant(org)} onToggle={() => void toggleTenant(org)} onReset={(user) => void sendPasswordReset(user)} />)}
+        {organizations.map((org) => <TenantRows key={org.id} org={org} selected={selectedOrg === org.id} users={tenantUsers} activity={tenantActivity} busyAction={busyAction} onManage={() => void manageTenant(org)} onToggle={() => void toggleTenant(org)} onReset={(user) => void sendPasswordReset(org, user)} />)}
         {!loading && !organizations.length && <tr><td colSpan={9} className="platform-empty">No tenants match this search.</td></tr>}
       </tbody></table></div>
       {orgOffset < orgTotal && <div className="platform-more"><button className="button secondary" onClick={() => void loadMoreOrganizations()} disabled={loading}>Load more tenants</button></div>}
@@ -134,7 +140,7 @@ export function PlatformAdminWorkspace() {
   </div>;
 }
 
-function TenantRows({ org, selected, users, busyAction, onManage, onToggle, onReset }: { org: Organization; selected: boolean; users: TenantUser[]; busyAction: string; onManage: () => void; onToggle: () => void; onReset: (user: TenantUser) => void }) {
+function TenantRows({ org, selected, users, activity, busyAction, onManage, onToggle, onReset }: { org: Organization; selected: boolean; users: TenantUser[]; activity: ActivityEntry[]; busyAction: string; onManage: () => void; onToggle: () => void; onReset: (user: TenantUser) => void }) {
   const enabled = Boolean(org.serviceEnabled);
   return <>
     <tr>
@@ -144,10 +150,12 @@ function TenantRows({ org, selected, users, busyAction, onManage, onToggle, onRe
       <td>{org.plan || "—"}</td><td>{org.members}</td><td>{org.employees}</td><td>{date(org.lastActivity)}</td><td>{date(org.createdAt)}</td>
       <td className="platform-row-actions"><button className="platform-link-button" onClick={onManage}>{selected ? "Close" : "Manage"}</button><button className="button secondary platform-toggle" onClick={onToggle} disabled={Boolean(org.isDemo) || busyAction === `service:${org.id}`}>{busyAction === `service:${org.id}` ? "Saving…" : enabled ? <><LockKeyhole size={13} /> Disable</> : <><ShieldCheck size={13} /> Enable</>}</button></td>
     </tr>
-    {selected && <tr><td colSpan={9} className="platform-members-cell"><div className="platform-members"><div className="platform-members-heading"><div><strong>Tenant accounts</strong><span>{users.length} memberships · reset links go to the user’s verified email</span></div></div><div className="table-scroll"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Account</th><th>Verified</th><th>Recovery</th></tr></thead><tbody>
-      {users.map((user) => <tr key={user.id}><td><strong>{user.fullName}</strong></td><td>{user.email}</td><td>{user.role}</td><td>{user.status}</td><td>{user.emailVerifiedAt ? "Yes" : "No"}</td><td><button className="platform-reset-button" onClick={() => onReset(user)} disabled={!user.emailVerifiedAt || user.status !== "active" || Boolean(org.isDemo) || busyAction === `reset:${user.id}`}>{busyAction === `reset:${user.id}` ? "Sending…" : <><KeyRound size={13} /> Send reset link</>}</button></td></tr>)}
+    {selected && <tr><td colSpan={9} className="platform-members-cell"><div className="platform-members"><div className="platform-members-heading"><div><strong>Tenant maintenance</strong><span>{users.length} tenant accounts · service access is managed above</span></div></div><div className="table-scroll"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Account</th><th>Verified</th><th>Admin recovery</th></tr></thead><tbody>
+      {users.map((user) => { const isTenantAdmin = user.role === "Organization Admin" || user.role === "CEO"; return <tr key={user.id}><td><strong>{user.fullName}</strong></td><td>{user.email}</td><td>{user.role}</td><td>{user.status}</td><td>{user.emailVerifiedAt ? "Yes" : "No"}</td><td>{isTenantAdmin ? <button className="platform-reset-button" onClick={() => onReset(user)} disabled={!user.emailVerifiedAt || user.status !== "active" || Boolean(org.isDemo) || busyAction === `reset:${user.id}`}>{busyAction === `reset:${user.id}` ? "Sending…" : <><KeyRound size={13} /> Send hard-reset link</>}</button> : <span className="platform-reset-note">Admin only</span>}</td></tr>; })}
       {!users.length && <tr><td colSpan={6} className="platform-empty">No member accounts are attached to this tenant.</td></tr>}
-    </tbody></table></div><p className="platform-reset-note">Password reset emails expire after 30 minutes. Existing sessions are revoked only after Brevo accepts the email.</p></div></td></tr>}
+    </tbody></table></div><p className="platform-reset-note">Hard resets are available only for verified Organization Admin or CEO accounts. The one-time email link expires in 30 minutes; sessions are revoked only after Brevo accepts the email.</p>
+      <div className="platform-maintenance-activity"><div className="platform-members-heading"><div><strong>Tenant audit history</strong><span>Recent administrative and workspace events for {org.name}</span></div></div><div className="table-scroll"><table><thead><tr><th>Activity</th><th>Module</th><th>Actor</th><th>Time</th></tr></thead><tbody>{activity.map((entry) => <tr key={entry.id}><td>{entry.action.replaceAll("_", " ")}{entry.recordType ? ` · ${entry.recordType.replaceAll("_", " ")}` : ""}</td><td>{entry.module}</td><td>{entry.actorName || "System"}</td><td>{date(entry.createdAt)}</td></tr>)}{!activity.length && <tr><td colSpan={4} className="platform-empty">No audit events recorded for this tenant.</td></tr>}</tbody></table></div></div>
+      </div></td></tr>}
   </>;
 }
 

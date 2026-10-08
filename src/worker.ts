@@ -1196,11 +1196,11 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       return json({ data: users.results || [] });
     }
 
-    const userResetMatch = path.match(/^\/api\/platform\/users\/([^/]+)\/password-reset$/);
+    const userResetMatch = path.match(/^\/api\/platform\/organizations\/([^/]+)\/users\/([^/]+)\/password-reset$/);
     if (request.method === "POST" && userResetMatch) {
       if (!(await consumeAuthLimit(env, request, "platform-password-reset", 15, 60))) return error("The password reset limit has been reached. Wait before sending more reset emails.", 429);
-      const target = await env.DB.prepare(`SELECT u.id, u.email, u.full_name as fullName, o.id as organizationId, o.name as organizationName FROM users u JOIN memberships m ON m.user_id = u.id JOIN organizations o ON o.id = m.organization_id WHERE u.id = ? AND u.status = 'active' AND u.email_verified_at IS NOT NULL AND o.is_demo = 0 ORDER BY m.created_at LIMIT 1`).bind(userResetMatch[1]).first<{ id: string; email: string; fullName: string; organizationId: string; organizationName: string }>();
-      if (!target) return error("No active, verified customer account was found for password reset.", 404);
+      const target = await env.DB.prepare(`SELECT u.id, u.email, u.full_name as fullName, o.id as organizationId, o.name as organizationName, r.name as role FROM users u JOIN memberships m ON m.user_id = u.id JOIN roles r ON r.id = m.role_id JOIN organizations o ON o.id = m.organization_id WHERE o.id = ? AND u.id = ? AND m.status = 'active' AND u.status = 'active' AND u.email_verified_at IS NOT NULL AND o.is_demo = 0 AND r.name IN ('Organization Admin','CEO') LIMIT 1`).bind(userResetMatch[1], userResetMatch[2]).first<{ id: string; email: string; fullName: string; organizationId: string; organizationName: string; role: string }>();
+      if (!target) return error("An active, verified Organization Admin or CEO account for this tenant was not found.", 404);
       await env.DB.prepare(`DELETE FROM password_reset_tokens WHERE user_id = ?`).bind(target.id).run();
       const resetToken = randomToken();
       const resetId = `pwdreset-${crypto.randomUUID()}`;
@@ -1214,9 +1214,13 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
         env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(target.id),
         env.DB.prepare(`DELETE FROM two_factor_challenges WHERE user_id = ?`).bind(target.id),
         env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id, new_value_json) VALUES (?, ?, ?, 'platform_password_reset_requested', 'platform', 'user', ?, ?)`)
-          .bind(`audit-${crypto.randomUUID()}`, target.organizationId, context.userId, target.id, JSON.stringify({ email: target.email, resetLinkExpiresInMinutes: 30 })),
+          .bind(`audit-${crypto.randomUUID()}`, target.organizationId, context.userId, target.id, JSON.stringify({ email: target.email, role: target.role, resetLinkExpiresInMinutes: 30 })),
       ]);
       return json({ ok: true, recipient: target.email, expiresIn: 1800, sessionsRevoked: true });
+    }
+
+    if (request.method === "POST" && /^\/api\/platform\/users\/[^/]+\/password-reset$/.test(path)) {
+      return error("Choose an Organization Admin or CEO from the specific tenant workspace.", 404);
     }
 
     if (request.method !== "GET") return error("Platform console endpoint not found.", 404);
