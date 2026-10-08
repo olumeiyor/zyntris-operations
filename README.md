@@ -88,6 +88,8 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - `POST /api/auth/register`
 - `POST /api/auth/verify`
 - `POST /api/auth/login`
+- `POST /api/auth/request-password-reset` — self-service reset request with generic responses and rate limiting.
+- `POST /api/auth/reset-password` — consume the one-use, 30-minute link sent through Brevo.
 - `POST /api/auth/2fa/verify` — complete a password sign-in using an authenticator or recovery code.
 - `/api/auth/2fa/*` — inspect status, begin setup, verify/enable, and disable 2FA for the current account.
 - `POST /api/auth/logout`
@@ -105,20 +107,24 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - `POST /api/auth/accept-invite`
 - `GET /api/leave`
 - `GET /api/tasks`
-- `GET|POST /api/expenses`
-- `GET|PATCH /api/requests`
+- `GET|POST /api/expenses`, `GET /api/expenses/export`, `GET /api/expenses/:id/receipt`, and `GET|PATCH /api/expense-policy` — tenant-scoped CSV and private R2 receipts, with enforced claim limits and receipt requirements.
+- `GET|POST /api/requests`, `GET /api/requests/:id/history`, and `PATCH /api/requests/:id` — filterable approvals and tenant-scoped audit history.
+- `/api/attendance/*` — employee time-clock, HR shift schedules, and manager review of submitted time records.
 - `GET|POST /api/assets`
 - `GET|POST /api/vendors`
 - `GET|POST /api/tickets`
 - `GET /api/calendar`
-- `GET|POST /api/customers`
+- `GET|POST /api/customers` and `PATCH /api/customers/:id` — tenant-scoped editable profiles and won-date reporting.
 - `GET|POST /api/files`
 - `/api/settings/organization` — organization profile and trial subscription details.
 - `/api/payroll/*` — policy, employee remuneration/bank records, recurring components, runs, employee-owned payslips, and payroll register exports. Bank details are never included in exports.
 
 ## Operational workflows now included
 
-- Expense submission creates a D1 expense record and a linked approval request.
+- Expense submission creates a D1 expense record and a linked approval request. Optional or policy-required PDF/JPEG/PNG/WebP receipts are stored in private R2; CSV export is permission-scoped and protects against spreadsheet formula injection.
+- Expense policies can enforce per-claim limits and receipt submission. The policies do not replace finance approval or local accounting controls.
+- Attendance supports in/out time-clock entries, tenant-admin shift schedules, review, and overtime measured against the configured shift. Overtime is not calculated where no matching schedule exists; local legal and contractual rules must be checked by HR. Overnight shifts and retroactive employee-edited timesheets are not yet supported.
+- CRM tracks the date a customer enters the won stage and calculates current-quarter won totals from actual records. Authorized operations managers can edit customer profiles.
 - General operational requests can be submitted from web or mobile; financial requests are routed to the CEO, and other requests to their selected role. Approvers are alerted through both email and the in-app inbox.
 - Approval decisions update both the request and its source expense, and write to the audit log.
 - Asset register supports ownership, location, lifecycle status and current value.
@@ -127,10 +133,10 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - Calendar combines meetings, leave and training events.
 - CRM customer pipeline supports lead, qualified, proposal, negotiation and won stages.
 
-Implemented HR talent modules include line-manager assignments, organization/team/employee KPI libraries, multi-rater 360 feedback, employee appraisal decisions, PIP plans and check-ins, recruitment candidate pipelines, and course assignment/completion tracking. Paid-plan checkout, password recovery, and AI talent tools remain future work.
+Implemented HR talent modules include line-manager assignments, organization/team/employee KPI libraries, multi-rater 360 feedback, employee appraisal decisions, PIP plans and check-ins, recruitment candidate pipelines, and course assignment/completion tracking. Self-service password recovery is implemented with Brevo and an enumeration-safe response. Paid subscription onboarding is sales-led and manual; there is no online checkout or automatic bank transfer. Google/Outlook two-way calendar sync remains unconfigured pending provider selection and OAuth credentials. The Expo app is separate from the web deployment; store submission and OS push notifications still require the organization’s Apple/Google/EAS accounts and push credentials.
 
 ## Payroll policy setup
 
 Payroll does not preload statutory tax rates or pension percentages. Configure the organization's effective policy for its country, region and payroll period, then validate it with a local payroll/tax professional before approval. Tax bands are progressive and entered with ascending `upTo` thresholds and a final `null` threshold, for example `[ { "upTo": 1000000, "rate": 0.07 }, { "upTo": null, "rate": 0.1 } ]`. Rates are decimals. Employee base remuneration and recurring amounts are entered per pay period. Admins may store bank details encrypted for record purposes; account numbers are masked on screen and excluded from generated documents/exports. The app documents remuneration, prepares employee payslips and records approval/payment status; actual bank transfers are outside the platform.
 
-Paid-plan checkout and extended talent modules are not yet integrated. New trials last 15 days from email verification. Expired trials are automatically suspended by the hourly Worker cron and cannot sign in; existing sessions are revoked. Organizations must contact Zyntris to arrange a paid plan before expiry.
+Paid plans are activated manually by the Business Development Manager; this application does not collect subscription payments. New trials last 15 days from email verification. Expired trials are automatically suspended by the hourly Worker cron and cannot sign in; existing sessions are revoked. Organizations should arrange their plan before expiry.

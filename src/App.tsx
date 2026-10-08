@@ -7,7 +7,7 @@ import {
   Sparkles, TrendingUp, UploadCloud, UserRound, Users, WalletCards, X,
 } from "lucide-react";
 import { demoDashboard, demoEmployees, demoUser } from "./data/demo";
-import { OperationalWorkspace } from "./operations";
+import { AttendanceWorkspace, OperationalWorkspace } from "./operations";
 import { Onboarding } from "./onboarding";
 import { EmployeePayslips, PayrollWorkspace } from "./payroll";
 import { PlatformAdminWorkspace } from "./platform-admin";
@@ -28,6 +28,7 @@ const navItems: NavItem[] = [
   { id: "appraisals", label: "Performance & appraisals", icon: Award, section: "People" },
   { id: "talent", label: "Teams & talent", icon: Users, section: "People" },
   { id: "leave", label: "Leave & attendance", icon: CalendarDays, badge: "12", section: "People" },
+  { id: "attendance", label: "Time & shifts", icon: Clock3, section: "People" },
   { id: "payroll", label: "Payroll", icon: WalletCards, section: "People" },
   { id: "projects", label: "Projects", icon: FolderKanban, section: "Work" },
   { id: "tasks", label: "Tasks", icon: ListTodo, section: "Work" },
@@ -161,7 +162,7 @@ export default function App() {
     if (item.id === "platform") return Boolean(user?.isPlatformAdmin);
     if (item.id === "settings") return userPermissions.has("settings.manage");
     if (item.id === "security") return true;
-    if (["employees", "leave"].includes(item.id)) return userPermissions.has("employees.view");
+    if (["employees", "leave", "attendance"].includes(item.id)) return userPermissions.has("employees.view");
     if (item.id === "payroll") return userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") || userPermissions.has("payroll.self.view");
     if (item.id === "appraisals") return userPermissions.has("appraisals.view") || userPermissions.has("appraisals.manage") || userPermissions.has("appraisals.self.view");
     if (item.id === "talent") return userPermissions.has("hr.talent.view") || userPermissions.has("hr.talent.manage");
@@ -247,6 +248,7 @@ export default function App() {
           {page === "appraisals" && <Appraisals user={{ id: user.id, permissions: user.permissions }} onToast={setToast} />}
           {page === "talent" && <HRTalentWorkspace user={{ id: user.id, permissions: user.permissions || [] }} employees={employees} onToast={setToast} onEmployeesUpdated={async () => { try { const people = await api<{ data: Employee[] }>("/api/employees"); setEmployees(people.data); } catch { /* handled in the workspace */ } }} />}
           {page === "leave" && <WorkLeaveWorkspace canManage={userPermissions.has("employees.manage") || userPermissions.has("hr.onboarding.approve")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
+          {page === "attendance" && <AttendanceWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "tasks" && <WorkTasksWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "projects" && <WorkProjectsWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "calendar" && <WorkCalendarWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}

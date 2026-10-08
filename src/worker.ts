@@ -40,7 +40,7 @@ const BACKUP_TABLES = [
   "employee_pay_profiles", "payroll_components", "employee_pay_components", "payroll_runs",
   "payroll_run_items", "appraisal_cycles", "appraisals", "performance_kpis", "appraisal_kpi_scores",
   "appraisal_360_feedback", "performance_improvement_plans", "pip_check_ins", "job_requisitions",
-  "job_candidates", "learning_courses", "learning_enrollments", "audit_logs",
+  "job_candidates", "learning_courses", "learning_enrollments", "attendance_records", "shift_schedules", "audit_logs",
 ] as const;
 
 const isoDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
@@ -350,8 +350,8 @@ async function sendPasswordResetEmail(env: Env, email: string, fullName: string,
       headers: { "api-key": env.BREVO_API_KEY, "content-type": "application/json", accept: "application/json" },
       body: JSON.stringify({
         sender: brevoSender(env), to: [{ email, name: fullName }], subject: "Reset your Zyntris password",
-        textContent: `A Zyntris platform administrator requested a password reset for your ${organizationName} account. Set a new password here: ${url}. This one-time link expires in 30 minutes. If you did not expect this email, contact your organization administrator.`,
-        htmlContent: `<p>Hello ${escapeHtml(fullName)},</p><p>A Zyntris platform administrator requested a password reset for your <strong>${escapeHtml(organizationName)}</strong> account.</p><p><a href="${url}">Set a new password</a></p><p>This one-time link expires in 30 minutes. If you did not expect this email, contact your organization administrator.</p>`,
+        textContent: `You requested a password reset for your ${organizationName} Zyntris account. Set a new password here: ${url}. This one-time link expires in 30 minutes. If you did not request this, you can ignore this email.`,
+        htmlContent: `<p>Hello ${escapeHtml(fullName)},</p><p>You requested a password reset for your <strong>${escapeHtml(organizationName)}</strong> Zyntris account.</p><p><a href="${url}">Set a new password</a></p><p>This one-time link expires in 30 minutes. If you did not request this, you can ignore this email.</p>`,
       }),
     });
     if (response.ok) return { accepted: true as const };
@@ -521,6 +521,28 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     ]);
     const session = await createSession(env, row.userId, row.organizationId);
     return cookieResponse({ ok: true }, session);
+  }
+  if (request.method === "POST" && path === "/api/auth/request-password-reset") {
+    if (!mobile && !originAllowed(request, env)) return error("Request origin rejected", 403);
+    if (!(await consumeAuthLimit(env, request, "forgot-password", 5, 30))) return error("Too many password reset requests. Try again later.", 429);
+    const body = await request.json<{ email?: string }>();
+    const email = body.email?.trim().toLowerCase();
+    if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return error("Enter a valid email address.");
+    const user = await env.DB.prepare(`SELECT u.id as userId, u.email, u.full_name as fullName, m.organization_id as organizationId, o.name as organizationName FROM users u JOIN memberships m ON m.user_id = u.id JOIN organizations o ON o.id = m.organization_id WHERE lower(u.email) = ? AND u.status = 'active' AND m.status = 'active' ORDER BY m.created_at LIMIT 1`).bind(email).first<{ userId: string; email: string; fullName: string; organizationId: string; organizationName: string }>();
+    if (user) {
+      const token = [...crypto.getRandomValues(new Uint8Array(32))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+      const tokenId = `reset-${crypto.randomUUID()}`;
+      await env.DB.prepare(`DELETE FROM password_reset_tokens WHERE user_id = ? AND used_at IS NULL`).bind(user.userId).run();
+      await env.DB.prepare(`INSERT INTO password_reset_tokens (id, user_id, organization_id, token_hash, expires_at) VALUES (?, ?, ?, ?, datetime('now', '+30 minutes'))`).bind(tokenId, user.userId, user.organizationId, await hashToken(token)).run();
+      const delivered = await sendPasswordResetEmail(env, user.email, user.fullName, user.organizationName, token);
+      if (!delivered.accepted) {
+        await env.DB.prepare(`DELETE FROM password_reset_tokens WHERE id = ?`).bind(tokenId).run();
+        console.warn("Self-service password reset email could not be delivered", delivered.message);
+      } else {
+        await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id) VALUES (?, ?, NULL, 'password_reset_requested', 'authentication', 'user', ?)`).bind(`audit-${crypto.randomUUID()}`, user.organizationId, user.userId).run();
+      }
+    }
+    return json({ ok: true });
   }
   if (request.method === "POST" && path === "/api/auth/reset-password") {
     if (!mobile && !originAllowed(request, env)) return error("Request origin rejected", 403);
@@ -1836,6 +1858,78 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ ok: true, invitationEmailAccepted: true, invitationEmailStatus: "accepted", emailMessageId: delivery.messageId || null });
   }
 
+  if (request.method === "GET" && path === "/api/attendance") {
+    if (!hasPermission(context, "employees.view")) return error("You do not have permission to view attendance.", 403);
+    const canViewAll = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve") ? 1 : 0;
+    const result = await env.DB.prepare(`SELECT a.id, a.work_date as workDate, a.clock_in_at as clockInAt, a.clock_out_at as clockOutAt, a.break_minutes as breakMinutes, a.worked_minutes as workedMinutes, a.overtime_minutes as overtimeMinutes, a.status, a.note, e.id as employeeId, e.first_name || ' ' || e.last_name as employee, u.full_name as reviewer FROM attendance_records a JOIN employees e ON e.id = a.employee_id LEFT JOIN users u ON u.id = a.reviewer_id WHERE a.organization_id = ? AND (? = 1 OR e.user_id = ?) ORDER BY a.work_date DESC, a.clock_in_at DESC LIMIT 200`).bind(context.organizationId, canViewAll, context.userId).all();
+    return json({ data: result.results || [], canManage: Boolean(canViewAll) });
+  }
+
+  if (request.method === "GET" && path === "/api/attendance/shifts") {
+    if (!hasPermission(context, "employees.view")) return error("You do not have permission to view shift schedules.", 403);
+    const result = await env.DB.prepare(`SELECT s.id, s.employee_id as employeeId, COALESCE(e.first_name || ' ' || e.last_name, 'All employees') as employee, s.weekday, s.start_time as startTime, s.end_time as endTime, s.break_minutes as breakMinutes, s.effective_from as effectiveFrom, s.effective_to as effectiveTo FROM shift_schedules s LEFT JOIN employees e ON e.id = s.employee_id WHERE s.organization_id = ? ORDER BY s.weekday, s.start_time LIMIT 200`).bind(context.organizationId).all();
+    return json({ data: result.results || [] });
+  }
+
+  if (request.method === "POST" && path === "/api/attendance/shifts") {
+    if (!hasPermission(context, "employees.manage")) return error("HR manager permission is required to create shifts.", 403);
+    const body = await request.json<{ employeeId?: string; weekday?: number; startTime?: string; endTime?: string; breakMinutes?: number; effectiveFrom?: string; effectiveTo?: string | null }>();
+    const weekday = Number(body.weekday); const breakMinutes = Number(body.breakMinutes || 0); const timePattern = /^([01]\d|2[0-3]):[0-5]\d$/;
+    if (!Number.isInteger(weekday) || weekday < 0 || weekday > 6 || !body.startTime || !body.endTime || !timePattern.test(body.startTime) || !timePattern.test(body.endTime) || body.startTime >= body.endTime || !Number.isInteger(breakMinutes) || breakMinutes < 0 || breakMinutes > 240 || !body.effectiveFrom || !isoDate(body.effectiveFrom) || body.effectiveTo && (!isoDate(body.effectiveTo) || body.effectiveTo < body.effectiveFrom)) return error("Enter a valid weekday, same-day shift times, break duration and effective date range.");
+    if (body.employeeId && !await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND deleted_at IS NULL`).bind(body.employeeId, context.organizationId).first()) return error("The selected employee was not found in this organization.", 404);
+    const id = `shift-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO shift_schedules (id, organization_id, employee_id, weekday, start_time, end_time, break_minutes, effective_from, effective_to, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.employeeId || null, weekday, body.startTime, body.endTime, breakMinutes, body.effectiveFrom, body.effectiveTo || null, context.userId).run();
+    await audit(env, context, "created", "shift_schedules", id, body);
+    return json({ id }, { status: 201 });
+  }
+
+  if (request.method === "POST" && path === "/api/attendance/clock-in") {
+    if (!hasPermission(context, "employees.view")) return error("Only organization members can clock in.", 403);
+    const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
+    if (!employee) return error("Your account must be linked to an active employee profile before clocking in.", 409);
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Africa/Lagos", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+    const workDate = `${parts.find((part) => part.type === "year")?.value}-${parts.find((part) => part.type === "month")?.value}-${parts.find((part) => part.type === "day")?.value}`;
+    const existing = await env.DB.prepare(`SELECT id, status FROM attendance_records WHERE organization_id = ? AND employee_id = ? AND work_date = ?`).bind(context.organizationId, employee.id, workDate).first<{ id: string; status: string }>();
+    if (existing) return error(existing.status === "in_progress" ? "You are already clocked in today." : "An attendance record already exists for today. Contact HR if it needs correction.", 409);
+    const id = `attendance-${crypto.randomUUID()}`; const now = new Date().toISOString();
+    await env.DB.prepare(`INSERT INTO attendance_records (id, organization_id, employee_id, work_date, clock_in_at, status) VALUES (?, ?, ?, ?, ?, 'in_progress')`).bind(id, context.organizationId, employee.id, workDate, now).run();
+    await audit(env, context, "clocked_in", "attendance", id, { workDate, clockInAt: now });
+    return json({ id, workDate, clockInAt: now, status: "in_progress" }, { status: 201 });
+  }
+
+  if (request.method === "POST" && path === "/api/attendance/clock-out") {
+    if (!hasPermission(context, "employees.view")) return error("Only organization members can clock out.", 403);
+    const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
+    if (!employee) return error("Your account must be linked to an active employee profile before clocking out.", 409);
+    const current = await env.DB.prepare(`SELECT id, clock_in_at as clockInAt, work_date as workDate FROM attendance_records WHERE organization_id = ? AND employee_id = ? AND status = 'in_progress' ORDER BY clock_in_at DESC LIMIT 1`).bind(context.organizationId, employee.id).first<{ id: string; clockInAt: string; workDate: string }>();
+    if (!current) return error("You do not have an active clock-in to end.", 409);
+    const now = new Date(); const elapsed = Math.floor((now.getTime() - new Date(current.clockInAt).getTime()) / 60000);
+    if (!Number.isFinite(elapsed) || elapsed <= 0 || elapsed > 24 * 60) return error("This clock-in duration is invalid. Ask HR to correct the time record.", 409);
+    const weekdayParts = new Intl.DateTimeFormat("en-US", { timeZone: "Africa/Lagos", weekday: "short" }).formatToParts(new Date(`${current.workDate}T12:00:00Z`));
+    const weekday = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(weekdayParts.find((part) => part.type === "weekday")?.value || "");
+    const shift = await env.DB.prepare(`SELECT break_minutes as breakMinutes, start_time as startTime, end_time as endTime FROM shift_schedules WHERE organization_id = ? AND (employee_id = ? OR employee_id IS NULL) AND weekday = ? AND effective_from <= ? AND (effective_to IS NULL OR effective_to >= ?) ORDER BY CASE WHEN employee_id = ? THEN 0 ELSE 1 END LIMIT 1`).bind(context.organizationId, employee.id, weekday, current.workDate, current.workDate, employee.id).first<{ breakMinutes: number; startTime: string; endTime: string }>();
+    const breakMinutes = shift?.breakMinutes || 0; const workedMinutes = Math.max(0, elapsed - breakMinutes); const shiftMinutes = shift ? (Number(shift.endTime.slice(0, 2)) * 60 + Number(shift.endTime.slice(3)) - Number(shift.startTime.slice(0, 2)) * 60 - Number(shift.startTime.slice(3)) - breakMinutes) : null; const overtimeMinutes = shiftMinutes === null ? null : Math.max(0, workedMinutes - shiftMinutes);
+    const changed = await env.DB.prepare(`UPDATE attendance_records SET clock_out_at = ?, break_minutes = ?, worked_minutes = ?, overtime_minutes = ?, status = 'submitted', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND employee_id = ? AND status = 'in_progress'`).bind(now.toISOString(), breakMinutes, workedMinutes, overtimeMinutes, current.id, context.organizationId, employee.id).run();
+    if (!changed.meta.changes) return error("The clock-in record changed. Refresh and try again.", 409);
+    await audit(env, context, "clocked_out", "attendance", current.id, { clockOutAt: now.toISOString(), workedMinutes, overtimeMinutes });
+    return json({ ok: true, workedMinutes, overtimeMinutes });
+  }
+
+  const attendanceReviewMatch = path.match(/^\/api\/attendance\/([^/]+)$/);
+  if (request.method === "PATCH" && attendanceReviewMatch) {
+    if (!hasPermission(context, "employees.manage") && !hasPermission(context, "hr.onboarding.approve")) return error("HR manager permission is required to review attendance.", 403);
+    const body = await request.json<{ status?: string; note?: string }>();
+    if (body.status !== "approved" && body.status !== "rejected") return error("Choose approved or rejected.");
+    const row = await env.DB.prepare(`SELECT a.id, a.status, e.user_id as userId FROM attendance_records a JOIN employees e ON e.id = a.employee_id WHERE a.id = ? AND a.organization_id = ?`).bind(attendanceReviewMatch[1], context.organizationId).first<{ id: string; status: string; userId: string | null }>();
+    if (!row) return error("Attendance record not found.", 404);
+    if (row.userId === context.userId) return error("You cannot review your own attendance record.", 403);
+    if (row.status !== "submitted") return error("Only submitted attendance records can be reviewed.", 409);
+    const changed = await env.DB.prepare(`UPDATE attendance_records SET status = ?, reviewer_id = ?, note = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'submitted'`).bind(body.status, context.userId, body.note?.trim().slice(0, 1000) || null, row.id, context.organizationId).run();
+    if (!changed.meta.changes) return error("The record changed. Refresh and try again.", 409);
+    await audit(env, context, body.status, "attendance", row.id, { note: body.note || null });
+    return json({ ok: true, status: body.status });
+  }
+
   if (request.method === "GET" && path === "/api/leave/types") {
     const result = await env.DB.prepare(`SELECT id, name, days_per_year as daysPerYear, requires_approval as requiresApproval FROM leave_types WHERE organization_id = ? ORDER BY name`).bind(context.organizationId).all();
     return json({ data: result.results || [] });
@@ -2059,19 +2153,59 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ ok: true });
   }
 
+  if (request.method === "GET" && path === "/api/expense-policy") {
+    if (!hasPermission(context, "expenses.view")) return error("You do not have permission to view expense policy.", 403);
+    const policy = await env.DB.prepare(`SELECT expense_max_amount as maxAmount, expense_receipt_required as receiptRequired FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ maxAmount: number | null; receiptRequired: number }>();
+    return json({ maxAmount: policy?.maxAmount ?? null, receiptRequired: Boolean(policy?.receiptRequired) });
+  }
+
+  if (request.method === "PATCH" && path === "/api/expense-policy") {
+    if (!hasPermission(context, "expenses.manage")) return error("Expense manager permission is required to change policy.", 403);
+    const body = await request.json<{ maxAmount?: number | null; receiptRequired?: boolean }>();
+    const existing = await env.DB.prepare(`SELECT expense_max_amount as maxAmount, expense_receipt_required as receiptRequired FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ maxAmount: number | null; receiptRequired: number }>();
+    const maxAmount = body.maxAmount === undefined ? (existing?.maxAmount ?? null) : body.maxAmount === null || body.maxAmount === 0 ? null : Number(body.maxAmount);
+    if (maxAmount !== null && (!Number.isFinite(maxAmount) || maxAmount < 0 || maxAmount > 1_000_000_000_000)) return error("Enter a valid positive expense limit, or leave it blank.");
+    if (body.receiptRequired !== undefined && typeof body.receiptRequired !== "boolean") return error("Receipt requirement must be enabled or disabled.");
+    const receiptRequired = body.receiptRequired ?? Boolean(existing?.receiptRequired);
+    await env.DB.prepare(`UPDATE organization_settings SET expense_max_amount = ?, expense_receipt_required = ? WHERE organization_id = ?`).bind(maxAmount, receiptRequired ? 1 : 0, context.organizationId).run();
+    await audit(env, context, "updated", "expense_policy", context.organizationId, { maxAmount, receiptRequired });
+    return json({ maxAmount, receiptRequired });
+  }
+
+  if (request.method === "GET" && path === "/api/expenses/export") {
+    if (!hasPermission(context, "expenses.view")) return error("You do not have permission to export expenses.", 403);
+    const result = await env.DB.prepare(`SELECT x.id, e.first_name || ' ' || e.last_name as employee, x.category, x.amount, x.currency, x.expense_date as expenseDate, x.description, x.status, p.name as project FROM expenses x JOIN employees e ON e.id = x.employee_id LEFT JOIN approval_requests a ON a.source_record_id = x.id AND a.organization_id = x.organization_id LEFT JOIN projects p ON p.id = json_extract(a.metadata_json, '$.project') AND p.organization_id = x.organization_id WHERE x.organization_id = ? AND (? = 1 OR e.user_id = ?) ORDER BY x.created_at DESC`).bind(context.organizationId, hasPermission(context, "expenses.manage") ? 1 : 0, context.userId).all<{ id: string; employee: string; category: string; amount: number; currency: string; expenseDate: string; description: string; status: string; project: string | null }>();
+    const cell = (value: unknown) => { let text = String(value ?? ""); if (/^[\s]*[=+@-]/.test(text)) text = `'${text}`; return `"${text.replace(/"/g, '""').replace(/[\r\n]+/g, " ")}"`; };
+    const rows = [["Expense ID", "Employee", "Category", "Date", "Amount", "Currency", "Description", "Status", "Project"], ...(result.results || []).map((row) => [row.id, row.employee, row.category, row.expenseDate, row.amount, row.currency, row.description, row.status, row.project || ""])];
+    const csv = rows.map((row) => row.map(cell).join(",")).join("\r\n");
+    return new Response(`\uFEFF${csv}`, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": 'attachment; filename="zyntris-expenses.csv"', "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
+  }
+
   if (request.method === "GET" && path === "/api/expenses") {
     if (!hasPermission(context, "expenses.view")) return error("You do not have permission to view expenses.", 403);
-    const result = await env.DB.prepare(`SELECT x.id, e.first_name || ' ' || e.last_name as employee, x.category, x.amount, x.currency, x.expense_date as expenseDate, x.description, x.status, p.name as project FROM expenses x JOIN employees e ON e.id = x.employee_id LEFT JOIN approval_requests a ON a.source_record_id = x.id AND a.organization_id = x.organization_id LEFT JOIN projects p ON p.id = json_extract(a.metadata_json, '$.project') AND p.organization_id = x.organization_id WHERE x.organization_id = ? AND (? = 1 OR e.user_id = ?) ORDER BY x.created_at DESC LIMIT 100`).bind(context.organizationId, hasPermission(context, "expenses.manage") ? 1 : 0, context.userId).all();
+    const result = await env.DB.prepare(`SELECT x.id, e.first_name || ' ' || e.last_name as employee, x.category, x.amount, x.currency, x.expense_date as expenseDate, x.description, x.status, x.receipt_key IS NOT NULL as receiptAvailable, p.name as project FROM expenses x JOIN employees e ON e.id = x.employee_id LEFT JOIN approval_requests a ON a.source_record_id = x.id AND a.organization_id = x.organization_id LEFT JOIN projects p ON p.id = json_extract(a.metadata_json, '$.project') AND p.organization_id = x.organization_id WHERE x.organization_id = ? AND (? = 1 OR e.user_id = ?) ORDER BY x.created_at DESC LIMIT 100`).bind(context.organizationId, hasPermission(context, "expenses.manage") ? 1 : 0, context.userId).all();
     return json({ data: result.results || [] });
   }
 
   if (request.method === "POST" && path === "/api/expenses") {
     if (!hasPermission(context, "employees.view")) return error("Only organization members can submit expense records.", 403);
-    const body = await request.json<{ category?: string; amount?: number; expenseDate?: string; description?: string; project?: string }>();
+    let body: { category?: string; amount?: number | string; expenseDate?: string; description?: string; project?: string };
+    let receipt: File | null = null;
+    if ((request.headers.get("content-type") || "").toLowerCase().includes("multipart/form-data")) {
+      const form = await request.formData();
+      const file = form.get("receipt");
+      receipt = file instanceof File && file.size > 0 ? file : null;
+      body = { category: String(form.get("category") || ""), amount: String(form.get("amount") || ""), expenseDate: String(form.get("expenseDate") || ""), description: String(form.get("description") || ""), project: String(form.get("project") || "") || undefined };
+    } else body = await request.json();
     const amount = Number(body.amount);
     const category = body.category?.trim(); const description = body.description?.trim();
     if (!category || category.length > 80 || !Number.isFinite(amount) || amount <= 0 || amount > 1_000_000_000_000 || !body.expenseDate || !isoDate(body.expenseDate) || !description || description.length > 1000) return error("Enter a valid category, amount, expense date and description. Amounts must be positive and the expense date must be valid.");
     if (body.expenseDate > new Date().toISOString().slice(0, 10)) return error("Expense date cannot be in the future.");
+    const policy = await env.DB.prepare(`SELECT expense_max_amount as maxAmount, expense_receipt_required as receiptRequired FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ maxAmount: number | null; receiptRequired: number }>();
+    if (policy?.maxAmount && amount > policy.maxAmount) return error(`This claim exceeds the organization’s per-claim limit of ₦${policy.maxAmount.toLocaleString("en-NG")}.`, 400);
+    if (policy?.receiptRequired && !receipt) return error("A receipt attachment is required by your organization’s expense policy.");
+    if (receipt && (receipt.size > 10 * 1024 * 1024 || !["image/jpeg", "image/png", "image/webp", "application/pdf"].includes(receipt.type))) return error("Attach a JPEG, PNG, WebP or PDF receipt no larger than 10MB.");
+    if (receipt && !env.FILES) return error("Receipt storage is unavailable. Contact your administrator.", 503);
     const employee = await env.DB.prepare(`SELECT id, first_name as firstName, last_name as lastName FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string; firstName: string; lastName: string }>();
     const employeeId = employee?.id;
     if (!employeeId) return error("Your account must be linked to an active employee profile before submitting an expense. Ask your HR administrator to complete your profile.", 409);
@@ -2080,8 +2214,10 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (duplicate) return error("A matching expense is already on file. Check its status before submitting again.", 409);
     const id = `expense-${crypto.randomUUID()}`;
     const requestIdValue = `request-${crypto.randomUUID()}`;
+    const receiptKey = receipt ? `expense-receipts/${context.organizationId}/${id}/${crypto.randomUUID()}` : null;
+    if (receipt && receiptKey) await env.FILES.put(receiptKey, receipt.stream(), { httpMetadata: { contentType: receipt.type } });
     await env.DB.batch([
-      env.DB.prepare(`INSERT INTO expenses (id, organization_id, employee_id, category, amount, currency, expense_date, description, status) VALUES (?, ?, ?, ?, ?, 'NGN', ?, ?, 'submitted')`).bind(id, context.organizationId, employeeId, category, amount, body.expenseDate, description),
+      env.DB.prepare(`INSERT INTO expenses (id, organization_id, employee_id, category, amount, currency, expense_date, description, receipt_key, status) VALUES (?, ?, ?, ?, ?, 'NGN', ?, ?, ?, 'submitted')`).bind(id, context.organizationId, employeeId, category, amount, body.expenseDate, description, receiptKey),
       env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'CEO', 'pending', 1, ?)`).bind(requestIdValue, context.organizationId, id, description, context.userId, amount, JSON.stringify({ category, project: body.project || null, approvalPolicy: ["CEO"] })),
     ]);
     await audit(env, context, "submitted", "expenses", id, { category, amount, description });
@@ -2089,9 +2225,28 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ id, requestId: requestIdValue, status: "submitted", employee: `${employee.firstName} ${employee.lastName}` }, { status: 201 });
   }
 
+  const expenseReceiptMatch = path.match(/^\/api\/expenses\/([^/]+)\/receipt$/);
+  if (request.method === "GET" && expenseReceiptMatch) {
+    const record = await env.DB.prepare(`SELECT x.receipt_key as receiptKey, x.employee_id as employeeId, e.user_id as userId FROM expenses x JOIN employees e ON e.id = x.employee_id WHERE x.id = ? AND x.organization_id = ?`).bind(expenseReceiptMatch[1], context.organizationId).first<{ receiptKey: string | null; employeeId: string; userId: string | null }>();
+    if (!record || !record.receiptKey) return error("Receipt not found.", 404);
+    if (record.userId !== context.userId && !hasPermission(context, "expenses.manage")) return error("You do not have permission to view this receipt.", 403);
+    const object = await env.FILES.get(record.receiptKey);
+    if (!object) return error("Receipt file is unavailable.", 404);
+    return new Response(object.body, { headers: { "content-type": object.httpMetadata?.contentType || "application/octet-stream", "content-disposition": "attachment; filename=expense-receipt", "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
+  }
+
   const expenseMatch = path.match(/^\/api\/expenses\/([^/]+)$/);
   if (request.method === "PATCH" && expenseMatch) {
     return error("Expense decisions must be made from the role-checked approval queue.", 409);
+  }
+
+  const requestHistoryMatch = path.match(/^\/api\/requests\/([^/]+)\/history$/);
+  if (request.method === "GET" && requestHistoryMatch) {
+    const requestRow = await env.DB.prepare(`SELECT id, requester_id as requesterId, request_type as requestType, title, created_at as createdAt FROM approval_requests WHERE id = ? AND organization_id = ? AND (? = 1 OR requester_id = ?)`).bind(requestHistoryMatch[1], context.organizationId, hasPermission(context, "requests.manage") ? 1 : 0, context.userId).first<{ id: string; requesterId: string; requestType: string; title: string; createdAt: string }>();
+    if (!requestRow) return error("Request not found.", 404);
+    const history = await env.DB.prepare(`SELECT a.id, a.action, a.module, a.new_value_json as details, a.created_at as createdAt, u.full_name as actor FROM audit_logs a LEFT JOIN users u ON u.id = a.actor_user_id WHERE a.organization_id = ? AND a.module = 'requests' AND a.record_id = ? ORDER BY a.created_at DESC LIMIT 50`).bind(context.organizationId, requestRow.id).all();
+    const initial = { id: `created-${requestRow.id}`, action: "submitted", module: "requests", details: JSON.stringify({ requestType: requestRow.requestType, title: requestRow.title }), createdAt: requestRow.createdAt, actor: null };
+    return json({ data: [initial, ...(history.results || [])] });
   }
 
   if (request.method === "GET" && path === "/api/requests") {
@@ -2304,17 +2459,30 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "GET" && path === "/api/customers") {
-    const result = await env.DB.prepare(`SELECT c.id, c.name, c.company, c.email, c.stage, c.value, u.full_name as owner, c.last_activity_at as lastActivity FROM customers c LEFT JOIN users u ON u.id = c.owner_id WHERE c.organization_id = ? ORDER BY c.created_at DESC`).bind(context.organizationId).all();
+    const result = await env.DB.prepare(`SELECT c.id, c.name, c.company, c.email, c.stage, c.value, u.full_name as owner, c.last_activity_at as lastActivity, c.won_at as wonAt FROM customers c LEFT JOIN users u ON u.id = c.owner_id WHERE c.organization_id = ? ORDER BY c.created_at DESC`).bind(context.organizationId).all();
     return json({ data: result.results || [] });
   }
 
   if (request.method === "POST" && path === "/api/customers") {
     const body = await request.json<{ name?: string; company?: string; email?: string; stage?: string; value?: number }>();
-    if (!body.name || !body.email) return error("name and email are required");
+    if (!body.name?.trim() || body.name.trim().length > 120 || !body.email || body.email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email) || body.company && body.company.length > 160 || !["lead", "qualified", "proposal", "negotiation", "won", "lost"].includes(body.stage || "lead") || !Number.isFinite(Number(body.value || 0)) || Number(body.value || 0) < 0) return error("Enter a valid contact name, email, stage, and non-negative deal value.");
     const id = `customer-${crypto.randomUUID().slice(0, 8)}`;
-    await env.DB.prepare(`INSERT INTO customers (id, organization_id, name, company, email, stage, value, owner_id, last_activity_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, date('now'))`).bind(id, context.organizationId, body.name, body.company || null, body.email, body.stage || "lead", Number(body.value || 0), context.userId).run();
+    await env.DB.prepare(`INSERT INTO customers (id, organization_id, name, company, email, stage, value, owner_id, last_activity_at, won_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, date('now'), CASE WHEN ? = 'won' THEN CURRENT_TIMESTAMP ELSE NULL END)`).bind(id, context.organizationId, body.name.trim(), body.company?.trim() || null, body.email.trim().toLowerCase(), body.stage || "lead", Number(body.value || 0), context.userId, body.stage || "lead").run();
     await audit(env, context, "created", "customers", id, body);
     return json({ id }, { status: 201 });
+  }
+
+  const customerMatch = path.match(/^\/api\/customers\/([^/]+)$/);
+  if (request.method === "PATCH" && customerMatch) {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to edit customer profiles.", 403);
+    const body = await request.json<{ name?: string; company?: string; email?: string; stage?: string; value?: number }>();
+    const current = await env.DB.prepare(`SELECT id, name, company, email, stage, value FROM customers WHERE id = ? AND organization_id = ?`).bind(customerMatch[1], context.organizationId).first<{ id: string; name: string; company: string | null; email: string; stage: string; value: number }>();
+    if (!current) return error("Customer not found.", 404);
+    const name = body.name?.trim() ?? current.name; const company = body.company === undefined ? current.company : body.company.trim() || null; const email = body.email?.trim().toLowerCase() ?? current.email; const stage = body.stage ?? current.stage; const value = body.value === undefined ? current.value : Number(body.value);
+    if (!name || name.length > 120 || company && company.length > 160 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !["lead", "qualified", "proposal", "negotiation", "won", "lost"].includes(stage) || !Number.isFinite(value) || value < 0 || value > 1_000_000_000_000) return error("Enter a valid customer profile and non-negative deal value.");
+    await env.DB.prepare(`UPDATE customers SET name = ?, company = ?, email = ?, stage = ?, value = ?, last_activity_at = date('now'), won_at = CASE WHEN ? = 'won' THEN CASE WHEN stage = 'won' AND won_at IS NOT NULL THEN won_at ELSE CURRENT_TIMESTAMP END ELSE NULL END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(name, company, email, stage, value, stage, current.id, context.organizationId).run();
+    await audit(env, context, "updated", "customers", current.id, { name, company, email, stage, value }, current);
+    return json({ ok: true });
   }
 
   if (request.method === "GET" && path === "/api/files") {

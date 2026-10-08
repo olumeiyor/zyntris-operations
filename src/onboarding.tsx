@@ -13,7 +13,7 @@ async function authRequest(path: string, body: Record<string, string>) {
 export function Onboarding({ onAuthenticated, initialNotice, adminPortal = false }: AuthFlowProps) {
   const inviteToken = new URLSearchParams(window.location.search).get("invite") || "";
   const resetToken = new URLSearchParams(window.location.search).get("reset") || "";
-  const [mode, setMode] = useState<"signup" | "login" | "demo" | "invite" | "reset">(resetToken ? "reset" : inviteToken ? "invite" : adminPortal ? "login" : "signup");
+  const [mode, setMode] = useState<"signup" | "login" | "demo" | "invite" | "reset" | "forgot">(resetToken ? "reset" : inviteToken ? "invite" : adminPortal ? "login" : "signup");
   const [message, setMessage] = useState(initialNotice || "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -36,6 +36,9 @@ export function Onboarding({ onAuthenticated, initialNotice, adminPortal = false
         await authRequest("/api/auth/reset-password", { token: resetToken, password: body.password || "" });
         setPasswordResetComplete(true);
         window.history.replaceState({}, "", window.location.pathname);
+      } else if (mode === "forgot") {
+        await authRequest("/api/auth/request-password-reset", { email: body.email || "" });
+        setMessage("If an account exists for that email, we’ve sent a secure password reset link. Please check your inbox and spam folder.");
       } else if (mode === "signup") {
         const result = await authRequest("/api/auth/register", body);
         setVerificationSent(true); setMessage(`We sent a verification link to ${result.email}. Your 15-day trial starts as soon as you verify.`);
@@ -84,16 +87,18 @@ export function Onboarding({ onAuthenticated, initialNotice, adminPortal = false
             <label><span>Your full name</span><input className="plain-auth-input" name="fullName" required minLength={2} maxLength={120} placeholder="e.g. Ada Okafor" /></label>
             <label><span>Industry <small>Optional</small></span><select className="plain-auth-input" name="industry" defaultValue=""><option value="">Choose an industry</option><option>Professional services</option><option>Technology</option><option>Financial services</option><option>Healthcare</option><option>Education</option><option>Retail & commerce</option><option>Manufacturing</option><option>Nonprofit</option><option>Other</option></select></label>
           </>}
-          {(mode === "signup" || mode === "login") && <label><span>Work email</span><div className="auth-input"><Mail size={16} /><input name="email" type="email" autoComplete="email" required placeholder="you@company.com" /></div></label>}
+          {(mode === "signup" || mode === "login" || mode === "forgot") && <label><span>Work email</span><div className="auth-input"><Mail size={16} /><input name="email" type="email" autoComplete="email" required placeholder="you@company.com" /></div></label>}
           {mode === "demo" && <div className="demo-login-id"><span>Demo sign-in ID</span><strong>demo@demo.zyntris.invalid</strong></div>}
-          <label><span>{mode === "demo" ? "Demo password" : mode === "login" ? "Password" : "Create password"} {(mode === "signup" || mode === "invite" || mode === "reset") && <small>At least 12 characters</small>}</span><div className="auth-input"><LockKeyhole size={16} /><input name="password" type="password" autoComplete={mode === "signup" || mode === "invite" || mode === "reset" ? "new-password" : "current-password"} minLength={mode === "signup" || mode === "invite" || mode === "reset" ? 12 : 1} required placeholder={mode === "signup" || mode === "invite" || mode === "reset" ? "Create a strong password" : mode === "demo" ? "Enter the shared demo password" : "Your password"} /></div></label>
+          {mode !== "forgot" && <label><span>{mode === "demo" ? "Demo password" : mode === "login" ? "Password" : "Create password"} {(mode === "signup" || mode === "invite" || mode === "reset") && <small>At least 12 characters</small>}</span><div className="auth-input"><LockKeyhole size={16} /><input name="password" type="password" autoComplete={mode === "signup" || mode === "invite" || mode === "reset" ? "new-password" : "current-password"} minLength={mode === "signup" || mode === "invite" || mode === "reset" ? 12 : 1} required placeholder={mode === "signup" || mode === "invite" || mode === "reset" ? "Create a strong password" : mode === "demo" ? "Enter the shared demo password" : "Your password"} /></div></label>}
           {mode === "reset" && <label><span>Confirm new password</span><div className="auth-input"><LockKeyhole size={16} /><input name="confirmPassword" type="password" autoComplete="new-password" minLength={12} required placeholder="Enter the new password again" /></div></label>}
           {mode === "login" && twoFactorChallenge && <label><span>Authenticator or recovery code</span><div className="auth-input"><ShieldCheck size={16} /><input name="code" inputMode="numeric" autoComplete="one-time-code" autoFocus required placeholder="6-digit code or recovery code" /></div></label>}
           {mode === "signup" && <div className="trial-note"><CheckCircle2 size={16} /><span><strong>15 days free</strong> · Full access during your trial, no card required.</span></div>}
           {mode === "demo" && <div className="trial-note"><ShieldCheck size={16} /><span>Fictional records only. Changes and uploads are disabled.</span></div>}
-          <button className="button primary auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "signup" ? "Create organization" : mode === "demo" ? "Enter demo sandbox" : mode === "invite" ? "Accept invitation" : mode === "reset" ? "Set new password" : twoFactorChallenge ? "Verify and sign in" : "Sign in"}<ArrowRight size={16} /></button>
+          <button className="button primary auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "signup" ? "Create organization" : mode === "demo" ? "Enter demo sandbox" : mode === "invite" ? "Accept invitation" : mode === "reset" ? "Set new password" : mode === "forgot" ? "Send reset link" : twoFactorChallenge ? "Verify and sign in" : "Sign in"}<ArrowRight size={16} /></button>
         </form>
         {mode === "login" && !twoFactorChallenge && !adminPortal && <div className="auth-switch">New to Zyntris?<button onClick={() => { setError(""); setMessage(""); setMode("signup"); }}>Start a 15-day trial</button></div>}
+        {mode === "login" && !twoFactorChallenge && <button className="demo-entry" type="button" onClick={() => { setError(""); setMessage(""); setMode("forgot"); }}>Forgot password?</button>}
+        {mode === "forgot" && <button className="demo-entry" type="button" onClick={() => { setError(""); setMessage(""); setMode("login"); }}>Back to sign in</button>}
         {mode === "signup" && <div className="auth-switch">Already have an account?<button onClick={() => { setError(""); setMessage(""); setMode("login"); }}>Sign in</button></div>}
         {mode === "demo" && <div className="auth-switch">Have a company account?<button onClick={() => { setError(""); setMessage(""); setMode("login"); }}>Sign in</button></div>}
         {mode === "reset" && <button className="demo-entry" type="button" onClick={() => { setError(""); setMessage(""); window.history.replaceState({}, "", window.location.pathname); setMode("login"); }}>Back to sign in</button>}
