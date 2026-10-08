@@ -59,7 +59,8 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 export default function App() {
-  const [page, setPage] = useState<PageId>("dashboard");
+  const adminPortal = window.location.pathname === "/admin" || window.location.pathname === "/platform-admin";
+  const [page, setPage] = useState<PageId>(adminPortal ? "platform" : "dashboard");
   const [collapsed, setCollapsed] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
   const [user, setUser] = useState<{ id: string; fullName: string; email: string; role: string; organizationId: string; organizationName: string; permissions?: string[]; trialEndsAt?: string | null; subscriptionStatus?: string; isPlatformAdmin?: boolean; isDemo?: boolean } | null>(null);
@@ -85,10 +86,15 @@ export default function App() {
           window.history.replaceState({}, "", window.location.pathname);
           setAuthNotice("Your email is verified. Your organization workspace is ready.");
         }
-        const [me, data, people] = await Promise.all([
-          api<NonNullable<typeof user>>("/api/me"), api<DashboardData>("/api/dashboard"), api<{ data: Employee[] }>("/api/employees"),
-        ]);
-        setUser(me); setDashboard(data); setEmployees(people.data); setConnected(true);
+        if (adminPortal) {
+          const me = await api<NonNullable<typeof user>>("/api/me");
+          setUser(me); setConnected(true);
+        } else {
+          const [me, data, people] = await Promise.all([
+            api<NonNullable<typeof user>>("/api/me"), api<DashboardData>("/api/dashboard"), api<{ data: Employee[] }>("/api/employees"),
+          ]);
+          setUser(me); setDashboard(data); setEmployees(people.data); setConnected(true);
+        }
       } catch {
         setConnected(false);
       } finally {
@@ -130,10 +136,15 @@ export default function App() {
   const reloadWorkspace = async () => {
     setAuthLoading(true);
     try {
-      const [me, data, people] = await Promise.all([
-        api<NonNullable<typeof user>>("/api/me"), api<DashboardData>("/api/dashboard"), api<{ data: Employee[] }>("/api/employees"),
-      ]);
-      setUser(me); setDashboard(data); setEmployees(people.data); setConnected(true); setAuthNotice("");
+      if (adminPortal) {
+        const me = await api<NonNullable<typeof user>>("/api/me");
+        setUser(me); setConnected(true); setAuthNotice("");
+      } else {
+        const [me, data, people] = await Promise.all([
+          api<NonNullable<typeof user>>("/api/me"), api<DashboardData>("/api/dashboard"), api<{ data: Employee[] }>("/api/employees"),
+        ]);
+        setUser(me); setDashboard(data); setEmployees(people.data); setConnected(true); setAuthNotice("");
+      }
     } catch { setUser(null); }
     finally { setAuthLoading(false); }
   };
@@ -159,10 +170,18 @@ export default function App() {
     if (["dashboard", "reports"].includes(item.id)) return userPermissions.has("employees.view") || userPermissions.has("operations.view");
     return userPermissions.has("operations.view");
   });
-  const openPage = (next: PageId) => { setPage(next); setMobileNav(false); };
+  const openPage = (next: PageId) => {
+    if (next === "platform") { window.location.assign("/admin"); return; }
+    setPage(next); setMobileNav(false);
+  };
 
   if (authLoading) return <main className="auth-loading"><img src="/zyntris-mark.png" alt="" /><span>Opening your secure workspace…</span></main>;
-  if (!user) return <Onboarding onAuthenticated={() => void reloadWorkspace()} initialNotice={authNotice} />;
+  if (!user) return <Onboarding onAuthenticated={() => void reloadWorkspace()} initialNotice={authNotice} adminPortal={adminPortal} />;
+
+  if (adminPortal) return <div className="admin-portal-shell">
+    <header className="admin-portal-header"><a className="admin-portal-brand" href="/admin"><img src="/zyntris-mark.png" alt="" /><span>Zyntris <small>Platform Admin</small></span></a><div className="admin-portal-account"><span><strong>{user.fullName}</strong><small>{user.email}</small></span><button className="button secondary" onClick={async () => { await api("/api/auth/logout", { method: "POST" }); setUser(null); }}>Sign out</button></div></header>
+    <main className="admin-portal-content">{user.isPlatformAdmin ? <PlatformAdminWorkspace /> : <section className="admin-portal-denied"><ShieldCheck size={30} /><h1>Administrator access required</h1><p>This account is not authorized for the Zyntris platform dashboard. Contact the platform administrator if you believe this is an error.</p><button className="button secondary" onClick={async () => { await api("/api/auth/logout", { method: "POST" }); setUser(null); }}>Sign out</button></section>}</main>
+  </div>;
 
   const createEmployee = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();

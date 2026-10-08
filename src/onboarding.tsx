@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { ArrowRight, Building2, CheckCircle2, LockKeyhole, Mail, ShieldCheck } from "lucide-react";
 
-type AuthFlowProps = { onAuthenticated: () => void; initialNotice?: string };
+type AuthFlowProps = { onAuthenticated: () => void; initialNotice?: string; adminPortal?: boolean };
 
 async function authRequest(path: string, body: Record<string, string>) {
   const response = await fetch(path, { method: "POST", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -10,10 +10,10 @@ async function authRequest(path: string, body: Record<string, string>) {
   return data;
 }
 
-export function Onboarding({ onAuthenticated, initialNotice }: AuthFlowProps) {
+export function Onboarding({ onAuthenticated, initialNotice, adminPortal = false }: AuthFlowProps) {
   const inviteToken = new URLSearchParams(window.location.search).get("invite") || "";
   const resetToken = new URLSearchParams(window.location.search).get("reset") || "";
-  const [mode, setMode] = useState<"signup" | "login" | "demo" | "invite" | "reset">(resetToken ? "reset" : inviteToken ? "invite" : "signup");
+  const [mode, setMode] = useState<"signup" | "login" | "demo" | "invite" | "reset">(resetToken ? "reset" : inviteToken ? "invite" : adminPortal ? "login" : "signup");
   const [message, setMessage] = useState(initialNotice || "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -67,15 +67,15 @@ export function Onboarding({ onAuthenticated, initialNotice }: AuthFlowProps) {
   return <main className="auth-shell">
     <section className="auth-aside">
       <img className="auth-logo" src="/zyntris-logo.png" alt="Zyntris" />
-      <div className="auth-aside-copy"><span className="auth-kicker">ONE SYSTEM. EVERY OPERATION.</span><h1>Give your team a calmer way to work.</h1><p>People, finance and day-to-day operations together in one secure workspace.</p></div>
-      <div className="auth-promise"><span><ShieldCheck size={17} /></span><div><strong>Private by design</strong><small>Your organization gets its own isolated workspace and records.</small></div></div>
+      <div className="auth-aside-copy"><span className="auth-kicker">{adminPortal ? "ZYNTRIS PLATFORM ADMIN" : "ONE SYSTEM. EVERY OPERATION."}</span><h1>{adminPortal ? "Operate the platform with confidence." : "Give your team a calmer way to work."}</h1><p>{adminPortal ? "A restricted control room for tenant oversight, service access and platform maintenance." : "People, finance and day-to-day operations together in one secure workspace."}</p></div>
+      <div className="auth-promise"><span><ShieldCheck size={17} /></span><div><strong>{adminPortal ? "Restricted access" : "Private by design"}</strong><small>{adminPortal ? "Only approved platform administrator accounts can enter." : "Your organization gets its own isolated workspace and records."}</small></div></div>
     </section>
     <section className="auth-main"><div className="auth-card">
       <div className="auth-brand-mobile"><img src="/zyntris-logo.png" alt="Zyntris" /></div>
       {passwordResetComplete ? <div className="verify-state"><span className="verify-icon"><CheckCircle2 size={24} /></span><div className="auth-kicker">PASSWORD UPDATED</div><h2>Sign in with your new password.</h2><p>Your password has been changed and existing sessions have been signed out.</p><button className="button secondary" onClick={() => { setPasswordResetComplete(false); setMode("login"); }}>Back to sign in</button></div> : verificationSent ? <div className="verify-state"><span className="verify-icon"><Mail size={24} /></span><div className="auth-kicker">ONE LAST STEP</div><h2>Check your inbox</h2><p>{message}</p><p className="auth-small">The secure link expires in 24 hours. Check your spam folder if it hasn’t arrived.</p><button className="button secondary" onClick={() => { setVerificationSent(false); setMode("login"); }}>Back to sign in</button></div> : <>
-        <div className="auth-kicker">{mode === "signup" ? "START YOUR WORKSPACE" : mode === "demo" ? "SANDBOX ACCESS" : mode === "invite" ? "EMPLOYEE ONBOARDING" : mode === "reset" ? "SECURE PASSWORD RESET" : "WELCOME BACK"}</div>
-        <h2>{mode === "signup" ? "Build better operations." : mode === "demo" ? "Explore the demo workspace." : mode === "invite" ? "Set up your employee access." : mode === "reset" ? "Create a new password." : "Sign in to Zyntris."}</h2>
-        <p className="auth-intro">{mode === "signup" ? "Create your organization workspace. No card required." : mode === "demo" ? "Fictional organization and payroll records. Demo access is read-only." : mode === "invite" ? "Your HR administrator invited you. Create a password to activate your account." : mode === "reset" ? "Choose a new password of at least 12 characters. This one-time link expires after 30 minutes." : twoFactorChallenge ? "Verify your identity to finish signing in." : "Pick up where your team left off."}</p>
+        <div className="auth-kicker">{adminPortal && mode === "login" ? "PLATFORM ADMIN ACCESS" : mode === "signup" ? "START YOUR WORKSPACE" : mode === "demo" ? "SANDBOX ACCESS" : mode === "invite" ? "EMPLOYEE ONBOARDING" : mode === "reset" ? "SECURE PASSWORD RESET" : "WELCOME BACK"}</div>
+        <h2>{adminPortal && mode === "login" ? "Sign in to the admin dashboard." : mode === "signup" ? "Build better operations." : mode === "demo" ? "Explore the demo workspace." : mode === "invite" ? "Set up your employee access." : mode === "reset" ? "Create a new password." : "Sign in to Zyntris."}</h2>
+        <p className="auth-intro">{adminPortal && mode === "login" ? "Use your approved Zyntris administrator account. All access is verified by the platform." : mode === "signup" ? "Create your organization workspace. No card required." : mode === "demo" ? "Fictional organization and payroll records. Demo access is read-only." : mode === "invite" ? "Your HR administrator invited you. Create a password to activate your account." : mode === "reset" ? "Choose a new password of at least 12 characters. This one-time link expires after 30 minutes." : twoFactorChallenge ? "Verify your identity to finish signing in." : "Pick up where your team left off."}</p>
         {message && <div className="auth-message"><CheckCircle2 size={17} />{message}</div>}
         {error && <div className="auth-error" role="alert">{error}</div>}
         <form className="auth-form" onSubmit={submit}>
@@ -93,12 +93,12 @@ export function Onboarding({ onAuthenticated, initialNotice }: AuthFlowProps) {
           {mode === "demo" && <div className="trial-note"><ShieldCheck size={16} /><span>Fictional records only. Changes and uploads are disabled.</span></div>}
           <button className="button primary auth-submit" type="submit" disabled={busy}>{busy ? "Please wait…" : mode === "signup" ? "Create organization" : mode === "demo" ? "Enter demo sandbox" : mode === "invite" ? "Accept invitation" : mode === "reset" ? "Set new password" : twoFactorChallenge ? "Verify and sign in" : "Sign in"}<ArrowRight size={16} /></button>
         </form>
-        {mode === "login" && !twoFactorChallenge && <div className="auth-switch">New to Zyntris?<button onClick={() => { setError(""); setMessage(""); setMode("signup"); }}>Start a 15-day trial</button></div>}
+        {mode === "login" && !twoFactorChallenge && !adminPortal && <div className="auth-switch">New to Zyntris?<button onClick={() => { setError(""); setMessage(""); setMode("signup"); }}>Start a 15-day trial</button></div>}
         {mode === "signup" && <div className="auth-switch">Already have an account?<button onClick={() => { setError(""); setMessage(""); setMode("login"); }}>Sign in</button></div>}
         {mode === "demo" && <div className="auth-switch">Have a company account?<button onClick={() => { setError(""); setMessage(""); setMode("login"); }}>Sign in</button></div>}
         {mode === "reset" && <button className="demo-entry" type="button" onClick={() => { setError(""); setMessage(""); window.history.replaceState({}, "", window.location.pathname); setMode("login"); }}>Back to sign in</button>}
         {twoFactorChallenge && <button className="demo-entry" type="button" onClick={() => { setTwoFactorChallenge(""); setMessage(""); setError(""); }}>Back to password sign in</button>}
-        {demoEnabled && mode !== "demo" && mode !== "invite" && mode !== "reset" && <button className="demo-entry" type="button" onClick={() => { setError(""); setMessage(""); setMode("demo"); }}>Explore the read-only demo</button>}
+        {!adminPortal && demoEnabled && mode !== "demo" && mode !== "invite" && mode !== "reset" && <button className="demo-entry" type="button" onClick={() => { setError(""); setMessage(""); setMode("demo"); }}>Explore the read-only demo</button>}
       </>}
       <div className="auth-legal">By continuing, you agree to Zyntris’s terms and privacy policy.</div>
     </div></section>
