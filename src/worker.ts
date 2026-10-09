@@ -487,7 +487,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
         env.DB.prepare(`INSERT INTO payroll_settings (organization_id, currency, tax_year) VALUES (?, 'NGN', ?)`).bind(orgId, now.getUTCFullYear()),
         env.DB.prepare(`INSERT INTO email_verification_tokens (id, user_id, token_hash, expires_at) VALUES (?, ?, ?, datetime('now', '+24 hours'))`).bind(`evt-${crypto.randomUUID()}`, userId, await hashToken(token)),
         env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions`).bind(roleId),
-        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','employees.manage','payroll.view','payroll.manage','payroll.run','hr.onboarding.approve','roles.manage','teams.manage','operations.view','goals.view','goals.manage','announcements.view','announcements.manage')`).bind(hrRoleId),
+        env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','employees.manage','payroll.view','payroll.manage','payroll.run','hr.onboarding.approve','roles.manage','teams.manage','requests.manage','operations.view','goals.view','goals.manage','announcements.view','announcements.manage')`).bind(hrRoleId),
         env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','payroll.view','payroll.approve','requests.manage','hr.onboarding.approve','operations.view','operations.manage','expenses.view','expenses.manage','goals.view','goals.manage','announcements.view','announcements.manage')`).bind(ceoRoleId),
         env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('payroll.view','payroll.run','payroll.approve','expenses.view','expenses.manage','requests.manage','operations.view','operations.manage','goals.view','announcements.view')`).bind(financeRoleId),
         env.DB.prepare(`INSERT INTO role_permissions (role_id, permission_id) SELECT ?, id FROM permissions WHERE code IN ('employees.view','operations.view','expenses.view','payroll.self.view','goals.view','announcements.view')`).bind(employeeRoleId),
@@ -1474,19 +1474,20 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (path === "/api/approval-workflows") {
     if (!hasPermission(context, "requests.manage")) return error("Request administration permission is required to configure approval routing.", 403);
     if (request.method === "GET") {
-      const row = await env.DB.prepare(`SELECT approval_workflows_json as workflowsJson FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ workflowsJson: string }>();
+      const row = await env.DB.prepare(`SELECT approval_workflows_json as workflowsJson, financial_fallback_role as financialFallbackRole FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ workflowsJson: string; financialFallbackRole: string }>();
       let workflows: Record<string, string> = {};
       try { workflows = JSON.parse(row?.workflowsJson || "{}"); } catch { /* use empty settings */ }
-      return json({ workflows: { Operational: workflows.Operational || "Manager", Access: workflows.Access || "Manager", HR: workflows.HR || "HR Admin", Leave: workflows.Leave || "HR Admin", Other: workflows.Other || "Manager" } });
+      return json({ workflows: { Operational: workflows.Operational || "Manager", Access: workflows.Access || "Manager", HR: workflows.HR || "HR Admin", Leave: workflows.Leave || "HR Admin", Other: workflows.Other || "Manager" }, financialFlow: { primaryRole: "CEO", fallbackRole: row?.financialFallbackRole || "HR Admin", fallbackTrigger: "approver_unavailable" } });
     }
     if (request.method === "PATCH") {
-      const body = await request.json<{ workflows?: Record<string, string> }>(); const workflows = body.workflows;
+      const body = await request.json<{ workflows?: Record<string, string>; financialFallbackRole?: string }>(); const workflows = body.workflows;
       const categories = ["Operational", "Access", "HR", "Leave", "Other"];
       const allowedRoles = ["Manager", "HR Admin", "CEO"];
-      if (!workflows || categories.some((category) => !allowedRoles.includes(workflows[category]))) return error("Choose Manager, HR Admin, or CEO for each non-financial request category.");
-      await env.DB.prepare(`UPDATE organization_settings SET approval_workflows_json = ?, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(JSON.stringify(Object.fromEntries(categories.map((category) => [category, workflows[category]]))), context.organizationId).run();
-      await audit(env, context, "updated", "approval_workflows", context.organizationId, { workflows });
-      return json({ ok: true, workflows });
+      const financialFallbackRole = body.financialFallbackRole || "HR Admin";
+      if (!workflows || categories.some((category) => !allowedRoles.includes(workflows[category])) || !["HR Admin", "Organization Admin"].includes(financialFallbackRole)) return error("Choose a valid approver for each category and HR Admin or Organization Admin as the financial fallback.");
+      await env.DB.prepare(`UPDATE organization_settings SET approval_workflows_json = ?, financial_fallback_role = ?, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(JSON.stringify(Object.fromEntries(categories.map((category) => [category, workflows[category]]))), financialFallbackRole, context.organizationId).run();
+      await audit(env, context, "updated", "approval_workflows", context.organizationId, { workflows, financialFlow: { primaryRole: "CEO", fallbackRole: financialFallbackRole, fallbackTrigger: "approver_unavailable" } });
+      return json({ ok: true, workflows, financialFlow: { primaryRole: "CEO", fallbackRole: financialFallbackRole, fallbackTrigger: "approver_unavailable" } });
     }
   }
 
@@ -2355,7 +2356,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET" && path === "/api/requests") {
     if (!hasPermission(context, "requests.manage") && !hasPermission(context, "employees.view")) return error("You do not have permission to view requests.", 403);
     const canViewAll = hasPermission(context, "requests.manage") ? 1 : 0;
-    const result = await env.DB.prepare(`SELECT a.id, a.request_type as requestType, a.title, json_extract(a.metadata_json, '$.details') as details, u.full_name as requester, a.amount, a.status, a.required_role as requiredRole, a.created_at as createdAt FROM approval_requests a JOIN users u ON u.id = a.requester_id WHERE a.organization_id = ? AND (? = 1 OR a.requester_id = ?) ORDER BY CASE a.status WHEN 'pending' THEN 1 ELSE 2 END, a.created_at DESC LIMIT 100`).bind(context.organizationId, canViewAll, context.userId).all();
+    const result = await env.DB.prepare(`SELECT a.id, a.request_type as requestType, a.title, json_extract(a.metadata_json, '$.details') as details, u.full_name as requester, a.amount, a.status, a.return_note as returnNote, a.requester_id = ? as canEdit, COALESCE(json_extract(a.metadata_json, '$.fallbackActive'), 0) as fallbackActive, CASE WHEN a.amount IS NOT NULL OR lower(trim(a.request_type)) IN ('expense','purchase','budget','payroll','reimbursement','payment','financial','asset purchase') THEN json_extract(a.metadata_json, '$.fallbackRoles[0]') ELSE 'HR Admin & CEO' END as fallbackRole, (a.requester_id = ? OR a.required_role = ? OR ? = 1) as canEscalate, a.required_role as requiredRole, a.created_at as createdAt FROM approval_requests a JOIN users u ON u.id = a.requester_id WHERE a.organization_id = ? AND (? = 1 OR a.requester_id = ?) ORDER BY CASE a.status WHEN 'pending' THEN 1 WHEN 'returned' THEN 2 ELSE 3 END, a.created_at DESC LIMIT 100`).bind(context.userId, context.userId, context.role, context.role === "Organization Admin" ? 1 : 0, context.organizationId, canViewAll, context.userId).all();
     return json({ data: result.results || [] });
   }
 
@@ -2383,35 +2384,77 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   const requestMatch = path.match(/^\/api\/requests\/([^/]+)$/);
+  const unavailableMatch = path.match(/^\/api\/requests\/([^/]+)\/approver-unavailable$/);
+  if (request.method === "POST" && unavailableMatch) {
+    const item = await env.DB.prepare(`SELECT a.requester_id as requesterId, a.request_type as requestType, a.title, a.required_role as requiredRole, a.amount, a.status, a.metadata_json as metadataJson, s.financial_fallback_role as financialFallbackRole FROM approval_requests a JOIN organization_settings s ON s.organization_id = a.organization_id WHERE a.id = ? AND a.organization_id = ?`).bind(unavailableMatch[1], context.organizationId).first<{ requesterId: string; requestType: string; title: string; requiredRole: string; amount: number | null; status: string; metadataJson: string; financialFallbackRole: string }>();
+    if (!item) return error("Request not found.", 404);
+    if (item.requesterId !== context.userId && context.role !== item.requiredRole && context.role !== "Organization Admin") return error("Only the requester, assigned approver, or organization administrator can flag an unavailable approver.", 403);
+    if (item.status !== "pending") return error("Only a pending request can be escalated.", 409);
+    let metadata: Record<string, unknown> = {}; try { metadata = JSON.parse(item.metadataJson || "{}"); } catch { /* preserve existing metadata via json_set */ }
+    if (metadata.fallbackActive) return error("This request has already been escalated to its fallback approver(s).", 409);
+    const financialTypes = ["expense", "purchase", "budget", "payroll", "reimbursement", "payment", "financial", "asset purchase"];
+    const isFinancialRequest = item.amount !== null || financialTypes.includes(item.requestType.trim().toLowerCase());
+    const fallbackRoles = isFinancialRequest ? [item.financialFallbackRole || "HR Admin"] : ["HR Admin", "CEO"];
+    const updated = await env.DB.prepare(`UPDATE approval_requests SET metadata_json = json_set(metadata_json, '$.fallbackActive', 1, '$.fallbackRoles', json(?), '$.fallbackAt', ?, '$.fallbackBy', ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'pending' AND COALESCE(json_extract(metadata_json, '$.fallbackActive'), 0) = 0`).bind(JSON.stringify(fallbackRoles), new Date().toISOString(), context.userId, unavailableMatch[1], context.organizationId).run();
+    if (!updated.meta.changes) return error("This request changed before escalation. Refresh and try again.", 409);
+    await audit(env, context, "approver_unavailable_escalated", "requests", unavailableMatch[1], { originalRole: item.requiredRole, fallbackRoles });
+    const requesterContext = { ...context, userId: item.requesterId };
+    await Promise.all(fallbackRoles.map((role) => notifyApprovers(env, requesterContext, role, item.title, `The assigned ${item.requiredRole} approver is unavailable. This request has moved to its configured fallback approver.`)));
+    return json({ ok: true, status: "pending", fallbackActive: true, fallbackRoles });
+  }
+  if (request.method === "PUT" && requestMatch) {
+    const body = await request.json<{ title?: string; details?: string; amount?: number | string | null }>();
+    const item = await env.DB.prepare(`SELECT source_record_id as sourceRecordId, requester_id as requesterId, request_type as requestType, required_role as requiredRole, amount, status FROM approval_requests WHERE id = ? AND organization_id = ?`).bind(requestMatch[1], context.organizationId).first<{ sourceRecordId: string | null; requesterId: string; requestType: string; requiredRole: string; amount: number | null; status: string }>();
+    if (!item) return error("Request not found.", 404);
+    if (item.requesterId !== context.userId) return error("Only the requester can edit this request.", 403);
+    if (item.status !== "returned") return error("Only a request returned for edits can be resubmitted.", 409);
+    const title = body.title?.trim(); const details = body.details?.trim();
+    const amount = body.amount === undefined || body.amount === null || body.amount === "" ? null : Number(body.amount);
+    const financialTypes = ["expense", "purchase", "budget", "payroll", "reimbursement", "payment", "financial", "asset purchase"];
+    const financial = amount !== null || financialTypes.includes(item.requestType.trim().toLowerCase());
+    if (!title || title.length > 120 || !details || details.length > 2000 || (amount !== null && (!Number.isFinite(amount) || amount <= 0)) || (financial && amount === null)) return error("Enter a valid title, details and amount. Financial requests must include a positive amount.");
+    const requiredRole = financial ? "CEO" : item.requiredRole;
+    const update = await env.DB.prepare(`UPDATE approval_requests SET title = ?, amount = ?, required_role = ?, status = 'pending', return_note = NULL, metadata_json = json_set(json_remove(metadata_json, '$.decisionReason', '$.fallbackActive', '$.fallbackAt', '$.fallbackBy'), '$.details', ?), current_step = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND requester_id = ? AND status = 'returned'`).bind(title, amount, requiredRole, details, requestMatch[1], context.organizationId, context.userId).run();
+    if (!update.meta.changes) return error("This request changed before it could be resubmitted. Refresh and try again.", 409);
+    if (item.sourceRecordId) await env.DB.prepare(`UPDATE expenses SET description = ?, amount = ?, status = 'submitted', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(title, amount, item.sourceRecordId, context.organizationId).run();
+    await audit(env, context, "resubmitted", "requests", requestMatch[1], { title, amount, requiredRole, details });
+    await notifyApprovers(env, context, requiredRole, title, `A returned request was edited and resubmitted for approval. Details: ${details}`);
+    return json({ ok: true, status: "pending", requiredRole });
+  }
   if (request.method === "PATCH" && requestMatch) {
     if (!hasPermission(context, "requests.manage") && !hasPermission(context, "hr.onboarding.approve")) return error("You do not have permission to approve requests.", 403);
-    const body = await request.json<{ status?: string; reason?: string }>();
-    if (!body.status || !["approved", "rejected", "paid", "cancelled"].includes(body.status)) return error("A valid request status is required");
+    const body = await request.json<{ status?: string; reason?: string; note?: string }>();
+    if (!body.status || !["approved", "rejected", "returned", "paid", "cancelled"].includes(body.status)) return error("A valid request status is required");
     const requestIdValue = requestMatch[1];
-    const item = await env.DB.prepare(`SELECT source_record_id as sourceRecordId, requester_id as requesterId, title, request_type as requestType, required_role as requiredRole, amount, current_step as currentStep, status FROM approval_requests WHERE id = ? AND organization_id = ?`).bind(requestIdValue, context.organizationId).first<{ sourceRecordId: string | null; requesterId: string; title: string; requestType: string; requiredRole: string; amount: number | null; currentStep: number; status: string }>();
+    const item = await env.DB.prepare(`SELECT source_record_id as sourceRecordId, requester_id as requesterId, title, request_type as requestType, required_role as requiredRole, amount, current_step as currentStep, status, metadata_json as metadataJson FROM approval_requests WHERE id = ? AND organization_id = ?`).bind(requestIdValue, context.organizationId).first<{ sourceRecordId: string | null; requesterId: string; title: string; requestType: string; requiredRole: string; amount: number | null; currentStep: number; status: string; metadataJson: string }>();
     if (!item) return error("Request not found.", 404);
     if (item.status !== "pending" && !(body.status === "paid" && item.status === "approved")) return error("This request has already been decided or is not ready for payment recording.", 409);
     const financialTypes = ["expense", "purchase", "budget", "payroll", "reimbursement", "payment", "financial", "asset purchase"];
     const isFinancialRequest = item.amount !== null || financialTypes.includes(item.requestType.trim().toLowerCase());
+    let decisionMetadata: Record<string, unknown> = {}; try { decisionMetadata = JSON.parse(item.metadataJson || "{}"); } catch { /* use role-only authorization */ }
+    const fallbackRoles = Array.isArray(decisionMetadata.fallbackRoles) ? decisionMetadata.fallbackRoles : isFinancialRequest ? ["HR Admin"] : ["HR Admin", "CEO"];
+    const fallbackApproverMayDecide = Boolean(decisionMetadata.fallbackActive) && fallbackRoles.includes(context.role);
     const requiredRole = isFinancialRequest ? "CEO" : item.requiredRole;
     if ((body.status === "approved" || body.status === "rejected") && item.requesterId === context.userId) return error("You cannot approve or reject a request you submitted.", 403);
     if (body.status === "rejected" && !body.reason?.trim()) return error("A rejection reason is required so the requester has a clear decision record.");
-    if (body.status === "approved" || body.status === "rejected") {
+    if (body.status === "returned" && !body.note?.trim()) return error("Add a note explaining what the requester needs to edit.");
+    if (body.status === "approved" || body.status === "rejected" || body.status === "returned") {
       const organizationAdminMayDecide = !isFinancialRequest && context.role === "Organization Admin";
-      if (context.role !== requiredRole && !organizationAdminMayDecide) return error(`This request requires approval from ${requiredRole}.`, 403);
+      if (context.role !== requiredRole && !organizationAdminMayDecide && !fallbackApproverMayDecide) return error(`This request requires approval from ${requiredRole}${decisionMetadata.fallbackActive ? " or its configured fallback approver" : ""}.`, 403);
     } else if (body.status === "paid" && !hasPermission(context, "expenses.manage")) return error("Finance permission is required to mark a claim as paid.", 403);
     const expectedStatus = body.status === "paid" ? "approved" : "pending";
+    const decisionNote = body.status === "returned" ? body.note!.trim().slice(0, 2000) : body.reason?.trim().slice(0, 2000) || "";
     const changes = await env.DB.batch([
-      env.DB.prepare(`UPDATE approval_requests SET status = ?, metadata_json = CASE WHEN ? = '' THEN metadata_json ELSE json_set(metadata_json, '$.decisionReason', ?) END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = ?`).bind(body.status, body.reason?.trim() || "", body.reason?.trim() || "", requestIdValue, context.organizationId, expectedStatus),
-      ...(item.sourceRecordId ? [env.DB.prepare(`UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND EXISTS (SELECT 1 FROM approval_requests WHERE id = ? AND organization_id = ? AND status = ?)`).bind(body.status, item.sourceRecordId, context.organizationId, requestIdValue, context.organizationId, body.status)] : []),
+      env.DB.prepare(`UPDATE approval_requests SET status = ?, return_note = CASE WHEN ? = 'returned' THEN ? ELSE return_note END, metadata_json = CASE WHEN ? = '' THEN metadata_json ELSE json_set(metadata_json, '$.decisionReason', ?) END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = ?`).bind(body.status, body.status, decisionNote, decisionNote, decisionNote, requestIdValue, context.organizationId, expectedStatus),
+      ...(item.sourceRecordId ? [env.DB.prepare(`UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND EXISTS (SELECT 1 FROM approval_requests WHERE id = ? AND organization_id = ? AND status = ?)`).bind(body.status === "returned" ? "submitted" : body.status, item.sourceRecordId, context.organizationId, requestIdValue, context.organizationId, body.status)] : []),
     ]);
     if (!changes[0]?.meta.changes) return error("This request was decided by another approver. Refresh the queue.", 409);
-    await audit(env, context, body.status, "requests", requestIdValue, { role: context.role, stage: item.currentStep });
-    if (body.status === "approved" || body.status === "rejected") {
+    await audit(env, context, body.status === "returned" ? "returned_for_edits" : body.status, "requests", requestIdValue, { role: context.role, stage: item.currentStep, note: decisionNote || null });
+    if (body.status === "approved" || body.status === "rejected" || body.status === "returned") {
       const requester = await env.DB.prepare(`SELECT u.email, u.full_name as fullName, o.name as organizationName FROM users u JOIN organizations o ON o.id = ? WHERE u.id = ?`).bind(context.organizationId, item.requesterId).first<{ email: string; fullName: string; organizationName: string }>();
-      const decisionText = body.status === "approved" ? "approved" : `rejected. Reason: ${body.reason!.trim()}`;
-      await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'request_decision', ?, ?)`).bind(requestId(), context.organizationId, item.requesterId, `Request ${body.status}`, `Your ${item.requestType.toLowerCase()} request “${item.title}” was ${decisionText}.`).run();
-      if (requester) await sendApprovalNotificationEmail(env, requester.email, requester.fullName, requester.organizationName, `Your Zyntris request was ${body.status}`, `Your ${item.requestType.toLowerCase()} request “${item.title}” was ${decisionText}.`);
+      const decisionText = body.status === "approved" ? "approved" : body.status === "returned" ? `returned for edits. Note: ${decisionNote}` : `rejected. Reason: ${decisionNote}`;
+      await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'request_decision', ?, ?)`).bind(requestId(), context.organizationId, item.requesterId, body.status === "returned" ? "Request returned for edits" : `Request ${body.status}`, `Your ${item.requestType.toLowerCase()} request “${item.title}” was ${decisionText}.`).run();
+      if (requester) await sendApprovalNotificationEmail(env, requester.email, requester.fullName, requester.organizationName, body.status === "returned" ? "Your Zyntris request needs edits" : `Your Zyntris request was ${body.status}`, `Your ${item.requestType.toLowerCase()} request “${item.title}” was ${decisionText}.`);
     }
     return json({ ok: true, id: requestIdValue, status: body.status });
   }

@@ -114,6 +114,8 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - `GET /api/search?q=...` — permission-filtered, tenant-scoped global search.
 - `GET|POST /api/expenses`, `GET /api/expenses/export`, `GET /api/expenses/:id/receipt`, and `GET|PATCH /api/expense-policy` — tenant-scoped CSV and private R2 receipts, with enforced claim limits and receipt requirements.
 - `GET|POST /api/requests`, `GET /api/requests/:id/history`, and `PATCH /api/requests/:id` — filterable approvals and tenant-scoped audit history.
+- `PUT /api/requests/:id` — requester edits and resubmits a request returned with reviewer notes; `POST /api/requests/:id/approver-unavailable` alerts HR Admin and CEO as fallback reviewers.
+- `GET|PATCH /api/approval-workflows` — HR Admins and Organization Admins configure category routing and the financial chain (CEO first, configured fallback second; HR Admin by default).
 - `/api/attendance/*` — employee time-clock, HR shift schedules, and manager review of submitted time records.
 - `GET|POST /api/assets`
 - `GET|POST /api/vendors`
@@ -131,6 +133,7 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - Attendance supports in/out time-clock entries, tenant-admin shift schedules, review, and overtime measured against the configured shift. Overtime is not calculated where no matching schedule exists; local legal and contractual rules must be checked by HR. Overnight shifts and retroactive employee-edited timesheets are not yet supported.
 - CRM tracks the date a customer enters the won stage and calculates current-quarter won totals from actual records. Authorized operations managers can edit customer profiles.
 - General operational requests can be submitted from web or mobile; financial requests are routed to the CEO, and other requests to their selected role. Approvers are alerted through both email and the in-app inbox.
+- Approvers can return a request for edits with a required note. The requester can edit its title, details and amount and resubmit; the return note and each decision are retained in request history. For non-financial requests, an unavailable approver escalates to HR Admin and CEO. Financial requests go to CEO first and, if marked unavailable, move to the configured second-level approver (HR Admin by default).
 - Approval decisions update both the request and its source expense, and write to the audit log.
 - Asset register supports ownership, location, lifecycle status and current value.
 - Vendor register surfaces contract expiry and spend risk.
