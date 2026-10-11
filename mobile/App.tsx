@@ -1,11 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, Alert, Image, KeyboardAvoidingView, Platform, Pressable, RefreshControl, SafeAreaView, ScrollView, StatusBar, StyleSheet, Text, TextInput, View } from "react-native";
 import * as SecureStore from "expo-secure-store";
+import * as Notifications from "expo-notifications";
+import Constants from "expo-constants";
 import { StatusBar as ExpoStatusBar } from "expo-status-bar";
 import zyntrisMark from "./assets/zyntris-mark.png";
 
 const API_URL = "https://app.zyntris.org";
 const TOKEN_KEY = "zyntris_mobile_access_token";
+Notifications.setNotificationHandler({ handleNotification: async () => ({ shouldShowBanner: true, shouldShowList: true, shouldPlaySound: false, shouldSetBadge: true }) });
 type Tab = "home" | "approvals" | "payroll" | "new" | "inbox";
 type User = { id: string; fullName: string; email: string; role: string; organizationName: string; permissions: string[] };
 type Approval = { id: string; requestType: string; title: string; details?: string | null; requester: string; amount: number | null; status: string; requiredRole: string; createdAt: string };
@@ -78,6 +81,24 @@ export default function App() {
     return () => clearInterval(interval);
   }, [token, loadWorkspace]);
 
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    void (async () => {
+      try {
+        const permission = await Notifications.getPermissionsAsync();
+        const finalStatus = permission.status === "granted" ? permission.status : (await Notifications.requestPermissionsAsync()).status;
+        if (finalStatus !== "granted") return;
+        if (Platform.OS === "android") await Notifications.setNotificationChannelAsync("default", { name: "Zyntris approvals", importance: Notifications.AndroidImportance.HIGH });
+        const projectId = Constants.expoConfig?.extra?.eas?.projectId ?? Constants.easConfig?.projectId;
+        if (!projectId) return;
+        const pushToken = (await Notifications.getExpoPushTokenAsync({ projectId })).data;
+        if (!cancelled) await request("/push-token", token, { method: "POST", body: JSON.stringify({ token: pushToken, platform: Platform.OS }) });
+      } catch { /* Push is best-effort; the in-app inbox remains the delivery fallback. */ }
+    })();
+    return () => { cancelled = true; };
+  }, [token]);
+
   const refresh = async () => {
     if (!token) return;
     setRefreshing(true);
@@ -139,7 +160,7 @@ export default function App() {
   };
 
   const signOut = async () => {
-    try { if (token) await request("/auth/logout", token, { method: "POST" }); } finally { await SecureStore.deleteItemAsync(TOKEN_KEY); setToken(null); setUser(null); }
+    try { if (token) { await request("/push-token", token, { method: "DELETE", body: JSON.stringify({}) }); await request("/auth/logout", token, { method: "POST" }); } } finally { await SecureStore.deleteItemAsync(TOKEN_KEY); setToken(null); setUser(null); }
   };
 
   if (restoringSession) return <SafeAreaView style={styles.safe}><ExpoStatusBar style="light" /><View style={styles.restore}><Image source={zyntrisMark} style={styles.loginLogo} resizeMode="contain" /><ActivityIndicator color="#D8AA54" /></View></SafeAreaView>;

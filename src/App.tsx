@@ -16,7 +16,7 @@ import { Appraisals } from "./appraisals";
 import { HRTalentWorkspace } from "./hr-talent";
 import { ExitManagement } from "./exit-management";
 import { AnnouncementsWorkspace, GoalsWorkspace } from "./company-modules";
-import { WorkCalendarWorkspace, WorkLeaveWorkspace, WorkProjectsWorkspace, WorkTasksWorkspace } from "./workspaces";
+import { WorkCalendarConnections, WorkCalendarWorkspace, WorkLeaveWorkspace, WorkProjectsWorkspace, WorkTasksWorkspace } from "./workspaces";
 import type { DashboardData, Employee, LeaveRequest, PageId, Task } from "./types";
 
 type IconComponent = typeof LayoutDashboard;
@@ -282,7 +282,7 @@ export default function App() {
           {page === "announcements" && <AnnouncementsWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "tasks" && <WorkTasksWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "projects" && <WorkProjectsWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
-          {page === "calendar" && <WorkCalendarWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
+          {page === "calendar" && <><WorkCalendarWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><WorkCalendarConnections canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /></>}
           {(["expenses", "requests", "budgets", "assets", "vendors", "helpdesk", "customers"] as PageId[]).includes(page) && <OperationalWorkspace page={page} role={user.role} onToast={setToast} />}
           {page === "documents" && <Documents version={documentsVersion} onUpload={() => setShowUpload(true)} onToast={setToast} />}
           {page === "reports" && <Reports onToast={setToast} />}

@@ -19,6 +19,6 @@
         "foregroundImage": "./assets/app-icon.png"
       }
     },
-    "plugins": ["expo-secure-store"]
+    "plugins": ["expo-secure-store", "expo-notifications"]
   }
 }

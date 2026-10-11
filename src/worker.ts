@@ -9,6 +9,11 @@ export interface Env {
   EMAIL_SENDER?: string;
   PLATFORM_ADMIN_EMAILS?: string;
   DEMO_ACCESS_PASSWORD?: string;
+  GOOGLE_CALENDAR_CLIENT_ID?: string;
+  GOOGLE_CALENDAR_CLIENT_SECRET?: string;
+  MICROSOFT_CALENDAR_CLIENT_ID?: string;
+  MICROSOFT_CALENDAR_CLIENT_SECRET?: string;
+  EXPO_ACCESS_TOKEN?: string;
 }
 
 type AuthContext = {
@@ -42,9 +47,177 @@ const BACKUP_TABLES = [
   "payroll_run_items", "appraisal_cycles", "appraisals", "performance_kpis", "appraisal_kpi_scores",
   "appraisal_360_feedback", "performance_improvement_plans", "pip_check_ins", "job_requisitions",
   "job_candidates", "learning_courses", "learning_enrollments", "attendance_records", "shift_schedules", "audit_logs",
+  "workflow_templates", "workflow_sla_settings", "tenant_backup_settings", "purchase_requests", "purchase_orders", "budget_reservations",
 ] as const;
 
 const isoDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
+
+async function createTenantBackup(env: Env, organizationId: string, createdBy: string) {
+  const id = `backup-${crypto.randomUUID()}`;
+  const tableSnapshots = await env.DB.batch(BACKUP_TABLES.map((table) => env.DB.prepare(`SELECT * FROM ${table} WHERE organization_id = ?`).bind(organizationId)));
+  const tables: Record<string, unknown[]> = {};
+  let recordCount = 0;
+  for (const [index, table] of BACKUP_TABLES.entries()) { const rows = tableSnapshots[index].results || []; tables[table] = rows as unknown[]; recordCount += rows.length; }
+  const files: { originalKey: string; backupKey: string }[] = [];
+  for (const doc of (tables.documents || []) as { r2_key?: string }[]) {
+    if (!doc.r2_key) continue;
+    const source = await env.FILES.get(doc.r2_key);
+    if (!source) throw new Error("A referenced document is missing from R2 storage.");
+    const backupKey = `tenant-backups/${organizationId}/${id}/files/${await hashToken(doc.r2_key)}`;
+    await env.FILES.put(backupKey, source.body, { httpMetadata: source.httpMetadata, customMetadata: { originalKeyHash: await hashToken(doc.r2_key) } });
+    files.push({ originalKey: doc.r2_key, backupKey });
+  }
+  const payload = JSON.stringify({ schemaVersion: 1, organizationId, generatedAt: new Date().toISOString(), tables, files });
+  const checksum = await hashToken(payload); const objectKey = `tenant-backups/${organizationId}/${id}/snapshot.json`;
+  await env.FILES.put(objectKey, payload, { httpMetadata: { contentType: "application/json" }, customMetadata: { checksum, schemaVersion: "1" } });
+  await env.DB.prepare(`INSERT INTO tenant_backups (id, organization_id, object_key, checksum, size_bytes, record_count, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .bind(id, organizationId, objectKey, checksum, new TextEncoder().encode(payload).byteLength, recordCount, createdBy).run();
+  return { id, checksum, recordCount, fileCount: files.length, createdAt: new Date().toISOString(), objectKey };
+}
+
+async function calendarCipherKey(env: Env) {
+  if (!env.SESSION_SECRET) throw new Error("SESSION_SECRET must be configured before calendar OAuth tokens can be stored.");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(env.SESSION_SECRET));
+  return crypto.subtle.importKey("raw", digest, "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+async function encryptCalendarTokens(env: Env, value: unknown) {
+  const iv = crypto.getRandomValues(new Uint8Array(12)); const key = await calendarCipherKey(env);
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(JSON.stringify(value)));
+  return `${btoa(String.fromCharCode(...iv))}.${btoa(String.fromCharCode(...new Uint8Array(encrypted)))}`;
+}
+async function decryptCalendarTokens(env: Env, value: string) {
+  const [ivPart, dataPart] = value.split("."); if (!ivPart || !dataPart) throw new Error("Stored calendar credentials are malformed.");
+  const toBytes = (part: string) => Uint8Array.from(atob(part), (character) => character.charCodeAt(0));
+  const clear = await crypto.subtle.decrypt({ name: "AES-GCM", iv: toBytes(ivPart) }, await calendarCipherKey(env), toBytes(dataPart));
+  return JSON.parse(new TextDecoder().decode(clear)) as { access_token: string; refresh_token?: string; expires_in?: number; token_type?: string };
+}
+
+type CalendarConnection = { id: string; organizationId: string; userId: string; provider: "google" | "microsoft"; encryptedTokens: string; syncCursor: string | null };
+async function calendarAccessToken(env: Env, connection: CalendarConnection) {
+  const tokens = await decryptCalendarTokens(env, connection.encryptedTokens);
+  const id = connection.provider === "google" ? env.GOOGLE_CALENDAR_CLIENT_ID : env.MICROSOFT_CALENDAR_CLIENT_ID;
+  const secret = connection.provider === "google" ? env.GOOGLE_CALENDAR_CLIENT_SECRET : env.MICROSOFT_CALENDAR_CLIENT_SECRET;
+  const expires = await env.DB.prepare(`SELECT expires_at as expiresAt FROM calendar_provider_connections WHERE id = ? AND organization_id = ?`).bind(connection.id, connection.organizationId).first<{ expiresAt: string | null }>();
+  if (expires?.expiresAt && Date.parse(expires.expiresAt) > Date.now() + 120000) return tokens.access_token;
+  if (!tokens.refresh_token || !id || !secret) throw new Error("Calendar token expired or refresh credentials are not configured. Reconnect the provider.");
+  const url = connection.provider === "google" ? "https://oauth2.googleapis.com/token" : "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+  const response = await fetch(url, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ client_id: id, client_secret: secret, refresh_token: tokens.refresh_token, grant_type: "refresh_token", ...(connection.provider === "microsoft" ? { scope: "offline_access https://graph.microsoft.com/Calendars.ReadWrite" } : {}) }) });
+  const refreshed = await response.json() as typeof tokens;
+  if (!response.ok || !refreshed.access_token) throw new Error("Calendar provider could not refresh access. Reconnect the provider.");
+  const merged = { ...tokens, ...refreshed, refresh_token: refreshed.refresh_token || tokens.refresh_token };
+  await env.DB.prepare(`UPDATE calendar_provider_connections SET encrypted_tokens = ?, expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(await encryptCalendarTokens(env, merged), new Date(Date.now() + Number(refreshed.expires_in || 3600) * 1000).toISOString(), connection.id, connection.organizationId).run();
+  return merged.access_token;
+}
+
+async function pushCalendarEvent(env: Env, organizationId: string, eventId: string) {
+  const event = await env.DB.prepare(`SELECT id, title, event_type as eventType, start_at as startAt, end_at as endAt, location FROM calendar_events WHERE id = ? AND organization_id = ?`).bind(eventId, organizationId).first<{ id: string; title: string; eventType: string; startAt: string; endAt: string; location: string | null }>();
+  if (!event) return;
+  const connections = await env.DB.prepare(`SELECT id, organization_id as organizationId, user_id as userId, provider, encrypted_tokens as encryptedTokens, sync_cursor as syncCursor FROM calendar_provider_connections WHERE organization_id = ? AND revoked_at IS NULL`).bind(organizationId).all<CalendarConnection>();
+  for (const connection of connections.results || []) {
+    try {
+      const token = await calendarAccessToken(env, connection);
+      const link = await env.DB.prepare(`SELECT provider_event_id as providerEventId FROM calendar_event_links WHERE calendar_event_id = ? AND connection_id = ? AND organization_id = ?`).bind(event.id, connection.id, organizationId).first<{ providerEventId: string }>();
+      let endpoint: string; let method: string; let payload: Record<string, unknown>;
+      if (connection.provider === "google") {
+        endpoint = `https://www.googleapis.com/calendar/v3/calendars/primary/events${link ? `/${encodeURIComponent(link.providerEventId)}` : ""}`; method = link ? "PATCH" : "POST";
+        payload = { summary: event.title, description: `Zyntris · ${event.eventType}`, location: event.location || undefined, start: { dateTime: event.startAt }, end: { dateTime: event.endAt }, extendedProperties: { private: { zyntrisEventId: event.id, zyntrisOrganizationId: organizationId } } };
+      } else {
+        endpoint = `https://graph.microsoft.com/v1.0/me/events${link ? `/${encodeURIComponent(link.providerEventId)}` : ""}`; method = link ? "PATCH" : "POST";
+        payload = { subject: event.title, body: { contentType: "text", content: `Zyntris · ${event.eventType}` }, location: { displayName: event.location || "" }, start: { dateTime: event.startAt, timeZone: "UTC" }, end: { dateTime: event.endAt, timeZone: "UTC" }, transactionId: event.id };
+      }
+      let response = await fetch(endpoint, { method, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(payload) });
+      if (link && response.status === 404) response = await fetch(endpoint.replace(`/${encodeURIComponent(link.providerEventId)}`, ""), { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(payload) });
+      const result = await response.json().catch(() => ({})) as { id?: string };
+      if (!response.ok || !result.id) throw new Error(`Provider rejected event sync (${response.status}).`);
+      await env.DB.prepare(`INSERT INTO calendar_event_links (organization_id, calendar_event_id, connection_id, provider_event_id, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(calendar_event_id,connection_id) DO UPDATE SET provider_event_id = excluded.provider_event_id, updated_at = CURRENT_TIMESTAMP`).bind(organizationId, event.id, connection.id, result.id).run();
+      await env.DB.prepare(`UPDATE calendar_provider_connections SET sync_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(connection.id, organizationId).run();
+    } catch (cause) {
+      await env.DB.prepare(`UPDATE calendar_provider_connections SET sync_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(cause instanceof Error ? cause.message.slice(0, 300) : "Calendar event sync failed", connection.id, organizationId).run();
+    }
+  }
+}
+
+async function syncExternalCalendars(env: Env) {
+  const data = await env.DB.prepare(`SELECT id, organization_id as organizationId, user_id as userId, provider, encrypted_tokens as encryptedTokens, sync_cursor as syncCursor FROM calendar_provider_connections WHERE revoked_at IS NULL`).all<CalendarConnection>();
+  for (const connection of data.results || []) {
+    try {
+      const token = await calendarAccessToken(env, connection);
+      // First publish organization events created in Zyntris, then fetch incremental provider changes.
+      const localEvents = await env.DB.prepare(`SELECT e.id FROM calendar_events e LEFT JOIN calendar_event_links l ON l.calendar_event_id = e.id AND l.connection_id = ? WHERE e.organization_id = ? AND e.external_provider IS NULL AND l.calendar_event_id IS NULL ORDER BY e.created_at LIMIT 100`).bind(connection.id, connection.organizationId).all<{ id: string }>();
+      for (const event of localEvents.results || []) await pushCalendarEvent(env, connection.organizationId, event.id);
+      if (connection.provider === "google") {
+        let pageToken: string | undefined; let nextSyncToken: string | undefined; let resetCursor = false; let keepPaging = true;
+        while (keepPaging) {
+          const endpoint = new URL("https://www.googleapis.com/calendar/v3/calendars/primary/events");
+          endpoint.searchParams.set("singleEvents", "true"); endpoint.searchParams.set("showDeleted", "true"); endpoint.searchParams.set("maxResults", "2500");
+          if (connection.syncCursor && !resetCursor) endpoint.searchParams.set("syncToken", connection.syncCursor);
+          if (pageToken) endpoint.searchParams.set("pageToken", pageToken);
+          const response = await fetch(endpoint, { headers: { authorization: `Bearer ${token}` } });
+          if (response.status === 410 && connection.syncCursor && !resetCursor) { resetCursor = true; pageToken = undefined; continue; }
+          const result = await response.json() as { items?: Array<{ id: string; status?: string; summary?: string; start?: { dateTime?: string; date?: string }; end?: { dateTime?: string; date?: string }; location?: string; updated?: string }>; nextPageToken?: string; nextSyncToken?: string; error?: { message?: string } };
+          if (!response.ok) throw new Error(result.error?.message || `Google Calendar sync failed (${response.status}).`);
+          for (const item of result.items || []) await upsertExternalCalendarEvent(env, connection, item.id, item.status === "cancelled", item.summary || "Calendar event", item.start?.dateTime || `${item.start?.date}T00:00:00.000Z`, item.end?.dateTime || `${item.end?.date}T00:00:00.000Z`, item.location || null, item.updated || null);
+          pageToken = result.nextPageToken; keepPaging = Boolean(pageToken); nextSyncToken = result.nextSyncToken || nextSyncToken;
+        }
+        if (nextSyncToken) await env.DB.prepare(`UPDATE calendar_provider_connections SET sync_cursor = ?, last_synced_at = CURRENT_TIMESTAMP, sync_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(nextSyncToken, connection.id).run();
+      } else {
+        const cursor = connection.syncCursor || `https://graph.microsoft.com/v1.0/me/calendarView/delta?startDateTime=${encodeURIComponent(new Date(Date.now() - 90 * 86400000).toISOString())}&endDateTime=${encodeURIComponent(new Date(Date.now() + 365 * 86400000).toISOString())}`;
+        let next: string | undefined = cursor; let deltaLink: string | undefined;
+        while (next) {
+          const response = await fetch(next, { headers: { authorization: `Bearer ${token}` } });
+          const result = await response.json() as { value?: Array<{ id: string; subject?: string; isCancelled?: boolean; start?: { dateTime?: string }; end?: { dateTime?: string }; location?: { displayName?: string }; lastModifiedDateTime?: string; "@removed"?: unknown }>; "@odata.nextLink"?: string; "@odata.deltaLink"?: string; error?: { message?: string } };
+          if (!response.ok) throw new Error(result.error?.message || `Microsoft calendar sync failed (${response.status}).`);
+          for (const item of result.value || []) await upsertExternalCalendarEvent(env, connection, item.id, Boolean(item["@removed"] || item.isCancelled), item.subject || "Calendar event", item.start?.dateTime ? new Date(item.start.dateTime).toISOString() : new Date().toISOString(), item.end?.dateTime ? new Date(item.end.dateTime).toISOString() : new Date().toISOString(), item.location?.displayName || null, item.lastModifiedDateTime || null);
+          next = result["@odata.nextLink"]; deltaLink = result["@odata.deltaLink"] || deltaLink;
+        }
+        if (deltaLink) await env.DB.prepare(`UPDATE calendar_provider_connections SET sync_cursor = ?, last_synced_at = CURRENT_TIMESTAMP, sync_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(deltaLink, connection.id).run();
+      }
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message.slice(0, 300) : "Calendar synchronization failed.";
+      await env.DB.prepare(`UPDATE calendar_provider_connections SET sync_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(message, connection.id, connection.organizationId).run();
+    }
+  }
+}
+
+async function upsertExternalCalendarEvent(env: Env, connection: CalendarConnection, providerEventId: string, deleted: boolean, title: string, startAt: string, endAt: string, location: string | null, updatedAt: string | null) {
+  const linked = await env.DB.prepare(`SELECT calendar_event_id as eventId FROM calendar_event_links WHERE connection_id = ? AND provider_event_id = ? AND organization_id = ?`).bind(connection.id, providerEventId, connection.organizationId).first<{ eventId: string }>();
+  const external = await env.DB.prepare(`SELECT id FROM calendar_events WHERE organization_id = ? AND connection_id = ? AND external_id = ?`).bind(connection.organizationId, connection.id, providerEventId).first<{ id: string }>();
+  const targetId = linked?.eventId || external?.id;
+  if (deleted) { if (external?.id) await env.DB.prepare(`DELETE FROM calendar_events WHERE id = ? AND organization_id = ?`).bind(external.id, connection.organizationId).run(); return; }
+  if (!targetId) {
+    const id = `external-event-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO calendar_events (id, organization_id, title, event_type, start_at, end_at, location, owner_id, external_provider, external_id, connection_id, external_updated_at) VALUES (?, ?, ?, 'Meeting', ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, connection.organizationId, title.slice(0,160), startAt, endAt, location?.slice(0,250) || null, connection.userId, connection.provider, providerEventId, connection.id, updatedAt).run();
+    await env.DB.prepare(`INSERT OR IGNORE INTO calendar_event_links (organization_id, calendar_event_id, connection_id, provider_event_id) VALUES (?, ?, ?, ?)`).bind(connection.organizationId, id, connection.id, providerEventId).run();
+  } else {
+    await env.DB.prepare(`UPDATE calendar_events SET title = ?, start_at = ?, end_at = ?, location = ?, external_updated_at = ? WHERE id = ? AND organization_id = ?`).bind(title.slice(0,160), startAt, endAt, location?.slice(0,250) || null, updatedAt, targetId, connection.organizationId).run();
+  }
+}
+
+async function handleCalendarOAuthCallback(request: Request, env: Env) {
+  const url = new URL(request.url); const provider = url.searchParams.get("provider");
+  const state = url.searchParams.get("state") || ""; const code = url.searchParams.get("code");
+  const home = `${env.APP_ORIGIN}/?calendar_connection=`;
+  if (!state || !code) return Response.redirect(`${home}failed`, 302);
+  const record = await env.DB.prepare(`SELECT organization_id as organizationId, user_id as userId, provider, expires_at as expiresAt FROM calendar_oauth_states WHERE token_hash = ?`).bind(await hashToken(state)).first<{ organizationId: string; userId: string; provider: string; expiresAt: string }>();
+  if (!record || !['google','microsoft'].includes(record.provider) || provider && record.provider !== provider || Date.parse(`${record.expiresAt.replace(" ", "T")}Z`) <= Date.now()) return Response.redirect(`${home}expired`, 302);
+  await env.DB.prepare(`DELETE FROM calendar_oauth_states WHERE token_hash = ?`).bind(await hashToken(state)).run();
+  const providerKind = record.provider;
+  const google = providerKind === "google";
+  const clientId = google ? env.GOOGLE_CALENDAR_CLIENT_ID : env.MICROSOFT_CALENDAR_CLIENT_ID;
+  const clientSecret = google ? env.GOOGLE_CALENDAR_CLIENT_SECRET : env.MICROSOFT_CALENDAR_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return Response.redirect(`${home}not_configured`, 302);
+  const redirectUri = `${env.APP_ORIGIN}/api/calendar/oauth/callback`;
+  const tokenUrl = google ? "https://oauth2.googleapis.com/token" : "https://login.microsoftonline.com/common/oauth2/v2.0/token";
+  try {
+    const response = await fetch(tokenUrl, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ code, client_id: clientId, client_secret: clientSecret, redirect_uri: redirectUri, grant_type: "authorization_code" }) });
+    const tokens = await response.json() as { access_token?: string; refresh_token?: string; expires_in?: number; scope?: string; token_type?: string };
+    if (!response.ok || !tokens.access_token) return Response.redirect(`${home}failed`, 302);
+    const id = `calendar-${record.organizationId}-${record.userId}-${providerKind}`;
+    const encrypted = await encryptCalendarTokens(env, tokens);
+    await env.DB.prepare(`INSERT INTO calendar_provider_connections (id, organization_id, user_id, provider, encrypted_tokens, scopes, expires_at, revoked_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, CURRENT_TIMESTAMP) ON CONFLICT(organization_id,user_id,provider) DO UPDATE SET id = excluded.id, encrypted_tokens = excluded.encrypted_tokens, scopes = excluded.scopes, expires_at = excluded.expires_at, sync_cursor = NULL, revoked_at = NULL, sync_error = NULL, updated_at = CURRENT_TIMESTAMP`).bind(id, record.organizationId, record.userId, providerKind, encrypted, tokens.scope || (google ? "https://www.googleapis.com/auth/calendar.events.owned" : "offline_access Calendars.ReadWrite"), new Date(Date.now() + Number(tokens.expires_in || 3600) * 1000).toISOString()).run();
+    return Response.redirect(`${home}${providerKind}_connected`, 302);
+  } catch (cause) { console.error("Calendar OAuth token exchange failed", cause instanceof Error ? cause.name : "unknown"); return Response.redirect(`${home}failed`, 302); }
+}
 const validTaxBands = (bands: unknown): bands is { upTo: number | null; rate: number }[] => Array.isArray(bands) && bands.length > 0 && bands.length <= 20 && bands.every((band, index) => band && Number.isFinite(band.rate) && band.rate >= 0 && band.rate <= 1 && (band.upTo === null || (Number.isFinite(band.upTo) && band.upTo > 0 && (index === 0 || bands[index - 1].upTo !== null && band.upTo > bands[index - 1].upTo)))) && bands.at(-1)?.upTo === null && bands.slice(0, -1).every((band) => band.upTo !== null);
 
 function withSecurityHeaders(response: Response) {
@@ -395,6 +568,17 @@ async function sendApprovalNotificationEmail(env: Env, email: string, fullName: 
   }
 }
 
+async function sendMobilePush(env: Env, organizationId: string, userId: string, title: string, body: string) {
+  const tokens = await env.DB.prepare(`SELECT token FROM mobile_push_tokens WHERE organization_id = ? AND user_id = ?`).bind(organizationId, userId).all<{ token: string }>();
+  if (!tokens.results?.length) return;
+  const headers: Record<string, string> = { "content-type": "application/json", accept: "application/json" };
+  if (env.EXPO_ACCESS_TOKEN) headers.authorization = `Bearer ${env.EXPO_ACCESS_TOKEN}`;
+  try {
+    const response = await fetch("https://exp.host/--/api/v2/push/send", { method: "POST", headers, body: JSON.stringify(tokens.results.map(({ token }) => ({ to: token, title: title.slice(0, 100), body: body.slice(0, 500), sound: "default", channelId: "default", priority: "high" }))) });
+    if (!response.ok) console.warn("Expo push service rejected a notification", response.status);
+  } catch (cause) { console.warn("Could not send Expo push notification", cause instanceof Error ? cause.name : "unknown"); }
+}
+
 async function notifyApprovers(env: Env, context: AuthContext, requiredRole: string, title: string, body: string) {
   const organization = await env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`).bind(context.organizationId).first<{ name: string }>();
   const requester = await env.DB.prepare(`SELECT full_name as fullName FROM users WHERE id = ?`).bind(context.userId).first<{ fullName: string }>();
@@ -411,6 +595,7 @@ async function notifyApprovers(env: Env, context: AuthContext, requiredRole: str
   const details = `${requester?.fullName || "A team member"} submitted “${title.replace(/[\r\n]+/g, " ").slice(0, 120)}”. ${body.slice(0, 1800)}`;
   const subjectTitle = title.replace(/[\r\n]+/g, " ").slice(0, 120);
   await env.DB.batch(targets.map((approver) => env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'approval_pending', ?, ?)`).bind(requestId(), context.organizationId, approver.id, "Approval pending", details)));
+  await Promise.all(targets.map((approver) => sendMobilePush(env, context.organizationId, approver.id, "Approval pending", `${subjectTitle}: ${details}`)));
   if (organization) await Promise.all(targets.map((approver) => sendApprovalNotificationEmail(env, approver.email, approver.fullName, organization.name, `Approval pending: ${subjectTitle}`, details)));
 }
 
@@ -844,16 +1029,24 @@ async function handleExitManagement(request: Request, env: Env, context: AuthCon
   if (path === base && request.method === "GET") {
     const cases = await env.DB.prepare(`SELECT c.id, c.employee_id as employeeId, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.email, e.job_title as jobTitle, e.department_id as departmentId, d.name as department, c.manager_id as managerId, COALESCE(m.first_name || ' ' || m.last_name, '') as managerName, c.separation_type as separationType, CASE WHEN ? = 1 OR e.user_id = ? THEN c.reason ELSE NULL END as reason, c.notice_date as noticeDate, c.last_working_date as lastWorkingDate, c.status, CASE WHEN ? = 1 OR e.user_id = ? THEN c.exit_interview_date ELSE NULL END as exitInterviewDate, CASE WHEN ? = 1 OR e.user_id = ? THEN c.exit_interview_notes ELSE NULL END as exitInterviewNotes, CASE WHEN ? = 1 OR e.user_id = ? THEN c.employee_feedback ELSE NULL END as employeeFeedback, CASE WHEN ? = 1 OR ? = 1 THEN c.final_salary ELSE NULL END as finalSalary, CASE WHEN ? = 1 OR ? = 1 THEN c.leave_payout ELSE NULL END as leavePayout, CASE WHEN ? = 1 OR ? = 1 THEN c.deductions ELSE NULL END as deductions, CASE WHEN ? = 1 OR ? = 1 THEN c.outstanding_balance ELSE NULL END as outstandingBalance, CASE WHEN ? = 1 OR ? = 1 THEN c.finance_notes ELSE NULL END as financeNotes, CASE WHEN ? = 1 OR ? = 1 THEN c.reference_documents ELSE NULL END as referenceDocuments, c.created_at as createdAt, c.completed_at as completedAt, (SELECT COUNT(*) FROM employee_exit_tasks t WHERE t.exit_case_id = c.id AND t.organization_id = c.organization_id) as taskCount, (SELECT COUNT(*) FROM employee_exit_tasks t WHERE t.exit_case_id = c.id AND t.organization_id = c.organization_id AND t.status IN ('completed','waived')) as completedTaskCount FROM employee_exit_cases c JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id LEFT JOIN departments d ON d.id = e.department_id AND d.organization_id = e.organization_id LEFT JOIN employees m ON m.id = c.manager_id AND m.organization_id = c.organization_id WHERE c.organization_id = ? AND (? = 1 OR e.user_id = ? OR m.user_id = ? OR ((? = 1 OR ? = 1) AND c.status = 'active')) ORDER BY CASE c.status WHEN 'active' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END, c.last_working_date DESC, c.created_at DESC`).bind(canManage ? 1 : 0, context.userId, canManage ? 1 : 0, context.userId, canManage ? 1 : 0, context.userId, canManage ? 1 : 0, context.userId, canManage ? 1 : 0, canFinance ? 1 : 0, canManage ? 1 : 0, canFinance ? 1 : 0, canManage ? 1 : 0, canFinance ? 1 : 0, canManage ? 1 : 0, canFinance ? 1 : 0, canManage ? 1 : 0, canFinance ? 1 : 0, context.organizationId, canManage ? 1 : 0, context.userId, context.userId, canFinance ? 1 : 0, canIT ? 1 : 0).all();
     const tasks = await env.DB.prepare(`SELECT t.id, t.exit_case_id as exitCaseId, t.category, t.title, t.details, t.status, t.notes, t.completed_at as completedAt, u.full_name as completedBy, t.sort_order as sortOrder, CASE WHEN ? = 1 OR (t.category = 'finance' AND ? = 1) OR (t.category = 'it' AND ? = 1) OR (t.category = 'employee' AND e.user_id = ?) OR (t.category = 'manager' AND m.user_id = ?) THEN 1 ELSE 0 END as canUpdate FROM employee_exit_tasks t JOIN employee_exit_cases c ON c.id = t.exit_case_id AND c.organization_id = t.organization_id JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id LEFT JOIN employees m ON m.id = c.manager_id AND m.organization_id = c.organization_id LEFT JOIN users u ON u.id = t.completed_by WHERE t.organization_id = ? AND (? = 1 OR (t.category = 'finance' AND ? = 1) OR (t.category = 'it' AND ? = 1) OR (t.category = 'employee' AND e.user_id = ?) OR (t.category = 'manager' AND m.user_id = ?)) ORDER BY t.exit_case_id, t.sort_order`).bind(canManage ? 1 : 0, canFinance ? 1 : 0, canIT ? 1 : 0, context.userId, context.userId, context.organizationId, canManage ? 1 : 0, canFinance ? 1 : 0, canIT ? 1 : 0, context.userId, context.userId).all();
-    return json({ data: cases.results || [], tasks: tasks.results || [], canManage, canFinance, canIT, employeeId: selfEmployee?.id || null });
+    const approvalRows = await env.DB.prepare(`SELECT id, approval_status as approvalStatus, approval_role as approvalRole, approval_note as approvalNote FROM employee_exit_cases WHERE organization_id = ?`).bind(context.organizationId).all<{ id: string; approvalStatus: string; approvalRole: string; approvalNote: string | null }>();
+    const approvals = new Map((approvalRows.results || []).map((row) => [row.id, row]));
+    const visibleCases = (cases.results || []).map((row) => ({ ...row, ...approvals.get(String((row as { id: string }).id)) }));
+    const pendingCases = context.role === "CEO" || context.role === "HR Admin" || context.role === "Organization Admin"
+      ? await env.DB.prepare(`SELECT c.id, c.employee_id as employeeId, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.email, e.job_title as jobTitle, d.name as department, c.manager_id as managerId, COALESCE(m.first_name || ' ' || m.last_name, '') as managerName, c.separation_type as separationType, c.reason, c.notice_date as noticeDate, c.last_working_date as lastWorkingDate, c.status, c.approval_status as approvalStatus, c.approval_role as approvalRole, c.approval_note as approvalNote, NULL as exitInterviewDate, NULL as exitInterviewNotes, NULL as employeeFeedback, NULL as finalSalary, NULL as leavePayout, NULL as deductions, NULL as outstandingBalance, NULL as financeNotes, NULL as referenceDocuments, c.created_at as createdAt, c.completed_at as completedAt, (SELECT COUNT(*) FROM employee_exit_tasks t WHERE t.exit_case_id = c.id AND t.organization_id = c.organization_id) as taskCount, 0 as completedTaskCount FROM employee_exit_cases c JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id LEFT JOIN departments d ON d.id = e.department_id AND d.organization_id = e.organization_id LEFT JOIN employees m ON m.id = c.manager_id AND m.organization_id = e.organization_id WHERE c.organization_id = ? AND c.approval_status = 'pending' AND c.approval_role = ?`).bind(context.organizationId, context.role === "Organization Admin" ? "CEO" : context.role).all()
+      : { results: [] };
+    const allCases = [...visibleCases, ...(pendingCases.results || []).filter((row) => !visibleCases.some((item) => (item as { id: string }).id === (row as { id: string }).id))];
+    return json({ data: allCases, tasks: tasks.results || [], canManage, canFinance, canIT, canApproveExit: ["CEO","HR Admin","Organization Admin"].includes(context.role), employeeId: selfEmployee?.id || null });
   }
 
   if (path === base && request.method === "POST") {
+    if (!canManage) return error("Only HR or an organization administrator can initiate an employee separation.", 403);
     const body = await request.json<{ employeeId?: string; separationType?: string; reason?: string; noticeDate?: string; lastWorkingDate?: string }>();
     const validTypes = ["resignation", "retirement", "end_of_contract", "redundancy", "termination", "other"];
     const noticeDate = body.noticeDate || "", lastWorkingDate = body.lastWorkingDate || "";
     const employee = body.employeeId ? await env.DB.prepare(`SELECT e.id, e.manager_id as managerId, e.first_name as firstName, e.last_name as lastName, e.user_id as userId FROM employees e WHERE e.id = ? AND e.organization_id = ? AND e.deleted_at IS NULL AND e.status != 'inactive'`).bind(body.employeeId, context.organizationId).first<{ id: string; managerId: string | null; firstName: string; lastName: string; userId: string | null }>() : null;
     if (!employee || !validTypes.includes(body.separationType || "") || !body.reason?.trim() || body.reason.trim().length > 2000 || !isIsoCalendarDate(noticeDate) || !isIsoCalendarDate(lastWorkingDate) || lastWorkingDate < noticeDate) return error("Choose an active employee and provide a separation type, reason, notice date and valid last working date.");
-    const existing = await env.DB.prepare(`SELECT id FROM employee_exit_cases WHERE organization_id = ? AND employee_id = ? AND status = 'active'`).bind(context.organizationId, employee.id).first();
+    const existing = await env.DB.prepare(`SELECT id FROM employee_exit_cases WHERE organization_id = ? AND employee_id = ? AND status != 'cancelled' AND approval_status != 'rejected'`).bind(context.organizationId, employee.id).first();
     if (existing) return error("This employee already has an active exit case.", 409);
     const id = `exit-${crypto.randomUUID()}`;
     const checklist: Array<[string, string, string]> = [
@@ -869,10 +1062,37 @@ async function handleExitManagement(request: Request, env: Env, context: AuthCon
       ["finance", "Validate final remuneration and leave balance", "Document final salary, eligible leave payout, deductions and outstanding balance. This records amounts only; it does not initiate a bank transfer."],
       ["finance", "Complete finance clearance", "Confirm the final reconciliation is reviewed and all amounts are documented in the case before HR closes it."],
     ];
-    const statements = [env.DB.prepare(`INSERT INTO employee_exit_cases (id, organization_id, employee_id, manager_id, separation_type, reason, notice_date, last_working_date, initiated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, employee.id, employee.managerId, body.separationType, body.reason.trim(), noticeDate, lastWorkingDate, context.userId), ...checklist.map(([category, title, details], index) => env.DB.prepare(`INSERT INTO employee_exit_tasks (id, organization_id, exit_case_id, category, title, details, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(`exit-task-${crypto.randomUUID()}`, context.organizationId, id, category, title, details, index + 1)), ...(employee.userId ? [env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'employee_exit', ?, ?)`).bind(requestId(), context.organizationId, employee.userId, "Employment exit process started", `HR has recorded an exit process with a planned last working date of ${lastWorkingDate}. Contact HR if any information is incorrect.`)] : [])];
+    const workflow = await env.DB.prepare(`SELECT exit_approval_role as approvalRole FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ approvalRole: string }>();
+    const approvalRole = workflow?.approvalRole || "CEO";
+    const statements = [env.DB.prepare(`INSERT INTO employee_exit_cases (id, organization_id, employee_id, manager_id, separation_type, reason, notice_date, last_working_date, initiated_by, approval_status, approval_role) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`).bind(id, context.organizationId, employee.id, employee.managerId, body.separationType, body.reason.trim(), noticeDate, lastWorkingDate, context.userId, approvalRole), ...checklist.map(([category, title, details], index) => env.DB.prepare(`INSERT INTO employee_exit_tasks (id, organization_id, exit_case_id, category, title, details, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(`exit-task-${crypto.randomUUID()}`, context.organizationId, id, category, title, details, index + 1))];
     await env.DB.batch(statements);
+    const approvers = await env.DB.prepare(`SELECT COUNT(*) as count FROM memberships m JOIN roles r ON r.id = m.role_id WHERE m.organization_id = ? AND m.status = 'active' AND r.name = ?`).bind(context.organizationId, approvalRole).first<{ count: number }>();
+    const actualApprovalRole = (approvers?.count || 0) > 0 ? approvalRole : approvalRole === "CEO" ? "HR Admin" : "CEO";
+    if (actualApprovalRole !== approvalRole) await env.DB.prepare(`UPDATE employee_exit_cases SET approval_role = ? WHERE id = ? AND organization_id = ?`).bind(actualApprovalRole, id, context.organizationId).run();
+    await notifyApprovers(env, context, actualApprovalRole, `Separation approval · ${employee.firstName} ${employee.lastName}`, `An HR separation request is waiting for your sign-off. Planned last working date: ${lastWorkingDate}. No offboarding tasks start until approval.`);
     await audit(env, context, "created", "employee_exit_cases", id, { employeeId: employee.id, separationType: body.separationType, lastWorkingDate });
     return json({ id }, { status: 201 });
+  }
+
+  const exitDecision = path.match(/^\/api\/hr\/exits\/([^/]+)\/decision$/);
+  if (exitDecision && request.method === "POST") {
+    const body = await request.json<{ decision?: string; note?: string }>();
+    if (!["approved","rejected"].includes(body.decision || "") || !body.note?.trim() || body.note.length > 2000) return error("Choose approve or reject and include the decision rationale (maximum 2,000 characters).");
+    const current = await env.DB.prepare(`SELECT c.employee_id as employeeId, c.approval_role as approvalRole, c.approval_status as approvalStatus, e.user_id as employeeUserId, e.email, e.first_name as firstName, e.last_name as lastName FROM employee_exit_cases c JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id WHERE c.id = ? AND c.organization_id = ?`).bind(exitDecision[1], context.organizationId).first<{ employeeId: string; approvalRole: string; approvalStatus: string; employeeUserId: string | null; email: string; firstName: string; lastName: string }>();
+    if (!current) return error("Exit case not found.", 404);
+    if (current.approvalStatus !== "pending") return error("This separation request has already been decided.", 409);
+    if (context.role !== current.approvalRole && context.role !== "Organization Admin") return error(`This separation requires approval from ${current.approvalRole}.`, 403);
+    const decision = body.decision as "approved" | "rejected";
+    await env.DB.prepare(`UPDATE employee_exit_cases SET approval_status = ?, approval_note = ?, approved_by = ?, approved_at = CURRENT_TIMESTAMP, status = CASE WHEN ? = 'rejected' THEN 'cancelled' ELSE status END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND approval_status = 'pending'`).bind(decision, body.note.trim(), context.userId, decision, exitDecision[1], context.organizationId).run();
+    if (current.employeeUserId) {
+      const title = decision === "approved" ? "Separation process approved" : "Separation request declined";
+      const message = decision === "approved" ? `The separation request was approved. HR will coordinate the offboarding steps and planned final working date.` : `The separation request was not approved. Decision note: ${body.note.trim()}`;
+      await env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'employee_exit', ?, ?)`).bind(requestId(), context.organizationId, current.employeeUserId, title, message).run();
+      const organization = await env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`).bind(context.organizationId).first<{ name: string }>();
+      await sendApprovalNotificationEmail(env, current.email, `${current.firstName} ${current.lastName}`, organization?.name || "your organization", title, message);
+    }
+    await audit(env, context, `separation_${decision}`, "employee_exit_cases", exitDecision[1], { approvalRole: current.approvalRole, note: body.note.trim() });
+    return json({ ok: true, approvalStatus: decision });
   }
 
   const taskMatch = path.match(/^\/api\/hr\/exits\/([^/]+)\/tasks\/([^/]+)$/);
@@ -880,8 +1100,8 @@ async function handleExitManagement(request: Request, env: Env, context: AuthCon
     const body = await request.json<{ status?: string; notes?: string }>();
     const status = body.status || "";
     if (!["pending", "completed", "waived"].includes(status) || (body.notes || "").length > 2000 || (status !== "pending" && !body.notes?.trim())) return error("Choose a valid status; add a completion or waiver note, with no more than 2,000 characters.");
-    const task = await env.DB.prepare(`SELECT t.category, c.status as caseStatus, e.user_id as employeeUserId, m.user_id as managerUserId FROM employee_exit_tasks t JOIN employee_exit_cases c ON c.id = t.exit_case_id AND c.organization_id = t.organization_id JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id LEFT JOIN employees m ON m.id = c.manager_id AND m.organization_id = c.organization_id WHERE t.id = ? AND t.exit_case_id = ? AND t.organization_id = ?`).bind(taskMatch[2], taskMatch[1], context.organizationId).first<{ category: string; caseStatus: string; employeeUserId: string | null; managerUserId: string | null }>();
-    const mayUpdateTask = Boolean(task && task.caseStatus === "active" && (canManage || (task.category === "finance" && canFinance) || (task.category === "it" && canIT) || (task.category === "employee" && task.employeeUserId === context.userId) || (task.category === "manager" && task.managerUserId === context.userId)));
+    const task = await env.DB.prepare(`SELECT t.category, c.status as caseStatus, c.approval_status as approvalStatus, e.user_id as employeeUserId, m.user_id as managerUserId FROM employee_exit_tasks t JOIN employee_exit_cases c ON c.id = t.exit_case_id AND c.organization_id = t.organization_id JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id LEFT JOIN employees m ON m.id = c.manager_id AND m.organization_id = c.organization_id WHERE t.id = ? AND t.exit_case_id = ? AND t.organization_id = ?`).bind(taskMatch[2], taskMatch[1], context.organizationId).first<{ category: string; caseStatus: string; approvalStatus: string; employeeUserId: string | null; managerUserId: string | null }>();
+    const mayUpdateTask = Boolean(task && task.caseStatus === "active" && task.approvalStatus === "approved" && (canManage || (task.category === "finance" && canFinance) || (task.category === "it" && canIT) || (task.category === "employee" && task.employeeUserId === context.userId) || (task.category === "manager" && task.managerUserId === context.userId)));
     if (!mayUpdateTask) return error("This checklist item is not assigned to your role or the exit case is closed.", 403);
     const result = await env.DB.prepare(`UPDATE employee_exit_tasks SET status = ?, notes = ?, completed_by = CASE WHEN ? = 'pending' THEN NULL ELSE ? END, completed_at = CASE WHEN ? = 'pending' THEN NULL ELSE CURRENT_TIMESTAMP END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND exit_case_id = ? AND organization_id = ? AND EXISTS (SELECT 1 FROM employee_exit_cases c WHERE c.id = exit_case_id AND c.organization_id = ? AND c.status = 'active')`).bind(status, body.notes?.trim() || null, status, context.userId, status, taskMatch[2], taskMatch[1], context.organizationId, context.organizationId).run();
     if (!result.meta.changes) return error("Active exit case or checklist task not found.", 404);
@@ -892,7 +1112,7 @@ async function handleExitManagement(request: Request, env: Env, context: AuthCon
   const caseMatch = path.match(/^\/api\/hr\/exits\/([^/]+)$/);
   if (caseMatch && request.method === "PATCH") {
     const body = await request.json<{ status?: string; exitInterviewDate?: string | null; exitInterviewNotes?: string | null; employeeFeedback?: string | null; finalSalary?: number; leavePayout?: number; deductions?: number; outstandingBalance?: number; financeNotes?: string | null; referenceDocuments?: string | null }>();
-    const current = await env.DB.prepare(`SELECT id, employee_id as employeeId, status FROM employee_exit_cases WHERE id = ? AND organization_id = ?`).bind(caseMatch[1], context.organizationId).first<{ id: string; employeeId: string; status: string }>();
+    const current = await env.DB.prepare(`SELECT id, employee_id as employeeId, status, approval_status as approvalStatus FROM employee_exit_cases WHERE id = ? AND organization_id = ?`).bind(caseMatch[1], context.organizationId).first<{ id: string; employeeId: string; status: string; approvalStatus: string }>();
     if (!current) return error("Exit case not found.", 404);
     if (!canManage && !canFinance) return error("HR or finance administrator access is required to update this case.", 403);
     const financeKeys = ["finalSalary", "leavePayout", "deductions", "outstandingBalance", "financeNotes", "referenceDocuments"];
@@ -900,6 +1120,7 @@ async function handleExitManagement(request: Request, env: Env, context: AuthCon
     if (!canManage && hrKeys.some((key) => body[key as keyof typeof body] !== undefined)) return error("Only HR may update the interview or close an exit case.", 403);
     if (!canFinance && !canManage && financeKeys.some((key) => body[key as keyof typeof body] !== undefined)) return error("Finance administrator access is required to update financial reconciliation.", 403);
     if (current.status !== "active") return error("Only active exit cases can be updated.", 409);
+    if (current.approvalStatus !== "approved" && body.status !== "cancelled") return error("HR, finance, employee and IT exit actions are locked until the required separation sign-off is approved.", 409);
     const amountFields = [body.finalSalary, body.leavePayout, body.deductions, body.outstandingBalance].filter((value) => value !== undefined);
     if (amountFields.some((value) => !Number.isFinite(value) || Number(value) < 0 || Number(value) > 1_000_000_000_000) || (body.exitInterviewDate && !isIsoCalendarDate(body.exitInterviewDate)) || [body.exitInterviewNotes, body.employeeFeedback, body.financeNotes, body.referenceDocuments].some((value) => value != null && value.length > 4000)) return error("Check the date, finance amounts (0–1 trillion NGN) and notes (maximum 4,000 characters).");
     if (body.status && !["completed", "cancelled"].includes(body.status)) return error("An exit case can only be completed or cancelled.");
@@ -1173,6 +1394,44 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const context = secured.context;
 
   if (context.isDemo && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return error("The demo sandbox is read-only. Changes are not allowed.", 403);
+
+  if (mobilePath && path === "/api/push-token" && request.method === "POST") {
+    const body = await request.json<{ token?: string; platform?: string }>();
+    if (!body.token || body.token.length > 250 || !/^(Expo|Exponent)PushToken\[[A-Za-z0-9_-]+\]$/.test(body.token) || !["ios","android"].includes(body.platform || "")) return error("A valid Expo push token and iOS or Android platform are required.");
+    await env.DB.prepare(`INSERT INTO mobile_push_tokens (id, organization_id, user_id, token, platform) VALUES (?, ?, ?, ?, ?) ON CONFLICT(token) DO UPDATE SET organization_id = excluded.organization_id, user_id = excluded.user_id, platform = excluded.platform, updated_at = CURRENT_TIMESTAMP`).bind(`push-${crypto.randomUUID()}`, context.organizationId, context.userId, body.token, body.platform).run();
+    return json({ ok: true });
+  }
+  if (mobilePath && path === "/api/push-token" && request.method === "DELETE") {
+    const body = await request.json<{ token?: string }>();
+    if (body.token) await env.DB.prepare(`DELETE FROM mobile_push_tokens WHERE token = ? AND organization_id = ? AND user_id = ?`).bind(body.token, context.organizationId, context.userId).run();
+    else await env.DB.prepare(`DELETE FROM mobile_push_tokens WHERE organization_id = ? AND user_id = ?`).bind(context.organizationId, context.userId).run();
+    return json({ ok: true });
+  }
+
+  if (path === "/api/calendar/connections" && request.method === "GET") {
+    const connections = await env.DB.prepare(`SELECT provider, scopes, last_synced_at as lastSyncedAt, sync_error as syncError, revoked_at as revokedAt FROM calendar_provider_connections WHERE organization_id = ? AND user_id = ? ORDER BY provider`).bind(context.organizationId, context.userId).all();
+    return json({ data: connections.results || [], configuredProviders: { google: Boolean(env.GOOGLE_CALENDAR_CLIENT_ID && env.GOOGLE_CALENDAR_CLIENT_SECRET), microsoft: Boolean(env.MICROSOFT_CALENDAR_CLIENT_ID && env.MICROSOFT_CALENDAR_CLIENT_SECRET) } });
+  }
+  if (path === "/api/calendar/connect" && request.method === "POST") {
+    const body = await request.json<{ provider?: string }>(); const provider = body.provider;
+    if (!hasPermission(context, "operations.view") || !["google","microsoft"].includes(provider || "")) return error("Calendar access is not enabled or provider is invalid.", 403);
+    const google = provider === "google";
+    const clientId = google ? env.GOOGLE_CALENDAR_CLIENT_ID : env.MICROSOFT_CALENDAR_CLIENT_ID;
+    if (!clientId) return error(`Set the ${google ? "GOOGLE_CALENDAR_CLIENT_ID" : "MICROSOFT_CALENDAR_CLIENT_ID"} Worker variable before connecting this provider.`, 409);
+    if (!env.SESSION_SECRET) return error("Calendar integration requires SESSION_SECRET for encrypted token storage.", 409);
+    const state = crypto.randomUUID().replaceAll("-", "") + crypto.randomUUID().replaceAll("-", "");
+    await env.DB.prepare(`INSERT INTO calendar_oauth_states (token_hash, organization_id, user_id, provider, expires_at) VALUES (?, ?, ?, ?, datetime('now','+10 minutes'))`).bind(await hashToken(state), context.organizationId, context.userId, provider).run();
+    const redirectUri = `${env.APP_ORIGIN}/api/calendar/oauth/callback`;
+    const authUrl = google ? new URL("https://accounts.google.com/o/oauth2/v2/auth") : new URL("https://login.microsoftonline.com/common/oauth2/v2.0/authorize");
+    authUrl.search = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, response_type: "code", response_mode: "query", scope: google ? "https://www.googleapis.com/auth/calendar.events.owned" : "offline_access https://graph.microsoft.com/Calendars.ReadWrite", state, ...(google ? { access_type: "offline", prompt: "consent" } : { prompt: "select_account" }) }).toString();
+    return json({ authUrl: authUrl.toString() });
+  }
+  const calendarConnectionMatch = path.match(/^\/api\/calendar\/connections\/(google|microsoft)$/);
+  if (calendarConnectionMatch && request.method === "DELETE") {
+    await env.DB.prepare(`UPDATE calendar_provider_connections SET revoked_at = CURRENT_TIMESTAMP, encrypted_tokens = '', sync_cursor = NULL, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ? AND user_id = ? AND provider = ?`).bind(context.organizationId, context.userId, calendarConnectionMatch[1]).run();
+    await audit(env, context, "disconnected", "calendar_provider_connections", calendarConnectionMatch[1]);
+    return json({ ok: true });
+  }
 
   if (request.method === "GET" && path === "/api/search") {
     const query = new URL(request.url).searchParams.get("q")?.trim().slice(0, 100) || "";
@@ -1465,39 +1724,27 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (path === "/api/settings/backups" && request.method === "GET") {
     if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
     const backups = await env.DB.prepare(`SELECT id, checksum, size_bytes as sizeBytes, record_count as recordCount, created_at as createdAt FROM tenant_backups WHERE organization_id = ? ORDER BY created_at DESC LIMIT 30`).bind(context.organizationId).all();
-    return json({ data: backups.results || [] });
+    const settings = await env.DB.prepare(`SELECT enabled, frequency, retention_days as retentionDays, alert_email as alertEmail, last_run_at as lastRunAt, last_status as lastStatus, last_error as lastError, last_verified_at as lastVerifiedAt FROM tenant_backup_settings WHERE organization_id = ?`).bind(context.organizationId).first();
+    return json({ data: backups.results || [], settings: settings || { enabled: 0, frequency: "daily", retentionDays: 30, alertEmail: null, lastRunAt: null, lastStatus: null, lastError: null, lastVerifiedAt: null } });
+  }
+
+  if (path === "/api/settings/backups/schedule" && request.method === "PUT") {
+    if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
+    const body = await request.json<{ enabled?: boolean; frequency?: string; retentionDays?: number; alertEmail?: string | null }>();
+    if (typeof body.enabled !== "boolean" || !["daily", "weekly"].includes(body.frequency || "") || !Number.isInteger(body.retentionDays) || Number(body.retentionDays) < 7 || Number(body.retentionDays) > 365 || (body.alertEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.alertEmail))) return error("Choose daily or weekly snapshots, 7–365 retention days, and a valid optional alert address.");
+    await env.DB.prepare(`INSERT INTO tenant_backup_settings (organization_id, enabled, frequency, retention_days, alert_email, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(organization_id) DO UPDATE SET enabled = excluded.enabled, frequency = excluded.frequency, retention_days = excluded.retention_days, alert_email = excluded.alert_email, updated_at = CURRENT_TIMESTAMP`).bind(context.organizationId, body.enabled ? 1 : 0, body.frequency, body.retentionDays, body.alertEmail?.trim().toLowerCase() || null).run();
+    await audit(env, context, "updated", "tenant_backup_settings", context.organizationId, { enabled: body.enabled, frequency: body.frequency, retentionDays: body.retentionDays });
+    return json({ ok: true });
   }
 
   if (path === "/api/settings/backups" && request.method === "POST") {
     if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
-    const id = `backup-${crypto.randomUUID()}`;
-    const tables: Record<string, unknown[]> = {};
-    let recordCount = 0;
-    const tableSnapshots = await env.DB.batch(BACKUP_TABLES.map((table) => env.DB.prepare(`SELECT * FROM ${table} WHERE organization_id = ?`).bind(context.organizationId)));
-    for (const [index, table] of BACKUP_TABLES.entries()) {
-      const rows = tableSnapshots[index].results || [];
-      tables[table] = rows as unknown[];
-      recordCount += rows.length;
-    }
-    const docs = (tables.documents || []) as { r2_key?: string }[];
-    const files: { originalKey: string; backupKey: string }[] = [];
-    const missingFiles: string[] = [];
-    for (const doc of docs) {
-      if (!doc.r2_key) continue;
-      const source = await env.FILES.get(doc.r2_key);
-      if (!source) { missingFiles.push(doc.r2_key); continue; }
-      const backupKey = `tenant-backups/${context.organizationId}/${id}/files/${await hashToken(doc.r2_key)}`;
-      await env.FILES.put(backupKey, source.body, { httpMetadata: source.httpMetadata, customMetadata: { originalKeyHash: await hashToken(doc.r2_key) } });
-      files.push({ originalKey: doc.r2_key, backupKey });
-    }
-    if (missingFiles.length) return error(`Backup was not completed: ${missingFiles.length} document file(s) are missing from R2. Resolve storage integrity before retrying.`, 409);
-    const payload = JSON.stringify({ schemaVersion: 1, organizationId: context.organizationId, generatedAt: new Date().toISOString(), tables, files });
-    const checksum = await hashToken(payload);
-    const objectKey = `tenant-backups/${context.organizationId}/${id}/snapshot.json`;
-    await env.FILES.put(objectKey, payload, { httpMetadata: { contentType: "application/json" }, customMetadata: { checksum, schemaVersion: "1" } });
-    await env.DB.prepare(`INSERT INTO tenant_backups (id, organization_id, object_key, checksum, size_bytes, record_count, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, objectKey, checksum, new TextEncoder().encode(payload).byteLength, recordCount, context.userId).run();
-    await audit(env, context, "created", "tenant_backups", id, { checksum, recordCount, fileCount: files.length });
-    return json({ id, checksum, recordCount, fileCount: files.length, createdAt: new Date().toISOString() }, { status: 201 });
+    try {
+      const created = await createTenantBackup(env, context.organizationId, context.userId);
+      await env.DB.prepare(`INSERT INTO tenant_backup_settings (organization_id, last_run_at, last_status, last_error, last_verified_at, updated_at) VALUES (?, CURRENT_TIMESTAMP, 'success', NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) ON CONFLICT(organization_id) DO UPDATE SET last_run_at = CURRENT_TIMESTAMP, last_status = 'success', last_error = NULL, last_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP`).bind(context.organizationId).run();
+      await audit(env, context, "created", "tenant_backups", created.id, { checksum: created.checksum, recordCount: created.recordCount, fileCount: created.fileCount });
+      return json(created, { status: 201 });
+    } catch (cause) { return error(`Backup was not completed: ${cause instanceof Error ? cause.message : "R2 or D1 snapshot failure"}`, 409); }
   }
 
   const backupMatch = path.match(/^\/api\/settings\/backups\/([^/]+)(?:\/(download|restore))?$/);
@@ -1581,29 +1828,171 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (path.startsWith("/api/payroll") && !hasPermission(context, "payroll.view") && !hasPermission(context, "payroll.manage")) return error("You do not have permission to access the payroll administration workspace.", 403);
 
   if (path.startsWith("/api/hr/") && !hasPermission(context, "employees.view")) return error("You do not have permission to access HR records.", 403);
-  const operationsPaths = ["/api/tasks", "/api/projects", "/api/assets", "/api/vendors", "/api/tickets", "/api/calendar", "/api/customers", "/api/files", "/api/budgets", "/api/reports", "/api/operations/members"];
+  const operationsPaths = ["/api/tasks", "/api/projects", "/api/assets", "/api/vendors", "/api/purchases", "/api/tickets", "/api/calendar", "/api/customers", "/api/files", "/api/budgets", "/api/reports", "/api/operations/members"];
   const operationsPath = operationsPaths.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
   if (operationsPath && !hasPermission(context, "operations.view")) return error("You do not have access to operations modules.", 403);
-  if (operationsPath && request.method !== "GET" && !(path === "/api/tickets" && request.method === "POST") && !hasPermission(context, "operations.manage")) return error("Operations manager permission is required for this change.", 403);
+  if (operationsPath && request.method !== "GET" && !(path === "/api/tickets" && request.method === "POST") && path !== "/api/purchases" && !path.startsWith("/api/purchases/") && !hasPermission(context, "operations.manage")) return error("Operations manager permission is required for this change.", 403);
 
   if (path === "/api/approval-workflows") {
     if (!hasPermission(context, "requests.manage")) return error("Request administration permission is required to configure approval routing.", 403);
     if (request.method === "GET") {
-      const row = await env.DB.prepare(`SELECT approval_workflows_json as workflowsJson, financial_fallback_role as financialFallbackRole FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ workflowsJson: string; financialFallbackRole: string }>();
+      const row = await env.DB.prepare(`SELECT approval_workflows_json as workflowsJson, financial_fallback_role as financialFallbackRole, exit_approval_role as exitApprovalRole FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ workflowsJson: string; financialFallbackRole: string; exitApprovalRole: string }>();
       let workflows: Record<string, string> = {};
       try { workflows = JSON.parse(row?.workflowsJson || "{}"); } catch { /* use empty settings */ }
-      return json({ workflows: { Operational: workflows.Operational || "Manager", Access: workflows.Access || "Manager", HR: workflows.HR || "HR Admin", Leave: workflows.Leave || "HR Admin", Other: workflows.Other || "Manager" }, financialFlow: { primaryRole: "CEO", fallbackRole: row?.financialFallbackRole || "HR Admin", fallbackTrigger: "approver_unavailable" } });
+      return json({ workflows: { Operational: workflows.Operational || "Manager", Access: workflows.Access || "Manager", HR: workflows.HR || "HR Admin", Leave: workflows.Leave || "HR Admin", Other: workflows.Other || "Manager" }, financialFlow: { primaryRole: "CEO", fallbackRole: row?.financialFallbackRole || "HR Admin", fallbackTrigger: "approver_unavailable" }, exitApprovalRole: row?.exitApprovalRole || "CEO" });
     }
     if (request.method === "PATCH") {
-      const body = await request.json<{ workflows?: Record<string, string>; financialFallbackRole?: string }>(); const workflows = body.workflows;
+      const body = await request.json<{ workflows?: Record<string, string>; financialFallbackRole?: string; exitApprovalRole?: string }>(); const workflows = body.workflows;
       const categories = ["Operational", "Access", "HR", "Leave", "Other"];
       const allowedRoles = ["Manager", "HR Admin", "CEO"];
       const financialFallbackRole = body.financialFallbackRole || "HR Admin";
-      if (!workflows || categories.some((category) => !allowedRoles.includes(workflows[category])) || !["HR Admin", "Organization Admin"].includes(financialFallbackRole)) return error("Choose a valid approver for each category and HR Admin or Organization Admin as the financial fallback.");
-      await env.DB.prepare(`UPDATE organization_settings SET approval_workflows_json = ?, financial_fallback_role = ?, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(JSON.stringify(Object.fromEntries(categories.map((category) => [category, workflows[category]]))), financialFallbackRole, context.organizationId).run();
+      const exitApprovalRole = body.exitApprovalRole || "CEO";
+      if (!workflows || categories.some((category) => !allowedRoles.includes(workflows[category])) || !["HR Admin", "Organization Admin"].includes(financialFallbackRole) || !["CEO","HR Admin"].includes(exitApprovalRole)) return error("Choose valid routing roles, a CEO-unavailable fallback, and CEO or HR Admin as the separation sign-off.");
+      await env.DB.prepare(`UPDATE organization_settings SET approval_workflows_json = ?, financial_fallback_role = ?, exit_approval_role = ?, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(JSON.stringify(Object.fromEntries(categories.map((category) => [category, workflows[category]]))), financialFallbackRole, exitApprovalRole, context.organizationId).run();
       await audit(env, context, "updated", "approval_workflows", context.organizationId, { workflows, financialFlow: { primaryRole: "CEO", fallbackRole: financialFallbackRole, fallbackTrigger: "approver_unavailable" } });
-      return json({ ok: true, workflows, financialFlow: { primaryRole: "CEO", fallbackRole: financialFallbackRole, fallbackTrigger: "approver_unavailable" } });
+      return json({ ok: true, workflows, financialFlow: { primaryRole: "CEO", fallbackRole: financialFallbackRole, fallbackTrigger: "approver_unavailable" }, exitApprovalRole });
     }
+  }
+
+  if (path === "/api/workflow-admin") {
+    if (!hasPermission(context, "requests.manage")) return error("HR or organization administration permission is required to configure workflow automation.", 403);
+    if (request.method === "GET") {
+      const [sla, templates] = await Promise.all([
+        env.DB.prepare(`SELECT request_type as requestType, due_hours as dueHours, reminder_hours as reminderHours, escalation_role as escalationRole FROM workflow_sla_settings WHERE organization_id = ? ORDER BY request_type`).bind(context.organizationId).all(),
+        env.DB.prepare(`SELECT id, name, category, steps_json as stepsJson, updated_at as updatedAt FROM workflow_templates WHERE organization_id = ? ORDER BY category,name`).bind(context.organizationId).all(),
+      ]);
+      return json({ sla: sla.results || [], templates: templates.results || [] });
+    }
+    if (request.method === "PUT") {
+      const body = await request.json<{ sla?: { requestType: string; dueHours: number; reminderHours: number; escalationRole: string }[] }>();
+      const allowedTypes = ["Operational","Access","HR","Leave","Expense","Purchase","Budget","Other"];
+      if (!Array.isArray(body.sla) || body.sla.length > allowedTypes.length || body.sla.some((s) => !allowedTypes.includes(s.requestType) || !Number.isInteger(s.dueHours) || s.dueHours < 1 || s.dueHours > 8760 || !Number.isInteger(s.reminderHours) || s.reminderHours < 1 || s.reminderHours > 8760 || !["HR Admin","CEO","Organization Admin"].includes(s.escalationRole))) return error("SLA rules must use supported request types, 1–8,760 hours, and an allowed escalation role.");
+      await env.DB.batch(body.sla.map((s) => env.DB.prepare(`INSERT INTO workflow_sla_settings (organization_id, request_type, due_hours, reminder_hours, escalation_role, updated_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) ON CONFLICT(organization_id,request_type) DO UPDATE SET due_hours = excluded.due_hours, reminder_hours = excluded.reminder_hours, escalation_role = excluded.escalation_role, updated_at = CURRENT_TIMESTAMP`).bind(context.organizationId, s.requestType, s.dueHours, s.reminderHours, s.escalationRole)));
+      await audit(env, context, "updated", "workflow_sla_settings", context.organizationId, { rules: body.sla.length });
+      return json({ ok: true });
+    }
+    if (request.method === "POST") {
+      const body = await request.json<{ name?: string; category?: string; steps?: { title: string; details?: string }[] }>();
+      const steps = body.steps || [];
+      if (!body.name?.trim() || body.name.length > 100 || !["onboarding","offboarding","task"].includes(body.category || "") || steps.length < 1 || steps.length > 50 || steps.some((step) => !step.title?.trim() || step.title.length > 160 || (step.details || "").length > 1000)) return error("Add a template name, supported category, and 1–50 concise steps.");
+      const id = `workflow-template-${crypto.randomUUID()}`;
+      await env.DB.prepare(`INSERT INTO workflow_templates (id, organization_id, name, category, steps_json, created_by) VALUES (?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.name.trim(), body.category, JSON.stringify(steps), context.userId).run();
+      await audit(env, context, "created", "workflow_templates", id, { category: body.category, name: body.name.trim() });
+      return json({ id }, { status: 201 });
+    }
+  }
+  const workflowTemplateMatch = path.match(/^\/api\/workflow-admin\/templates\/([^/]+)$/);
+  const workflowTemplateApplyMatch = path.match(/^\/api\/workflow-admin\/templates\/([^/]+)\/apply$/);
+  if (workflowTemplateApplyMatch && request.method === "POST") {
+    if (!hasPermission(context, "requests.manage")) return error("HR or organization administration permission is required to apply workflow templates.", 403);
+    const body = await request.json<{ assigneeId?: string | null; exitCaseId?: string | null; dueDate?: string | null }>();
+    const template = await env.DB.prepare(`SELECT id, name, category, steps_json as stepsJson FROM workflow_templates WHERE id = ? AND organization_id = ?`).bind(workflowTemplateApplyMatch[1], context.organizationId).first<{ id: string; name: string; category: string; stepsJson: string }>();
+    if (!template) return error("Workflow template not found.", 404);
+    let steps: { title: string; details?: string }[];
+    try { steps = JSON.parse(template.stepsJson); } catch { return error("This workflow template is invalid. Edit or recreate it before applying.", 409); }
+    if (!Array.isArray(steps) || steps.length === 0 || steps.length > 50) return error("This workflow template has no valid steps.", 409);
+    if (body.dueDate && !isIsoCalendarDate(body.dueDate)) return error("Choose a valid task due date.");
+    if (body.assigneeId) {
+      const assignee = await env.DB.prepare(`SELECT id FROM employees WHERE id = ? AND organization_id = ? AND deleted_at IS NULL AND status = 'active'`).bind(body.assigneeId, context.organizationId).first();
+      if (!assignee) return error("Choose an active employee in this organization as the assignee.");
+    }
+    if (template.category === "offboarding") {
+      if (!body.exitCaseId) return error("Choose an exit case to apply this offboarding checklist.");
+      const exitCase = await env.DB.prepare(`SELECT id, approval_status as approvalStatus, status FROM employee_exit_cases WHERE id = ? AND organization_id = ?`).bind(body.exitCaseId, context.organizationId).first<{ id: string; approvalStatus: string; status: string }>();
+      if (!exitCase || exitCase.status !== "active" || exitCase.approvalStatus === "rejected") return error("Choose an active, non-declined exit case.");
+      const existing = await env.DB.prepare(`SELECT COUNT(*) as count FROM employee_exit_tasks WHERE organization_id = ? AND exit_case_id = ? AND title IN (${steps.map(() => "?").join(",")})`).bind(context.organizationId, body.exitCaseId, ...steps.map((step) => step.title.trim())).first<{ count: number }>();
+      if ((existing?.count || 0) > 0) return error("One or more template steps already exist on this exit case; no duplicate steps were added.", 409);
+      await env.DB.batch(steps.map((step, index) => env.DB.prepare(`INSERT INTO employee_exit_tasks (id, organization_id, exit_case_id, category, title, details, sort_order) VALUES (?, ?, ?, 'hr', ?, ?, (SELECT COALESCE(MAX(sort_order),0) + ? FROM employee_exit_tasks WHERE organization_id = ? AND exit_case_id = ?))`).bind(`exit-task-${crypto.randomUUID()}`, context.organizationId, body.exitCaseId, step.title.trim(), step.details?.trim() || `Added from workflow template: ${template.name}.`, index + 1, context.organizationId, body.exitCaseId)));
+      await audit(env, context, "applied", "workflow_templates", template.id, { exitCaseId: body.exitCaseId, stepCount: steps.length });
+      return json({ ok: true, created: steps.length, target: "exit_case" }, { status: 201 });
+    }
+    await env.DB.batch(steps.map((step) => env.DB.prepare(`INSERT INTO tasks (id, organization_id, title, description, assignee_id, creator_id, due_date) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .bind(`task-${crypto.randomUUID()}`, context.organizationId, step.title.trim(), step.details?.trim() || `Created from workflow template: ${template.name}.`, body.assigneeId || null, context.userId, body.dueDate || null)));
+    await audit(env, context, "applied", "workflow_templates", template.id, { assigneeId: body.assigneeId || null, stepCount: steps.length });
+    return json({ ok: true, created: steps.length, target: "tasks" }, { status: 201 });
+  }
+  if (workflowTemplateMatch && request.method === "DELETE") {
+    if (!hasPermission(context, "requests.manage")) return error("HR or organization administration permission is required.", 403);
+    const result = await env.DB.prepare(`DELETE FROM workflow_templates WHERE id = ? AND organization_id = ?`).bind(workflowTemplateMatch[1], context.organizationId).run();
+    if (!result.meta.changes) return error("Workflow template not found.", 404);
+    await audit(env, context, "deleted", "workflow_templates", workflowTemplateMatch[1]);
+    return json({ ok: true });
+  }
+
+  if (path === "/api/purchases" && request.method === "GET") {
+    const data = await env.DB.prepare(`SELECT p.id, p.title, p.description, p.amount, p.currency, p.status, p.items_json as itemsJson, p.quotes_json as quotesJson, p.receipt_reference as receiptReference, p.invoice_reference as invoiceReference, p.received_amount as receivedAmount, p.created_at as createdAt, u.full_name as requester, v.name as vendor, b.name as budget, po.po_number as poNumber FROM purchase_requests p JOIN users u ON u.id = p.requester_id LEFT JOIN vendors v ON v.id = p.vendor_id AND v.organization_id = p.organization_id LEFT JOIN budgets b ON b.id = p.budget_id AND b.organization_id = p.organization_id LEFT JOIN purchase_orders po ON po.purchase_request_id = p.id AND po.organization_id = p.organization_id WHERE p.organization_id = ? ORDER BY p.created_at DESC LIMIT 100`).bind(context.organizationId).all();
+    return json({ data: data.results || [] });
+  }
+  if (path === "/api/purchases" && request.method === "POST") {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to create purchase requests.", 403);
+    const body = await request.json<{ title?: string; description?: string; amount?: number; vendorId?: string; budgetId?: string; items?: { description: string; quantity: number; unitPrice: number }[]; quotes?: { vendor: string; amount: number; reference?: string }[] }>();
+    const amount = Number(body.amount); const items = body.items || []; const quotes = body.quotes || [];
+    if (!body.title?.trim() || body.title.length > 120 || !body.description?.trim() || body.description.length > 2000 || !Number.isFinite(amount) || amount <= 0 || items.length > 100 || quotes.length > 10 || items.some((i) => !i.description?.trim() || i.description.length > 200 || !Number.isFinite(i.quantity) || i.quantity <= 0 || !Number.isFinite(i.unitPrice) || i.unitPrice < 0) || quotes.some((q) => !q.vendor?.trim() || !Number.isFinite(q.amount) || q.amount <= 0)) return error("Provide a title, description, positive total, valid line items and up to ten comparable quotes.");
+    if (body.vendorId && !await env.DB.prepare(`SELECT id FROM vendors WHERE id = ? AND organization_id = ?`).bind(body.vendorId, context.organizationId).first()) return error("Vendor not found in this organization.", 404);
+    if (body.budgetId && !await env.DB.prepare(`SELECT id FROM budgets WHERE id = ? AND organization_id = ?`).bind(body.budgetId, context.organizationId).first()) return error("Budget not found in this organization.", 404);
+    const id = `purchase-${crypto.randomUUID()}`;
+    await env.DB.prepare(`INSERT INTO purchase_requests (id, organization_id, title, description, requester_id, vendor_id, budget_id, amount, currency, items_json, quotes_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT currency FROM organizations WHERE id = ?), ?, ?)`)
+      .bind(id, context.organizationId, body.title.trim(), body.description.trim(), context.userId, body.vendorId || null, body.budgetId || null, amount, context.organizationId, JSON.stringify(items), JSON.stringify(quotes)).run();
+    await audit(env, context, "created", "purchase_requests", id, { amount, vendorId: body.vendorId || null, budgetId: body.budgetId || null });
+    return json({ id, status: "draft" }, { status: 201 });
+  }
+  const purchaseMatch = path.match(/^\/api\/purchases\/([^/]+)(?:\/(submit|receive|match))?$/);
+  if (purchaseMatch && request.method === "POST" && purchaseMatch[2] === "submit") {
+    const p = await env.DB.prepare(`SELECT id, title, requester_id as requesterId, amount, budget_id as budgetId, quotes_json as quotesJson, status FROM purchase_requests WHERE id = ? AND organization_id = ?`).bind(purchaseMatch[1], context.organizationId).first<{ id: string; title: string; requesterId: string; amount: number; budgetId: string | null; quotesJson: string; status: string }>();
+    if (!p) return error("Purchase request not found.", 404);
+    if (p.requesterId !== context.userId && !hasPermission(context, "operations.manage")) return error("Only the requester or an operations administrator can submit this purchase.", 403);
+    if (p.status !== "draft") return error("Only a draft purchase can be submitted.", 409);
+    let quoteRows: { vendor: string; amount: number; reference?: string }[] = [];
+    try { quoteRows = JSON.parse(p.quotesJson || "[]") as typeof quoteRows; } catch { return error("Quote comparison data is invalid. Edit the purchase and add valid quotes.", 409); }
+    if (!Array.isArray(quoteRows) || quoteRows.length < 2) return error("Add at least two comparable supplier quotes before submitting for CEO approval.", 409);
+    if (!quoteRows.some((quote) => Number(quote.amount) === Number(p.amount))) return error("The requested total must match one of the entered supplier quotes so the CEO can compare the selected offer.", 409);
+    const quoteSummary = quoteRows.map((quote) => `${quote.vendor}: ${Number(quote.amount).toLocaleString()}${quote.reference ? ` (${quote.reference})` : ""}`).join("; ");
+    if (p.budgetId) {
+      const budget = await env.DB.prepare(`SELECT allocated, spent, COALESCE((SELECT SUM(amount) FROM budget_reservations r WHERE r.budget_id = budgets.id AND r.organization_id = budgets.organization_id AND r.status = 'reserved'),0) as reserved FROM budgets WHERE id = ? AND organization_id = ?`).bind(p.budgetId, context.organizationId).first<{ allocated: number; spent: number; reserved: number }>();
+      if (!budget || Number(budget.allocated) - Number(budget.spent) - Number(budget.reserved) < p.amount) return error("The selected budget does not have enough unreserved funds for this purchase.", 409);
+    }
+    const purchaseSla = await env.DB.prepare(`SELECT due_hours as dueHours FROM workflow_sla_settings WHERE organization_id = ? AND request_type = 'Purchase'`).bind(context.organizationId).first<{ dueHours: number }>();
+    const approvalDueAt = new Date(Date.now() + (purchaseSla?.dueHours || 48) * 3600000).toISOString();
+    const approvalId = `request-${crypto.randomUUID()}`;
+    const statements = [
+      env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json, due_at) VALUES (?, ?, 'Purchase', ?, ?, ?, ?, (SELECT currency FROM organizations WHERE id = ?), 'CEO', 'pending', 1, ?, ?)`)
+        .bind(approvalId, context.organizationId, p.id, p.title, p.requesterId, p.amount, context.organizationId, JSON.stringify({ details: `Supplier quotes: ${quoteSummary}`, approvalPolicy: ["CEO"], purchaseRequestId: p.id, quotes: quoteRows }), approvalDueAt),
+      env.DB.prepare(`UPDATE purchase_requests SET status = 'pending_approval', approval_request_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'draft'`).bind(approvalId, p.id, context.organizationId),
+      ...(p.budgetId ? [env.DB.prepare(`INSERT INTO budget_reservations (id, organization_id, budget_id, purchase_request_id, amount) VALUES (?, ?, ?, ?, ?)`).bind(`reservation-${crypto.randomUUID()}`, context.organizationId, p.budgetId, p.id, p.amount)] : []),
+    ];
+    await env.DB.batch(statements);
+    await notifyApprovers(env, context, "CEO", p.title, `A purchase request for ${p.amount.toLocaleString()} is pending your approval.`);
+    await audit(env, context, "submitted_for_approval", "purchase_requests", p.id, { approvalId, amount: p.amount });
+    return json({ ok: true, approvalId, requiredRole: "CEO" });
+  }
+  if (purchaseMatch && request.method === "POST" && purchaseMatch[2] === "receive") {
+    if (!hasPermission(context, "operations.manage") && !hasPermission(context, "expenses.manage")) return error("Finance or operations administrator access is required to record goods receipt and invoice references.", 403);
+    const body = await request.json<{ receivedAmount?: number; receiptReference?: string; invoiceReference?: string }>();
+    const p = await env.DB.prepare(`SELECT id, amount, status FROM purchase_requests WHERE id = ? AND organization_id = ?`).bind(purchaseMatch[1], context.organizationId).first<{ id: string; amount: number; status: string }>();
+    if (!p || !["ordered","partially_received","received"].includes(p.status)) return error("Only an approved purchase order can record receipt and invoice details.", 409);
+    const received = Number(body.receivedAmount);
+    if (!Number.isFinite(received) || received < 0 || received > p.amount || !body.receiptReference?.trim() || !body.invoiceReference?.trim() || body.receiptReference.length > 120 || body.invoiceReference.length > 120) return error("Record valid received value plus both a receipt reference and supplier invoice reference.");
+    const next = received >= p.amount ? "received" : received > 0 ? "partially_received" : p.status;
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE purchase_requests SET received_amount = ?, receipt_reference = ?, invoice_reference = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(received, body.receiptReference.trim(), body.invoiceReference.trim(), next, p.id, context.organizationId),
+      env.DB.prepare(`UPDATE purchase_orders SET status = ? WHERE purchase_request_id = ? AND organization_id = ?`).bind(next, p.id, context.organizationId),
+    ]);
+    await audit(env, context, "receipt_recorded", "purchase_requests", p.id, { received, receiptReference: body.receiptReference, invoiceReference: body.invoiceReference });
+    return json({ ok: true, status: next });
+  }
+  if (purchaseMatch && request.method === "POST" && purchaseMatch[2] === "match") {
+    if (!hasPermission(context, "expenses.manage") && !hasPermission(context, "operations.manage")) return error("Finance administrator access is required to complete a three-way match.", 403);
+    const p = await env.DB.prepare(`SELECT id, amount, received_amount as receivedAmount, receipt_reference as receiptReference, invoice_reference as invoiceReference, status FROM purchase_requests WHERE id = ? AND organization_id = ?`).bind(purchaseMatch[1], context.organizationId).first<{ id: string; amount: number; receivedAmount: number; receiptReference: string | null; invoiceReference: string | null; status: string }>();
+    if (!p || p.status !== "received" || !p.receiptReference || !p.invoiceReference || Number(p.receivedAmount) !== Number(p.amount)) return error("Three-way match requires an approved PO, full receipt, and recorded supplier invoice and goods-received references.", 409);
+    const req = await env.DB.prepare(`SELECT budget_id as budgetId FROM purchase_requests WHERE id = ? AND organization_id = ?`).bind(p.id, context.organizationId).first<{ budgetId: string | null }>();
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE purchase_requests SET status = 'matched', matched_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(p.id, context.organizationId),
+      env.DB.prepare(`UPDATE purchase_orders SET status = 'closed' WHERE purchase_request_id = ? AND organization_id = ?`).bind(p.id, context.organizationId),
+      env.DB.prepare(`UPDATE budget_reservations SET status = 'consumed', updated_at = CURRENT_TIMESTAMP WHERE purchase_request_id = ? AND organization_id = ?`).bind(p.id, context.organizationId),
+      ...(req?.budgetId ? [env.DB.prepare(`UPDATE budgets SET spent = spent + ? WHERE id = ? AND organization_id = ?`).bind(p.amount, req.budgetId, context.organizationId)] : []),
+    ]);
+    await audit(env, context, "three_way_matched", "purchase_requests", p.id, { amount: p.amount });
+    return json({ ok: true, status: "matched" });
   }
 
   if (request.method === "GET" && path === "/api/reports/summary") {
@@ -1836,7 +2225,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "GET" && path === "/api/payroll/runs") {
     if (!hasPermission(context, "payroll.view") && !hasPermission(context, "payroll.manage")) return error("Payroll viewing permission is required.", 403);
-    const runs = await env.DB.prepare(`SELECT id, period_start as periodStart, period_end as periodEnd, payment_date as paymentDate, currency, status, employee_count as employeeCount, gross_total as grossTotal, deductions_total as deductionsTotal, employer_cost_total as employerCostTotal, net_total as netTotal, created_at as createdAt FROM payroll_runs WHERE organization_id = ? ORDER BY period_start DESC LIMIT 100`).bind(context.organizationId).all();
+    const runs = await env.DB.prepare(`SELECT id, period_start as periodStart, period_end as periodEnd, payment_date as paymentDate, currency, status, employee_count as employeeCount, gross_total as grossTotal, deductions_total as deductionsTotal, employer_cost_total as employerCostTotal, net_total as netTotal, preflight_warnings_json as preflightWarningsJson, created_at as createdAt FROM payroll_runs WHERE organization_id = ? ORDER BY period_start DESC LIMIT 100`).bind(context.organizationId).all();
     return json({ data: runs.results || [] });
   }
 
@@ -1858,6 +2247,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       if (!person.effectiveFrom || !isoDate(person.effectiveFrom) || person.effectiveFrom > periodEnd) return [`${name}: pay profile is not effective for this period`];
       return [];
     });
+    const duplicateNumbers = await env.DB.prepare(`SELECT employee_number as employeeNumber, COUNT(*) as count FROM employees WHERE organization_id = ? AND status = 'active' AND deleted_at IS NULL AND start_date <= ? GROUP BY employee_number HAVING COUNT(*) > 1`).bind(context.organizationId, body.periodEnd).all<{ employeeNumber: string; count: number }>();
+    blockers.push(...(duplicateNumbers.results || []).map((row) => `Duplicate employee number ${row.employeeNumber} is assigned to ${row.count} active employee records`));
     if (blockers.length) return json({ error: `Payroll preflight found ${blockers.length} blocking issue${blockers.length === 1 ? "" : "s"}. No run was created.`, blockers: blockers.slice(0, 50) }, { status: 409 });
     const employees = await env.DB.prepare(`SELECT e.id as employeeId, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.job_title as jobTitle, e.start_date as startDate, p.base_salary as baseSalary, p.currency as payCurrency, c.id as componentId, c.code as componentCode, c.name as componentName, c.kind as componentKind, c.taxable, c.pensionable, ec.amount as componentAmount FROM employees e JOIN employee_pay_profiles p ON p.employee_id = e.id AND p.organization_id = e.organization_id AND p.status = 'active' AND p.pay_frequency = (SELECT pay_frequency FROM payroll_settings WHERE organization_id = e.organization_id) LEFT JOIN employee_pay_components ec ON ec.employee_id = e.id AND ec.organization_id = e.organization_id AND ec.effective_from <= ? AND (ec.effective_to IS NULL OR ec.effective_to >= ?) LEFT JOIN payroll_components c ON c.id = ec.component_id AND c.organization_id = e.organization_id WHERE e.organization_id = ? AND e.status = 'active' AND e.deleted_at IS NULL ORDER BY e.employee_number`).bind(body.periodEnd, body.periodStart, context.organizationId).all<Record<string, unknown>>();
     const byEmployee = new Map<string, Record<string, unknown>[]>();
@@ -1919,21 +2310,22 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       calculated.push({ id: `pri-${crypto.randomUUID()}`, employeeId, employeeNumber: String(employee.employeeNumber), employeeName: `${employee.firstName} ${employee.lastName}`, jobTitle: String(employee.jobTitle), baseSalary: prorate(baseSalary), gross: prorate(gross), taxable: prorate(taxable), tax: prorate(tax), employeePension: prorate(employeePension), employerPension: prorate(employerPension), otherDeductions: prorate(otherDeductions), employerContributions: prorate(employerContributions), net: prorate(net), breakdown: { currency: config.currency, lines, prorated: factor !== 1, prorationFactor: factor, taxBands } });
     }
     const sum = (key: "gross" | "tax" | "employeePension" | "employerPension" | "otherDeductions" | "employerContributions" | "net") => calculated.reduce((total, item) => total + item[key], 0);
-    const statements: D1PreparedStatement[] = [env.DB.prepare(`INSERT INTO payroll_runs (id, organization_id, period_start, period_end, payment_date, currency, status, employee_count, gross_total, deductions_total, employer_cost_total, net_total, created_by) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?)`)
-      .bind(runId, context.organizationId, body.periodStart, body.periodEnd, body.paymentDate, config.currency, calculated.length, sum("gross"), sum("tax") + sum("employeePension") + sum("otherDeductions"), sum("gross") + sum("employerPension") + sum("employerContributions"), sum("net"), context.userId)];
+    const preflightWarnings = calculated.filter((item) => item.gross > 0 && item.otherDeductions / item.gross > 0.4).map((item) => `${item.employeeName}: additional deductions exceed 40% of gross earnings; verify authorization and policy.`);
+    const statements: D1PreparedStatement[] = [env.DB.prepare(`INSERT INTO payroll_runs (id, organization_id, period_start, period_end, payment_date, currency, status, employee_count, gross_total, deductions_total, employer_cost_total, net_total, created_by, preflight_warnings_json) VALUES (?, ?, ?, ?, ?, ?, 'draft', ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(runId, context.organizationId, body.periodStart, body.periodEnd, body.paymentDate, config.currency, calculated.length, sum("gross"), sum("tax") + sum("employeePension") + sum("otherDeductions"), sum("gross") + sum("employerPension") + sum("employerContributions"), sum("net"), context.userId, JSON.stringify(preflightWarnings))];
     for (const item of calculated) statements.push(env.DB.prepare(`INSERT INTO payroll_run_items (id, organization_id, payroll_run_id, employee_id, employee_number, employee_name, job_title, base_salary, gross_pay, taxable_pay, paye_tax, employee_pension, employer_pension, other_deductions, employer_contributions, net_pay, breakdown_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .bind(item.id, context.organizationId, runId, item.employeeId, item.employeeNumber, item.employeeName, item.jobTitle, item.baseSalary, item.gross, item.taxable, item.tax, item.employeePension, item.employerPension, item.otherDeductions, item.employerContributions, item.net, JSON.stringify(item.breakdown)));
     await env.DB.batch(statements);
     await audit(env, context, "created", "payroll_runs", runId, { periodStart: body.periodStart, periodEnd: body.periodEnd, employeeCount: calculated.length });
     await notifyApprovers(env, context, "Finance Admin", `Payroll run · ${body.periodStart} to ${body.periodEnd}`, `A payroll run covering ${calculated.length} employees is ready for finance review.`);
-    return json({ id: runId, employeeCount: calculated.length, status: "draft" }, { status: 201 });
+    return json({ id: runId, employeeCount: calculated.length, status: "draft", preflightWarnings }, { status: 201 });
   }
 
   const payrollRunMatch = path.match(/^\/api\/payroll\/runs\/([^/]+)(?:\/(action|payslips|export|payout))?$/);
   if (payrollRunMatch && request.method === "GET") {
     if (!hasPermission(context, "payroll.view") && !hasPermission(context, "payroll.manage")) return error("Payroll viewing permission is required.", 403);
     const runId = payrollRunMatch[1];
-    const run = await env.DB.prepare(`SELECT id, period_start as periodStart, period_end as periodEnd, payment_date as paymentDate, currency, status, employee_count as employeeCount, gross_total as grossTotal, deductions_total as deductionsTotal, employer_cost_total as employerCostTotal, net_total as netTotal, created_at as createdAt FROM payroll_runs WHERE id = ? AND organization_id = ?`).bind(runId, context.organizationId).first();
+    const run = await env.DB.prepare(`SELECT id, period_start as periodStart, period_end as periodEnd, payment_date as paymentDate, currency, status, employee_count as employeeCount, gross_total as grossTotal, deductions_total as deductionsTotal, employer_cost_total as employerCostTotal, net_total as netTotal, preflight_warnings_json as preflightWarningsJson, created_at as createdAt FROM payroll_runs WHERE id = ? AND organization_id = ?`).bind(runId, context.organizationId).first();
     if (!run) return error("Payroll run not found.", 404);
     const items = await env.DB.prepare(`SELECT id, employee_id as employeeId, employee_number as employeeNumber, employee_name as employeeName, job_title as jobTitle, base_salary as baseSalary, gross_pay as grossPay, taxable_pay as taxablePay, paye_tax as payeTax, employee_pension as employeePension, employer_pension as employerPension, other_deductions as otherDeductions, employer_contributions as employerContributions, net_pay as netPay, breakdown_json as breakdownJson FROM payroll_run_items WHERE payroll_run_id = ? AND organization_id = ? ORDER BY employee_name`).bind(runId, context.organizationId).all();
     if (payrollRunMatch[2] === "export") {
@@ -2353,6 +2745,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!['Meeting','Deadline','Training','Company','Leave','Other'].includes(eventType)) return error("Choose a valid calendar event type.");
     const id = `event-${crypto.randomUUID()}`;
     await env.DB.prepare(`INSERT INTO calendar_events (id, organization_id, title, event_type, start_at, end_at, location, owner_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, body.title.trim(), eventType, start.toISOString(), end.toISOString(), body.location?.trim() || null, context.userId).run();
+    await pushCalendarEvent(env, context.organizationId, id);
     await audit(env, context, "created", "calendar_events", id, { title: body.title.trim(), eventType, startAt: start.toISOString(), endAt: end.toISOString() });
     return json({ id }, { status: 201 });
   }
@@ -2368,6 +2761,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (new Date(endAt) <= new Date(startAt)) return error("The event end must be after its start.");
     if (body.eventType && !['Meeting','Deadline','Training','Company','Leave','Other'].includes(body.eventType)) return error("Choose a valid calendar event type.");
     await env.DB.prepare(`UPDATE calendar_events SET title = COALESCE(?, title), event_type = COALESCE(?, event_type), start_at = ?, end_at = ?, location = COALESCE(?, location) WHERE id = ? AND organization_id = ?`).bind(body.title?.trim() || null, body.eventType || null, startAt, endAt, body.location?.trim() || null, current.id, context.organizationId).run();
+    await pushCalendarEvent(env, context.organizationId, current.id);
     await audit(env, context, "updated", "calendar_events", current.id, body);
     return json({ ok: true });
   }
@@ -2433,11 +2827,13 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (duplicate) return error("A matching expense is already on file. Check its status before submitting again.", 409);
     const id = `expense-${crypto.randomUUID()}`;
     const requestIdValue = `request-${crypto.randomUUID()}`;
+    const expenseSla = await env.DB.prepare(`SELECT due_hours as dueHours FROM workflow_sla_settings WHERE organization_id = ? AND request_type = 'Expense'`).bind(context.organizationId).first<{ dueHours: number }>();
+    const expenseDueAt = new Date(Date.now() + (expenseSla?.dueHours || 48) * 3600000).toISOString();
     const receiptKey = receipt ? `expense-receipts/${context.organizationId}/${id}/${crypto.randomUUID()}` : null;
     if (receipt && receiptKey) await env.FILES.put(receiptKey, receipt.stream(), { httpMetadata: { contentType: receipt.type } });
     await env.DB.batch([
       env.DB.prepare(`INSERT INTO expenses (id, organization_id, employee_id, category, amount, currency, expense_date, description, receipt_key, status) VALUES (?, ?, ?, ?, ?, 'NGN', ?, ?, ?, 'submitted')`).bind(id, context.organizationId, employeeId, category, amount, body.expenseDate, description, receiptKey),
-      env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'CEO', 'pending', 1, ?)`).bind(requestIdValue, context.organizationId, id, description, context.userId, amount, JSON.stringify({ category, project: body.project || null, approvalPolicy: ["CEO"] })),
+      env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json, due_at) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'CEO', 'pending', 1, ?, ?)`).bind(requestIdValue, context.organizationId, id, description, context.userId, amount, JSON.stringify({ category, project: body.project || null, approvalPolicy: ["CEO"] }), expenseDueAt),
     ]);
     await audit(env, context, "submitted", "expenses", id, { category, amount, description });
     await notifyApprovers(env, context, "CEO", description, `A financial request for ₦${amount.toLocaleString("en-NG")} is pending your approval.`);
@@ -2491,11 +2887,13 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     try { workflowSettings = JSON.parse(workflowRow?.workflowsJson || "{}"); } catch { /* use defaults */ }
     const requiredRole = financial ? "CEO" : workflowSettings[requestType] || (requestType === "HR" || requestType === "Leave" ? "HR Admin" : "Manager");
     const id = `request-${crypto.randomUUID()}`;
-    await env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, title, requester_id, amount, currency, required_role, status, current_step, metadata_json) VALUES (?, ?, ?, ?, ?, ?, 'NGN', ?, 'pending', 1, ?)`)
-      .bind(id, context.organizationId, requestType, title, context.userId, amount, requiredRole, JSON.stringify({ details, approvalPolicy: [requiredRole] })).run();
+    const sla = await env.DB.prepare(`SELECT due_hours as dueHours FROM workflow_sla_settings WHERE organization_id = ? AND request_type = ?`).bind(context.organizationId, requestType).first<{ dueHours: number }>();
+    const dueAt = new Date(Date.now() + (sla?.dueHours || 48) * 3600000).toISOString();
+    await env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, title, requester_id, amount, currency, required_role, status, current_step, metadata_json, due_at) VALUES (?, ?, ?, ?, ?, ?, 'NGN', ?, 'pending', 1, ?, ?)`)
+      .bind(id, context.organizationId, requestType, title, context.userId, amount, requiredRole, JSON.stringify({ details, approvalPolicy: [requiredRole] }), dueAt).run();
     await audit(env, context, "submitted", "requests", id, { requestType, title, amount, requiredRole });
     await notifyApprovers(env, context, requiredRole, title, `${financial ? `A financial request for ₦${Number(amount || 0).toLocaleString("en-NG")} is` : "A request is"} pending your approval. Details: ${details}`);
-    return json({ id, requestType, title, amount, requiredRole, status: "pending" }, { status: 201 });
+    return json({ id, requestType, title, amount, requiredRole, dueAt, status: "pending" }, { status: 201 });
   }
 
   const requestMatch = path.match(/^\/api\/requests\/([^/]+)$/);
@@ -2564,6 +2962,21 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       ...(item.sourceRecordId ? [env.DB.prepare(`UPDATE expenses SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND EXISTS (SELECT 1 FROM approval_requests WHERE id = ? AND organization_id = ? AND status = ?)`).bind(body.status === "returned" ? "submitted" : body.status, item.sourceRecordId, context.organizationId, requestIdValue, context.organizationId, body.status)] : []),
     ]);
     if (!changes[0]?.meta.changes) return error("This request was decided by another approver. Refresh the queue.", 409);
+    if (item.requestType.toLowerCase() === "purchase" && typeof decisionMetadata.purchaseRequestId === "string") {
+      const purchaseId = decisionMetadata.purchaseRequestId;
+      if (body.status === "approved") {
+        const poNumber = `PO-${new Date().getUTCFullYear()}-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
+        await env.DB.batch([
+          env.DB.prepare(`UPDATE purchase_requests SET status = 'ordered', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'pending_approval'`).bind(purchaseId, context.organizationId),
+          env.DB.prepare(`INSERT OR IGNORE INTO purchase_orders (id, organization_id, purchase_request_id, po_number, issued_by) VALUES (?, ?, ?, ?, ?)`).bind(`po-${crypto.randomUUID()}`, context.organizationId, purchaseId, poNumber, context.userId),
+        ]);
+      } else if (body.status === "rejected" || body.status === "cancelled") {
+        await env.DB.batch([
+          env.DB.prepare(`UPDATE purchase_requests SET status = 'rejected', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(purchaseId, context.organizationId),
+          env.DB.prepare(`UPDATE budget_reservations SET status = 'released', updated_at = CURRENT_TIMESTAMP WHERE purchase_request_id = ? AND organization_id = ? AND status = 'reserved'`).bind(purchaseId, context.organizationId),
+        ]);
+      }
+    }
     await audit(env, context, body.status === "returned" ? "returned_for_edits" : body.status, "requests", requestIdValue, { role: context.role, stage: item.currentStep, note: decisionNote || null });
     if (body.status === "approved" || body.status === "rejected" || body.status === "returned") {
       const requester = await env.DB.prepare(`SELECT u.email, u.full_name as fullName, o.name as organizationName FROM users u JOIN organizations o ON o.id = ? WHERE u.id = ?`).bind(context.organizationId, item.requesterId).first<{ email: string; fullName: string; organizationName: string }>();
@@ -2800,6 +3213,7 @@ export default {
       const url = new URL(request.url);
       const calendarFeedMatch = url.pathname.match(/^\/calendar\/feed\/([a-f0-9]{64})(?:\.ics)?$/i);
       if (request.method === "GET" && calendarFeedMatch) return withSecurityHeaders(await publicCalendarFeed(calendarFeedMatch[1], env));
+      if (request.method === "GET" && url.pathname === "/api/calendar/oauth/callback") return withSecurityHeaders(await handleCalendarOAuthCallback(request, env));
       if (url.pathname.startsWith("/api/")) return withSecurityHeaders(await handleApi(request, env));
       return env.ASSETS.fetch(request);
     } catch (cause) {
@@ -2809,5 +3223,59 @@ export default {
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await expireTrials(env);
+    await syncExternalCalendars(env);
+    const pending = await env.DB.prepare(`SELECT a.id, a.organization_id as organizationId, a.requester_id as requesterId, a.request_type as requestType, a.title, a.required_role as requiredRole, a.amount, a.due_at as dueAt, a.reminder_sent_at as reminderSentAt, a.escalated_at as escalatedAt, s.reminder_hours as reminderHours, s.escalation_role as escalationRole, os.financial_fallback_role as financialFallbackRole FROM approval_requests a LEFT JOIN workflow_sla_settings s ON s.organization_id = a.organization_id AND s.request_type = a.request_type LEFT JOIN organization_settings os ON os.organization_id = a.organization_id WHERE a.status = 'pending' AND a.due_at IS NOT NULL ORDER BY a.due_at LIMIT 500`).all<{ id: string; organizationId: string; requesterId: string; requestType: string; title: string; requiredRole: string; amount: number | null; dueAt: string; reminderSentAt: string | null; escalatedAt: string | null; reminderHours: number | null; escalationRole: string | null; financialFallbackRole: string | null }>();
+    for (const item of pending.results || []) {
+      const systemContext: AuthContext = { userId: item.requesterId, organizationId: item.organizationId, email: "", role: "System", isDemo: false, isPlatformAdmin: false, permissions: new Set() };
+      const overdue = Date.parse(`${item.dueAt.replace(" ", "T")}Z`) <= Date.now();
+      const reminderDue = Date.parse(`${item.dueAt.replace(" ", "T")}Z`) - (item.reminderHours || 24) * 3600000 <= Date.now();
+      const financial = item.amount !== null || ["expense","purchase","budget","payroll","reimbursement","payment","financial","asset purchase"].includes(item.requestType.toLowerCase());
+      if (overdue && !item.escalatedAt) {
+        const roles = financial ? [item.financialFallbackRole || "HR Admin"] : [item.escalationRole || "HR Admin", "CEO"];
+        const changed = await env.DB.prepare(`UPDATE approval_requests SET escalated_at = CURRENT_TIMESTAMP, metadata_json = json_set(metadata_json, '$.fallbackActive', 1, '$.fallbackRoles', json(?), '$.fallbackAt', ?), updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'pending' AND escalated_at IS NULL`).bind(JSON.stringify(roles), new Date().toISOString(), item.id, item.organizationId).run();
+        if (changed.meta.changes) for (const role of [...new Set(roles)]) await notifyApprovers(env, systemContext, role, item.title, `This approval is overdue (SLA due ${item.dueAt}). It has been escalated from ${item.requiredRole}.`);
+      } else if (reminderDue && !item.reminderSentAt) {
+        await env.DB.prepare(`UPDATE approval_requests SET reminder_sent_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND reminder_sent_at IS NULL`).bind(item.id, item.organizationId).run();
+        await notifyApprovers(env, systemContext, item.requiredRole, item.title, `Reminder: approval is due by ${item.dueAt}. Please review the pending request.`);
+      }
+    }
+
+    const backupSchedules = await env.DB.prepare(`SELECT b.organization_id as organizationId, b.frequency, b.retention_days as retentionDays, b.alert_email as alertEmail, b.last_run_at as lastRunAt, m.user_id as createdBy FROM tenant_backup_settings b JOIN memberships m ON m.organization_id = b.organization_id AND m.status = 'active' WHERE b.enabled = 1 GROUP BY b.organization_id`).all<{ organizationId: string; frequency: string; retentionDays: number; alertEmail: string | null; lastRunAt: string | null; createdBy: string }>();
+    for (const schedule of backupSchedules.results || []) {
+      const interval = schedule.frequency === "weekly" ? 7 * 86400000 : 86400000;
+      if (schedule.lastRunAt && Date.now() - Date.parse(`${schedule.lastRunAt.replace(" ", "T")}Z`) < interval) continue;
+      try {
+        const backup = await createTenantBackup(env, schedule.organizationId, schedule.createdBy);
+        const stored = await env.FILES.get(backup.objectKey);
+        const serialized = stored ? await stored.text() : "";
+        let valid = Boolean(stored && await hashToken(serialized) === backup.checksum);
+        if (valid) {
+          try {
+            const snapshot = JSON.parse(serialized) as { schemaVersion?: number; organizationId?: string; tables?: Record<string, unknown[]>; files?: { originalKey: string; backupKey: string }[] };
+            valid = snapshot.schemaVersion === 1 && snapshot.organizationId === schedule.organizationId && !!snapshot.tables && !Array.isArray(snapshot.tables)
+              && Object.values(snapshot.tables).every((rows) => Array.isArray(rows) && rows.every((row) => !!row && typeof row === "object" && (row as { organization_id?: unknown }).organization_id === schedule.organizationId))
+              && Array.isArray(snapshot.files) && snapshot.files.every((file) => file && file.originalKey.startsWith(`${schedule.organizationId}/`) && file.backupKey.startsWith(`tenant-backups/${schedule.organizationId}/${backup.id}/files/`));
+            if (valid) for (const file of snapshot.files || []) if (!await env.FILES.head(file.backupKey)) { valid = false; break; }
+          } catch { valid = false; }
+        }
+        await env.DB.prepare(`UPDATE tenant_backup_settings SET last_run_at = CURRENT_TIMESTAMP, last_status = ?, last_error = ?, last_verified_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_verified_at END, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(valid ? "success" : "verification_failed", valid ? null : "Snapshot checksum or restore preflight verification failed", valid ? 1 : 0, schedule.organizationId).run();
+        if (!valid) throw new Error("Scheduled snapshot failed its checksum or non-destructive restore preflight verification.");
+        const cutoff = new Date(Date.now() - schedule.retentionDays * 86400000).toISOString();
+        const expired = await env.DB.prepare(`SELECT id, object_key as objectKey FROM tenant_backups WHERE organization_id = ? AND created_at < ?`).bind(schedule.organizationId, cutoff).all<{ id: string; objectKey: string }>();
+        for (const row of expired.results || []) {
+          await env.FILES.delete(row.objectKey);
+          let cursor: string | undefined;
+          do { const listed = await env.FILES.list({ prefix: `tenant-backups/${schedule.organizationId}/${row.id}/`, cursor }); if (listed.objects.length) await Promise.all(listed.objects.map((object) => env.FILES.delete(object.key))); cursor = listed.truncated ? listed.cursor : undefined; } while (cursor);
+          await env.DB.prepare(`DELETE FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(row.id, schedule.organizationId).run();
+        }
+      } catch (cause) {
+        const message = cause instanceof Error ? cause.message.slice(0, 300) : "Unknown backup failure";
+        await env.DB.prepare(`UPDATE tenant_backup_settings SET last_run_at = CURRENT_TIMESTAMP, last_status = 'failed', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(message, schedule.organizationId).run();
+        if (schedule.alertEmail) {
+          const org = await env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`).bind(schedule.organizationId).first<{ name: string }>();
+          await sendApprovalNotificationEmail(env, schedule.alertEmail, "Administrator", org?.name || "Zyntris", "Scheduled backup failed", `The scheduled tenant backup failed: ${message}. Review organization settings and storage health.`);
+        }
+      }
+    }
   },
 };
