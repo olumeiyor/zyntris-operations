@@ -4,7 +4,7 @@ import {
   CalendarDays, CheckCircle2, ChevronDown, ChevronLeft, CircleHelp, ClipboardCheck, Clock3, Cloud,
   Command, CreditCard, FileText, FolderKanban, Grid2x2, LayoutDashboard, LifeBuoy, ListTodo, LockKeyhole,
   Menu, MessageSquareText, Megaphone, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Plus, Search, Settings, ShieldCheck, Target,
-  Sparkles, TrendingUp, UploadCloud, UserRound, Users, WalletCards, X,
+  Sparkles, TrendingUp, UploadCloud, UserRound, UserRoundMinus, Users, WalletCards, X,
 } from "lucide-react";
 import { demoDashboard, demoEmployees, demoUser } from "./data/demo";
 import { AttendanceWorkspace, OperationalWorkspace } from "./operations";
@@ -14,6 +14,7 @@ import { PlatformAdminWorkspace } from "./platform-admin";
 import { AccountSecurity, OrganizationSettings } from "./settings";
 import { Appraisals } from "./appraisals";
 import { HRTalentWorkspace } from "./hr-talent";
+import { ExitManagement } from "./exit-management";
 import { AnnouncementsWorkspace, GoalsWorkspace } from "./company-modules";
 import { WorkCalendarWorkspace, WorkLeaveWorkspace, WorkProjectsWorkspace, WorkTasksWorkspace } from "./workspaces";
 import type { DashboardData, Employee, LeaveRequest, PageId, Task } from "./types";
@@ -22,7 +23,7 @@ type IconComponent = typeof LayoutDashboard;
 type InboxNotification = { id: string; type: string; title: string; body: string; readAt: string | null; createdAt: string };
 type GlobalSearchResult = { id: string; title: string; subtitle: string; module: string };
 
-type NavItem = { id: PageId; label: string; icon: IconComponent; badge?: string; section?: string; soon?: boolean };
+type NavItem = { id: PageId; label: string; icon: IconComponent; section?: string; soon?: boolean };
 
 const navItems: NavItem[] = [
   { id: "dashboard", label: "Dashboard", icon: LayoutDashboard },
@@ -30,13 +31,14 @@ const navItems: NavItem[] = [
   { id: "goals", label: "Goals & OKRs", icon: Target, section: "People" },
   { id: "appraisals", label: "Performance & appraisals", icon: Award, section: "People" },
   { id: "talent", label: "Teams & talent", icon: Users, section: "People" },
-  { id: "leave", label: "Leave & attendance", icon: CalendarDays, badge: "12", section: "People" },
+  { id: "exit", label: "Exit management", icon: UserRoundMinus, section: "People" },
+  { id: "leave", label: "Leave & attendance", icon: CalendarDays, section: "People" },
   { id: "attendance", label: "Time & shifts", icon: Clock3, section: "People" },
   { id: "payroll", label: "Payroll", icon: WalletCards, section: "People" },
   { id: "projects", label: "Projects", icon: FolderKanban, section: "Work" },
   { id: "tasks", label: "Tasks", icon: ListTodo, section: "Work" },
   { id: "expenses", label: "Expenses", icon: WalletCards, section: "Finance" },
-  { id: "requests", label: "Requests & approvals", icon: ClipboardCheck, badge: "4", section: "Finance" },
+  { id: "requests", label: "Requests & approvals", icon: ClipboardCheck, section: "Finance" },
   { id: "budgets", label: "Budgets", icon: CreditCard, section: "Finance" },
   { id: "assets", label: "Assets", icon: BriefcaseBusiness, section: "Operations" },
   { id: "documents", label: "Documents", icon: FileText, section: "Operations" },
@@ -184,6 +186,7 @@ export default function App() {
     if (item.id === "payroll") return userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") || userPermissions.has("payroll.self.view");
     if (item.id === "appraisals") return userPermissions.has("appraisals.view") || userPermissions.has("appraisals.manage") || userPermissions.has("appraisals.self.view");
     if (item.id === "talent") return userPermissions.has("hr.talent.view") || userPermissions.has("hr.talent.manage");
+    if (item.id === "exit") return userPermissions.has("employees.view") || userPermissions.has("employees.manage") || userPermissions.has("hr.onboarding.approve") || userPermissions.has("payroll.manage") || userPermissions.has("expenses.manage") || userPermissions.has("operations.manage");
     if (item.id === "goals") return userPermissions.has("goals.view");
     if (item.id === "announcements") return userPermissions.has("announcements.view");
     if (item.id === "expenses") return userPermissions.has("expenses.view") || userPermissions.has("expenses.manage");
@@ -251,7 +254,7 @@ export default function App() {
               {!collapsed && item.section && (index === 1 || visibleNavItems[index - 1]?.section !== item.section) && <div className="nav-section-label">{item.section}</div>}
               <button className={`nav-item ${page === item.id ? "active" : ""}`} onClick={() => openPage(item.id)} title={collapsed ? item.label : undefined}>
                 <item.icon size={18} strokeWidth={page === item.id ? 2.2 : 1.8} />
-                {!collapsed && <><span>{item.id === "payroll" && !userPermissions.has("payroll.view") && !userPermissions.has("payroll.manage") ? "My payslips" : item.label}</span>{item.badge && <span className="nav-badge">{item.badge}</span>}</>}
+                {!collapsed && <><span>{item.id === "payroll" && !userPermissions.has("payroll.view") && !userPermissions.has("payroll.manage") ? "My payslips" : item.label}</span>{item.id === "leave" && dashboard.leave.visiblePending > 0 && <span className="nav-badge">{dashboard.leave.visiblePending}</span>}{item.id === "requests" && dashboard.requests.pending > 0 && <span className="nav-badge">{dashboard.requests.pending}</span>}</>}
               </button>
             </div>
           ))}
@@ -272,6 +275,7 @@ export default function App() {
           {page === "employees" && <Employees employees={employees} onAdd={() => setShowAddEmployee(true)} canManage={userPermissions.has("employees.manage")} canManageStructure={userPermissions.has("teams.manage") || userPermissions.has("hr.talent.manage")} onToast={setToast} onDeliveryUpdated={(id, status) => setEmployees((current) => current.map((employee) => employee.id === id ? { ...employee, invitationEmailStatus: status } : employee))} />}
           {page === "appraisals" && <Appraisals user={{ id: user.id, permissions: user.permissions }} onToast={setToast} />}
           {page === "talent" && <HRTalentWorkspace user={{ id: user.id, permissions: user.permissions || [] }} employees={employees} onToast={setToast} onEmployeesUpdated={async () => { try { const people = await api<{ data: Employee[] }>("/api/employees"); setEmployees(people.data); } catch { /* handled in the workspace */ } }} />}
+          {page === "exit" && <ExitManagement employees={employees} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "leave" && <WorkLeaveWorkspace canManage={userPermissions.has("employees.manage") || userPermissions.has("hr.onboarding.approve")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "attendance" && <AttendanceWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "goals" && <GoalsWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}

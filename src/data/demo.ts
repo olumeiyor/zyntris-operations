@@ -4,7 +4,8 @@ export const demoUser = { fullName: "Amaka Okafor", email: "admin@zyntris.org", 
 
 export const demoDashboard: DashboardData = {
   people: { total: 124, active: 116, onLeave: 8 },
-  leave: { pending: 12 },
+  leave: { pending: 12, visiblePending: 12 },
+  requests: { pending: 4 },
   projects: { active: 18 },
   tasks: { overdue: 7 },
   expenses: { total: 18450000 },

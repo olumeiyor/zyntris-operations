@@ -1,4 +1,4 @@
-export type PageId = "dashboard" | "employees" | "leave" | "attendance" | "goals" | "announcements" | "appraisals" | "talent" | "projects" | "tasks" | "expenses" | "requests" | "budgets" | "assets" | "documents" | "vendors" | "helpdesk" | "calendar" | "customers" | "reports" | "payroll" | "settings" | "security" | "platform";
+export type PageId = "dashboard" | "employees" | "leave" | "attendance" | "goals" | "announcements" | "appraisals" | "talent" | "exit" | "projects" | "tasks" | "expenses" | "requests" | "budgets" | "assets" | "documents" | "vendors" | "helpdesk" | "calendar" | "customers" | "reports" | "payroll" | "settings" | "security" | "platform";
 
 export type Employee = {
   id: string;
@@ -23,7 +23,8 @@ export type Employee = {
 
 export type DashboardData = {
   people: { total: number; active: number; onLeave: number };
-  leave: { pending: number };
+  leave: { pending: number; visiblePending: number };
+  requests: { pending: number };
   projects: { active: number };
   tasks: { overdue: number };
   expenses: { total: number };

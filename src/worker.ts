@@ -30,6 +30,7 @@ const json = (data: unknown, init: ResponseInit = {}) =>
 const error = (message: string, status = 400) => json({ error: message }, { status });
 
 const requestId = () => crypto.randomUUID();
+const isIsoCalendarDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00.000Z`)) && new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value;
 
 // Tenant-owned business data only. Credentials, global identities, sessions, billing,
 // role grants and platform-control tables are intentionally excluded.
@@ -831,6 +832,112 @@ async function handleAppraisals(request: Request, env: Env, context: AuthContext
   return error("Appraisal endpoint not found.", 404);
 }
 
+async function handleExitManagement(request: Request, env: Env, context: AuthContext, path: string): Promise<Response | null> {
+  const base = "/api/hr/exits";
+  if (path !== base && !path.startsWith(`${base}/`)) return null;
+  const canManage = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve");
+  const canFinance = hasPermission(context, "payroll.manage") || hasPermission(context, "expenses.manage");
+  const canIT = hasPermission(context, "operations.manage");
+  const selfEmployee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
+  if (!canManage && !canFinance && !canIT && !selfEmployee) return error("Exit management is not enabled for this account.", 403);
+
+  if (path === base && request.method === "GET") {
+    const cases = await env.DB.prepare(`SELECT c.id, c.employee_id as employeeId, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.email, e.job_title as jobTitle, e.department_id as departmentId, d.name as department, c.manager_id as managerId, COALESCE(m.first_name || ' ' || m.last_name, '') as managerName, c.separation_type as separationType, CASE WHEN ? = 1 OR e.user_id = ? THEN c.reason ELSE NULL END as reason, c.notice_date as noticeDate, c.last_working_date as lastWorkingDate, c.status, CASE WHEN ? = 1 OR e.user_id = ? THEN c.exit_interview_date ELSE NULL END as exitInterviewDate, CASE WHEN ? = 1 OR e.user_id = ? THEN c.exit_interview_notes ELSE NULL END as exitInterviewNotes, CASE WHEN ? = 1 OR e.user_id = ? THEN c.employee_feedback ELSE NULL END as employeeFeedback, CASE WHEN ? = 1 OR ? = 1 THEN c.final_salary ELSE NULL END as finalSalary, CASE WHEN ? = 1 OR ? = 1 THEN c.leave_payout ELSE NULL END as leavePayout, CASE WHEN ? = 1 OR ? = 1 THEN c.deductions ELSE NULL END as deductions, CASE WHEN ? = 1 OR ? = 1 THEN c.outstanding_balance ELSE NULL END as outstandingBalance, CASE WHEN ? = 1 OR ? = 1 THEN c.finance_notes ELSE NULL END as financeNotes, CASE WHEN ? = 1 OR ? = 1 THEN c.reference_documents ELSE NULL END as referenceDocuments, c.created_at as createdAt, c.completed_at as completedAt, (SELECT COUNT(*) FROM employee_exit_tasks t WHERE t.exit_case_id = c.id AND t.organization_id = c.organization_id) as taskCount, (SELECT COUNT(*) FROM employee_exit_tasks t WHERE t.exit_case_id = c.id AND t.organization_id = c.organization_id AND t.status IN ('completed','waived')) as completedTaskCount FROM employee_exit_cases c JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id LEFT JOIN departments d ON d.id = e.department_id AND d.organization_id = e.organization_id LEFT JOIN employees m ON m.id = c.manager_id AND m.organization_id = c.organization_id WHERE c.organization_id = ? AND (? = 1 OR e.user_id = ? OR m.user_id = ? OR ((? = 1 OR ? = 1) AND c.status = 'active')) ORDER BY CASE c.status WHEN 'active' THEN 0 WHEN 'completed' THEN 1 ELSE 2 END, c.last_working_date DESC, c.created_at DESC`).bind(canManage ? 1 : 0, context.userId, canManage ? 1 : 0, context.userId, canManage ? 1 : 0, context.userId, canManage ? 1 : 0, context.userId, canManage ? 1 : 0, canFinance ? 1 : 0, canManage ? 1 : 0, canFinance ? 1 : 0, canManage ? 1 : 0, canFinance ? 1 : 0, canManage ? 1 : 0, canFinance ? 1 : 0, canManage ? 1 : 0, canFinance ? 1 : 0, context.organizationId, canManage ? 1 : 0, context.userId, context.userId, canFinance ? 1 : 0, canIT ? 1 : 0).all();
+    const tasks = await env.DB.prepare(`SELECT t.id, t.exit_case_id as exitCaseId, t.category, t.title, t.details, t.status, t.notes, t.completed_at as completedAt, u.full_name as completedBy, t.sort_order as sortOrder, CASE WHEN ? = 1 OR (t.category = 'finance' AND ? = 1) OR (t.category = 'it' AND ? = 1) OR (t.category = 'employee' AND e.user_id = ?) OR (t.category = 'manager' AND m.user_id = ?) THEN 1 ELSE 0 END as canUpdate FROM employee_exit_tasks t JOIN employee_exit_cases c ON c.id = t.exit_case_id AND c.organization_id = t.organization_id JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id LEFT JOIN employees m ON m.id = c.manager_id AND m.organization_id = c.organization_id LEFT JOIN users u ON u.id = t.completed_by WHERE t.organization_id = ? AND (? = 1 OR (t.category = 'finance' AND ? = 1) OR (t.category = 'it' AND ? = 1) OR (t.category = 'employee' AND e.user_id = ?) OR (t.category = 'manager' AND m.user_id = ?)) ORDER BY t.exit_case_id, t.sort_order`).bind(canManage ? 1 : 0, canFinance ? 1 : 0, canIT ? 1 : 0, context.userId, context.userId, context.organizationId, canManage ? 1 : 0, canFinance ? 1 : 0, canIT ? 1 : 0, context.userId, context.userId).all();
+    return json({ data: cases.results || [], tasks: tasks.results || [], canManage, canFinance, canIT, employeeId: selfEmployee?.id || null });
+  }
+
+  if (path === base && request.method === "POST") {
+    const body = await request.json<{ employeeId?: string; separationType?: string; reason?: string; noticeDate?: string; lastWorkingDate?: string }>();
+    const validTypes = ["resignation", "retirement", "end_of_contract", "redundancy", "termination", "other"];
+    const noticeDate = body.noticeDate || "", lastWorkingDate = body.lastWorkingDate || "";
+    const employee = body.employeeId ? await env.DB.prepare(`SELECT e.id, e.manager_id as managerId, e.first_name as firstName, e.last_name as lastName, e.user_id as userId FROM employees e WHERE e.id = ? AND e.organization_id = ? AND e.deleted_at IS NULL AND e.status != 'inactive'`).bind(body.employeeId, context.organizationId).first<{ id: string; managerId: string | null; firstName: string; lastName: string; userId: string | null }>() : null;
+    if (!employee || !validTypes.includes(body.separationType || "") || !body.reason?.trim() || body.reason.trim().length > 2000 || !isIsoCalendarDate(noticeDate) || !isIsoCalendarDate(lastWorkingDate) || lastWorkingDate < noticeDate) return error("Choose an active employee and provide a separation type, reason, notice date and valid last working date.");
+    const existing = await env.DB.prepare(`SELECT id FROM employee_exit_cases WHERE organization_id = ? AND employee_id = ? AND status = 'active'`).bind(context.organizationId, employee.id).first();
+    if (existing) return error("This employee already has an active exit case.", 409);
+    const id = `exit-${crypto.randomUUID()}`;
+    const checklist: Array<[string, string, string]> = [
+      ["employee", "Return organization property", "Return company devices, keys, ID cards, documents and any other assigned property; record exceptions in notes."],
+      ["employee", "Submit handover and outstanding work notes", "Document current responsibilities, open work, key contacts, deadlines and locations of work materials."],
+      ["manager", "Review handover and reassign responsibilities", "Confirm work ownership, project access, customer handover, open approvals and continuity arrangements."],
+      ["hr", "Conduct and document exit interview", "Record the interview date, employee feedback, reason for leaving and any agreed follow-up."],
+      ["hr", "Prepare exit documents and archive personnel records", "Confirm required notices, acknowledgements, service/experience documents and secure personnel-file retention."],
+      ["hr", "Confirm benefits and policy close-out", "Confirm benefit end dates, pension/insurance administration and employee communication under applicable policy."],
+      ["it", "Recover devices and remove physical access", "Record returned devices and remove building, badge, VPN and other physical access on the approved date."],
+      ["it", "Revoke application and organization access", "Disable organization membership and revoke email, SaaS, shared-secret and privileged access at the approved separation time."],
+      ["finance", "Reconcile expenses, advances and outstanding balances", "Reconcile submitted claims, advances, loans, recoverables and approved deductions; attach references in finance notes."],
+      ["finance", "Validate final remuneration and leave balance", "Document final salary, eligible leave payout, deductions and outstanding balance. This records amounts only; it does not initiate a bank transfer."],
+      ["finance", "Complete finance clearance", "Confirm the final reconciliation is reviewed and all amounts are documented in the case before HR closes it."],
+    ];
+    const statements = [env.DB.prepare(`INSERT INTO employee_exit_cases (id, organization_id, employee_id, manager_id, separation_type, reason, notice_date, last_working_date, initiated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, context.organizationId, employee.id, employee.managerId, body.separationType, body.reason.trim(), noticeDate, lastWorkingDate, context.userId), ...checklist.map(([category, title, details], index) => env.DB.prepare(`INSERT INTO employee_exit_tasks (id, organization_id, exit_case_id, category, title, details, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?)`).bind(`exit-task-${crypto.randomUUID()}`, context.organizationId, id, category, title, details, index + 1)), ...(employee.userId ? [env.DB.prepare(`INSERT INTO notifications (id, organization_id, user_id, type, title, body) VALUES (?, ?, ?, 'employee_exit', ?, ?)`).bind(requestId(), context.organizationId, employee.userId, "Employment exit process started", `HR has recorded an exit process with a planned last working date of ${lastWorkingDate}. Contact HR if any information is incorrect.`)] : [])];
+    await env.DB.batch(statements);
+    await audit(env, context, "created", "employee_exit_cases", id, { employeeId: employee.id, separationType: body.separationType, lastWorkingDate });
+    return json({ id }, { status: 201 });
+  }
+
+  const taskMatch = path.match(/^\/api\/hr\/exits\/([^/]+)\/tasks\/([^/]+)$/);
+  if (taskMatch && request.method === "PATCH") {
+    const body = await request.json<{ status?: string; notes?: string }>();
+    const status = body.status || "";
+    if (!["pending", "completed", "waived"].includes(status) || (body.notes || "").length > 2000 || (status !== "pending" && !body.notes?.trim())) return error("Choose a valid status; add a completion or waiver note, with no more than 2,000 characters.");
+    const task = await env.DB.prepare(`SELECT t.category, c.status as caseStatus, e.user_id as employeeUserId, m.user_id as managerUserId FROM employee_exit_tasks t JOIN employee_exit_cases c ON c.id = t.exit_case_id AND c.organization_id = t.organization_id JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id LEFT JOIN employees m ON m.id = c.manager_id AND m.organization_id = c.organization_id WHERE t.id = ? AND t.exit_case_id = ? AND t.organization_id = ?`).bind(taskMatch[2], taskMatch[1], context.organizationId).first<{ category: string; caseStatus: string; employeeUserId: string | null; managerUserId: string | null }>();
+    const mayUpdateTask = Boolean(task && task.caseStatus === "active" && (canManage || (task.category === "finance" && canFinance) || (task.category === "it" && canIT) || (task.category === "employee" && task.employeeUserId === context.userId) || (task.category === "manager" && task.managerUserId === context.userId)));
+    if (!mayUpdateTask) return error("This checklist item is not assigned to your role or the exit case is closed.", 403);
+    const result = await env.DB.prepare(`UPDATE employee_exit_tasks SET status = ?, notes = ?, completed_by = CASE WHEN ? = 'pending' THEN NULL ELSE ? END, completed_at = CASE WHEN ? = 'pending' THEN NULL ELSE CURRENT_TIMESTAMP END, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND exit_case_id = ? AND organization_id = ? AND EXISTS (SELECT 1 FROM employee_exit_cases c WHERE c.id = exit_case_id AND c.organization_id = ? AND c.status = 'active')`).bind(status, body.notes?.trim() || null, status, context.userId, status, taskMatch[2], taskMatch[1], context.organizationId, context.organizationId).run();
+    if (!result.meta.changes) return error("Active exit case or checklist task not found.", 404);
+    await audit(env, context, status === "pending" ? "reopened" : status, "employee_exit_tasks", taskMatch[2], { exitCaseId: taskMatch[1], status });
+    return json({ ok: true });
+  }
+
+  const caseMatch = path.match(/^\/api\/hr\/exits\/([^/]+)$/);
+  if (caseMatch && request.method === "PATCH") {
+    const body = await request.json<{ status?: string; exitInterviewDate?: string | null; exitInterviewNotes?: string | null; employeeFeedback?: string | null; finalSalary?: number; leavePayout?: number; deductions?: number; outstandingBalance?: number; financeNotes?: string | null; referenceDocuments?: string | null }>();
+    const current = await env.DB.prepare(`SELECT id, employee_id as employeeId, status FROM employee_exit_cases WHERE id = ? AND organization_id = ?`).bind(caseMatch[1], context.organizationId).first<{ id: string; employeeId: string; status: string }>();
+    if (!current) return error("Exit case not found.", 404);
+    if (!canManage && !canFinance) return error("HR or finance administrator access is required to update this case.", 403);
+    const financeKeys = ["finalSalary", "leavePayout", "deductions", "outstandingBalance", "financeNotes", "referenceDocuments"];
+    const hrKeys = ["status", "exitInterviewDate", "exitInterviewNotes", "employeeFeedback"];
+    if (!canManage && hrKeys.some((key) => body[key as keyof typeof body] !== undefined)) return error("Only HR may update the interview or close an exit case.", 403);
+    if (!canFinance && !canManage && financeKeys.some((key) => body[key as keyof typeof body] !== undefined)) return error("Finance administrator access is required to update financial reconciliation.", 403);
+    if (current.status !== "active") return error("Only active exit cases can be updated.", 409);
+    const amountFields = [body.finalSalary, body.leavePayout, body.deductions, body.outstandingBalance].filter((value) => value !== undefined);
+    if (amountFields.some((value) => !Number.isFinite(value) || Number(value) < 0 || Number(value) > 1_000_000_000_000) || (body.exitInterviewDate && !isIsoCalendarDate(body.exitInterviewDate)) || [body.exitInterviewNotes, body.employeeFeedback, body.financeNotes, body.referenceDocuments].some((value) => value != null && value.length > 4000)) return error("Check the date, finance amounts (0–1 trillion NGN) and notes (maximum 4,000 characters).");
+    if (body.status && !["completed", "cancelled"].includes(body.status)) return error("An exit case can only be completed or cancelled.");
+    if (body.status === "completed") {
+      const openTasks = await env.DB.prepare(`SELECT COUNT(*) as count FROM employee_exit_tasks WHERE organization_id = ? AND exit_case_id = ? AND status = 'pending'`).bind(context.organizationId, current.id).first<{ count: number }>();
+      const financeClearance = await env.DB.prepare(`SELECT COUNT(*) as count FROM employee_exit_tasks WHERE organization_id = ? AND exit_case_id = ? AND category = 'finance' AND title = 'Complete finance clearance' AND status = 'completed'`).bind(context.organizationId, current.id).first<{ count: number }>();
+      const requiredSignoffs = await env.DB.prepare(`SELECT COUNT(*) as count FROM employee_exit_tasks WHERE organization_id = ? AND exit_case_id = ? AND ((category = 'hr' AND title = 'Conduct and document exit interview' AND status = 'completed') OR (category = 'it' AND title = 'Revoke application and organization access' AND status = 'completed'))`).bind(context.organizationId, current.id).first<{ count: number }>();
+      const closureDetails = await env.DB.prepare(`SELECT c.finance_notes as financeNotes, c.exit_interview_date as exitInterviewDate, c.exit_interview_notes as exitInterviewNotes, e.user_id as employeeUserId FROM employee_exit_cases c JOIN employees e ON e.id = c.employee_id AND e.organization_id = c.organization_id WHERE c.id = ? AND c.organization_id = ?`).bind(current.id, context.organizationId).first<{ financeNotes: string | null; exitInterviewDate: string | null; exitInterviewNotes: string | null; employeeUserId: string | null }>();
+      if ((openTasks?.count || 0) > 0 || !(financeClearance?.count || 0) || requiredSignoffs?.count !== 2 || !closureDetails?.financeNotes?.trim() || !closureDetails.exitInterviewDate || !closureDetails.exitInterviewNotes?.trim()) return error("Complete or explicitly waive checklist items, record the exit interview, revoke organization access, and complete finance clearance with reconciliation notes before closing.", 409);
+      if (closureDetails.employeeUserId === context.userId) return error("You cannot complete your own employee exit case.", 409);
+      if (closureDetails.employeeUserId) {
+        const adminMembership = await env.DB.prepare(`SELECT r.name as roleName FROM memberships m JOIN roles r ON r.id = m.role_id WHERE m.organization_id = ? AND m.user_id = ? AND m.status = 'active' AND r.name IN ('Organization Admin','CEO') LIMIT 1`).bind(context.organizationId, closureDetails.employeeUserId).first<{ roleName: string }>();
+        if (adminMembership) {
+          const otherAdmins = await env.DB.prepare(`SELECT COUNT(*) as count FROM memberships m JOIN roles r ON r.id = m.role_id JOIN users u ON u.id = m.user_id AND u.status = 'active' WHERE m.organization_id = ? AND m.status = 'active' AND m.user_id != ? AND r.name IN ('Organization Admin','CEO')`).bind(context.organizationId, closureDetails.employeeUserId).first<{ count: number }>();
+          if (!(otherAdmins?.count || 0)) return error("Assign another active Organization Admin or CEO before completing this exit so the organization retains an administrator.", 409);
+        }
+      }
+    }
+    const updates: Array<[string, unknown]> = [];
+    const fields: Record<string, string> = { exitInterviewDate: "exit_interview_date", exitInterviewNotes: "exit_interview_notes", employeeFeedback: "employee_feedback", finalSalary: "final_salary", leavePayout: "leave_payout", deductions: "deductions", outstandingBalance: "outstanding_balance", financeNotes: "finance_notes", referenceDocuments: "reference_documents" };
+    for (const [key, column] of Object.entries(fields)) if (body[key as keyof typeof body] !== undefined) updates.push([column, body[key as keyof typeof body] ?? null]);
+    if (body.status === "completed") updates.push(["status", "completed"], ["completed_by", context.userId], ["completed_at", new Date().toISOString()]);
+    if (body.status === "cancelled") updates.push(["status", "cancelled"]);
+    if (updates.length) {
+      const setClause = updates.map(([column]) => `${column} = ?`).join(", ");
+      const statements = [env.DB.prepare(`UPDATE employee_exit_cases SET ${setClause}, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ? AND status = 'active'`).bind(...updates.map(([, value]) => value), current.id, context.organizationId)];
+      if (body.status === "completed") statements.push(
+        env.DB.prepare(`UPDATE employees SET status = 'inactive', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(current.employeeId, context.organizationId),
+        env.DB.prepare(`UPDATE memberships SET status = 'inactive' WHERE organization_id = ? AND user_id = (SELECT user_id FROM employees WHERE id = ? AND organization_id = ?) AND status = 'active'`).bind(context.organizationId, current.employeeId, context.organizationId),
+      );
+      await env.DB.batch(statements);
+    }
+    await audit(env, context, body.status || "updated", "employee_exit_cases", current.id, { changedFields: updates.map(([column]) => column) });
+    return json({ ok: true });
+  }
+  return error("Exit management endpoint not found.", 404);
+}
+
 async function handleHRTalent(request: Request, env: Env, context: AuthContext, path: string): Promise<Response | null> {
   if (!path.startsWith("/api/hr/talent")) return null;
   const canManage = hasPermission(context, "hr.talent.manage");
@@ -997,17 +1104,23 @@ async function handleHRTalent(request: Request, env: Env, context: AuthContext, 
   return error("HR talent endpoint not found.", 404);
 }
 
-async function dashboard(env: Env, organizationId: string) {
-  const [people, leave, projects, tasks, expenses, departments, recentActivity] = await Promise.all([
+async function dashboard(env: Env, context: AuthContext) {
+  const { organizationId, userId } = context;
+  const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(organizationId, userId).first<{ id: string }>();
+  const canManageLeave = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve");
+  const canViewAllRequests = hasPermission(context, "requests.manage");
+  const [people, leave, visibleLeave, requests, projects, tasks, expenses, departments, recentActivity] = await Promise.all([
     env.DB.prepare(`SELECT COUNT(*) as total, SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END) as active, SUM(CASE WHEN status = 'on_leave' THEN 1 ELSE 0 END) as onLeave FROM employees WHERE organization_id = ? AND deleted_at IS NULL`).bind(organizationId).first<{ total: number; active: number; onLeave: number }>(),
     env.DB.prepare(`SELECT COUNT(*) as pending FROM leave_requests WHERE organization_id = ? AND status = 'pending'`).bind(organizationId).first<{ pending: number }>(),
+    env.DB.prepare(`SELECT COUNT(*) as pending FROM leave_requests l JOIN employees e ON e.id = l.employee_id AND e.organization_id = l.organization_id WHERE l.organization_id = ? AND l.status = 'pending' AND (? = 1 OR e.user_id = ? OR e.manager_id = ?)`).bind(organizationId, canManageLeave ? 1 : 0, userId, employee?.id || "").first<{ pending: number }>(),
+    env.DB.prepare(`SELECT COUNT(*) as pending FROM approval_requests WHERE organization_id = ? AND status = 'pending' AND (? = 1 OR requester_id = ?)`).bind(organizationId, canViewAllRequests ? 1 : 0, userId).first<{ pending: number }>(),
     env.DB.prepare(`SELECT COUNT(*) as active FROM projects WHERE organization_id = ? AND status IN ('active','at_risk')`).bind(organizationId).first<{ active: number }>(),
     env.DB.prepare(`SELECT COUNT(*) as overdue FROM tasks WHERE organization_id = ? AND status != 'completed' AND due_date < date('now')`).bind(organizationId).first<{ overdue: number }>(),
     env.DB.prepare(`SELECT COALESCE(SUM(amount),0) as total FROM expenses WHERE organization_id = ? AND strftime('%Y-%m', expense_date) = strftime('%Y-%m', 'now')`).bind(organizationId).first<{ total: number }>(),
     env.DB.prepare(`SELECT d.name, COUNT(e.id) as count FROM departments d LEFT JOIN employees e ON e.department_id = d.id AND e.deleted_at IS NULL WHERE d.organization_id = ? GROUP BY d.id ORDER BY count DESC`).bind(organizationId).all(),
     env.DB.prepare(`SELECT action, module, created_at FROM audit_logs WHERE organization_id = ? ORDER BY created_at DESC LIMIT 6`).bind(organizationId).all(),
   ]);
-  return { people: people || { total: 0, active: 0, onLeave: 0 }, leave: leave || { pending: 0 }, projects: projects || { active: 0 }, tasks: tasks || { overdue: 0 }, expenses: expenses || { total: 0 }, departments: departments.results || [], recentActivity: recentActivity.results || [] };
+  return { people: people || { total: 0, active: 0, onLeave: 0 }, leave: { pending: leave?.pending || 0, visiblePending: visibleLeave?.pending || 0 }, requests: requests || { pending: 0 }, projects: projects || { active: 0 }, tasks: tasks || { overdue: 0 }, expenses: expenses || { total: 0 }, departments: departments.results || [], recentActivity: recentActivity.results || [] };
 }
 
 async function handleApi(request: Request, env: Env): Promise<Response> {
@@ -1082,6 +1195,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return json({ data: data.slice(0, 50) });
   }
 
+  const exitManagementResponse = await handleExitManagement(request, env, context, path);
+  if (exitManagementResponse) return exitManagementResponse;
   const talentResponse = await handleHRTalent(request, env, context, path);
   if (talentResponse) return talentResponse;
   const appraisalResponse = await handleAppraisals(request, env, context, path);
@@ -1861,7 +1976,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "GET" && path === "/api/dashboard") {
-    return json(await dashboard(env, context.organizationId));
+    return json(await dashboard(env, context));
   }
 
   if (request.method === "GET" && path === "/api/employees") {
