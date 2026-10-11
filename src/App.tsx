@@ -186,7 +186,7 @@ export default function App() {
     if (item.id === "payroll") return userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") || userPermissions.has("payroll.self.view");
     if (item.id === "appraisals") return userPermissions.has("appraisals.view") || userPermissions.has("appraisals.manage") || userPermissions.has("appraisals.self.view");
     if (item.id === "talent") return userPermissions.has("hr.talent.view") || userPermissions.has("hr.talent.manage");
-    if (item.id === "exit") return userPermissions.has("employees.view") || userPermissions.has("employees.manage") || userPermissions.has("hr.onboarding.approve") || userPermissions.has("payroll.manage") || userPermissions.has("expenses.manage") || userPermissions.has("operations.manage");
+    if (item.id === "exit") return user?.role === "Admin" || user?.role === "Organization Admin" || userPermissions.has("employees.view") || userPermissions.has("employees.manage") || userPermissions.has("hr.onboarding.approve") || userPermissions.has("payroll.manage") || userPermissions.has("expenses.manage") || userPermissions.has("operations.manage");
     if (item.id === "goals") return userPermissions.has("goals.view");
     if (item.id === "announcements") return userPermissions.has("announcements.view");
     if (item.id === "expenses") return userPermissions.has("expenses.view") || userPermissions.has("expenses.manage");

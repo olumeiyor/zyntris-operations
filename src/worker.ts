@@ -1020,7 +1020,7 @@ async function handleAppraisals(request: Request, env: Env, context: AuthContext
 async function handleExitManagement(request: Request, env: Env, context: AuthContext, path: string): Promise<Response | null> {
   const base = "/api/hr/exits";
   if (path !== base && !path.startsWith(`${base}/`)) return null;
-  const canManage = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve");
+  const canManage = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve") || context.role === "Admin" || context.role === "Organization Admin";
   const canFinance = hasPermission(context, "payroll.manage") || hasPermission(context, "expenses.manage");
   const canIT = hasPermission(context, "operations.manage");
   const selfEmployee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string }>();
