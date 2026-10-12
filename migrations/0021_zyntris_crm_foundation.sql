@@ -135,13 +135,14 @@ CREATE TABLE IF NOT EXISTS crm_events (
 );
 CREATE INDEX IF NOT EXISTS idx_crm_events_pending ON crm_events(organization_id,status,created_at);
 
+WITH sources(name) AS (VALUES ('Website'),('Referral'),('Social Media'),('LinkedIn'),('Event'),('Webinar'),('Advertisement'),('Email Campaign'),('Direct Outreach'),('Partner'),('Existing Customer'),('Walk-in'),('Other'))
 INSERT OR IGNORE INTO crm_lead_sources (id,organization_id,name)
 SELECT 'crm-source-' || substr(o.id,1,32) || '-' || lower(replace(s.name,' ','-')), o.id, s.name
-FROM organizations o CROSS JOIN (SELECT 'Website' name UNION ALL SELECT 'Referral' UNION ALL SELECT 'Social Media' UNION ALL SELECT 'LinkedIn' UNION ALL SELECT 'Event' UNION ALL SELECT 'Webinar' UNION ALL SELECT 'Advertisement' UNION ALL SELECT 'Email Campaign' UNION ALL SELECT 'Direct Outreach' UNION ALL SELECT 'Partner' UNION ALL SELECT 'Existing Customer' UNION ALL SELECT 'Walk-in' UNION ALL SELECT 'Other') s;
+FROM organizations o CROSS JOIN sources s;
 
+WITH stages(stage_key,name,probability,sort_order) AS (VALUES ('qualification','Qualification',10,1),('discovery','Discovery',25,2),('proposal','Proposal',50,3),('negotiation','Negotiation',75,4),('won','Won',100,5),('lost','Lost',0,6))
 INSERT OR IGNORE INTO crm_pipeline_stages (id,organization_id,stage_key,name,probability,sort_order)
-SELECT 'crm-stage-' || substr(o.id,1,28) || '-' || s.stage_key,o.id,s.stage_key,s.name,s.probability,s.sort_order FROM organizations o
-CROSS JOIN (SELECT 'qualification' stage_key,'Qualification' name,10 probability,1 sort_order UNION ALL SELECT 'discovery','Discovery',25,2 UNION ALL SELECT 'proposal','Proposal',50,3 UNION ALL SELECT 'negotiation','Negotiation',75,4 UNION ALL SELECT 'won','Won',100,5 UNION ALL SELECT 'lost','Lost',0,6) s;
+SELECT 'crm-stage-' || substr(o.id,1,28) || '-' || s.stage_key,o.id,s.stage_key,s.name,s.probability,s.sort_order FROM organizations o CROSS JOIN stages s;
 
 INSERT OR IGNORE INTO permissions (id,code,description) VALUES
  ('perm-crm-view','crm.view','View authorized CRM records'),

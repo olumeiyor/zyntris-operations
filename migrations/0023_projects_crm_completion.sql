@@ -213,16 +213,17 @@ CREATE TABLE IF NOT EXISTS crm_scoring_rules (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(organization_id,factor_key)
 );
+WITH scoring_rules(factor_key,label,points,condition_json) AS (VALUES
+  ('has_email','Email available',15,'{}'),
+  ('has_phone','Phone available',10,'{}'),
+  ('has_company','Company identified',10,'{}'),
+  ('has_website','Website available',5,'{}'),
+  ('estimated_value_min','Estimated deal is at least ₦1,000,000',20,'{"min":1000000}'),
+  ('interest','Product/service interest recorded',10,'{}')
+ )
 INSERT OR IGNORE INTO crm_scoring_rules(id,organization_id,factor_key,label,points,condition_json)
- SELECT 'score-'||substr(o.id,1,28)||'-'||r.factor_key,o.id,r.factor_key,r.label,r.points,r.condition_json
- FROM organizations o CROSS JOIN (
-  SELECT 'has_email' factor_key,'Email available' label,15 points,'{}' condition_json UNION ALL
-  SELECT 'has_phone','Phone available',10,'{}' UNION ALL
-  SELECT 'has_company','Company identified',10,'{}' UNION ALL
-  SELECT 'has_website','Website available',5,'{}' UNION ALL
-  SELECT 'estimated_value_min','Estimated deal is at least ₦1,000,000',20,'{"min":1000000}' UNION ALL
-  SELECT 'interest','Product/service interest recorded',10,'{}'
- ) r;
+SELECT 'score-'||substr(o.id,1,28)||'-'||r.factor_key,o.id,r.factor_key,r.label,r.points,r.condition_json
+FROM organizations o CROSS JOIN scoring_rules r;
 CREATE TABLE IF NOT EXISTS crm_sales_targets (
   id TEXT PRIMARY KEY,
   organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
