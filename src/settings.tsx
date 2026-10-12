@@ -1,5 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { Building2, Check, CheckCircle2, Copy, CreditCard, DatabaseBackup, Download, Globe2, Mail, RotateCcw, Send, ShieldCheck } from "lucide-react";
+import QRCode from "qrcode";
 
 type Organization = { id: string; name: string; slug: string; industry: string | null; description: string | null; timezone: string; currency: string; status: string };
 type Subscription = { plan: string; status: string; trialEndsAt: string | null; renewsAt: string | null; employeeLimit: number; storageLimitBytes: number };
@@ -80,6 +81,25 @@ export function OrganizationSettings({ onToast, currentEmail }: { onToast: (mess
 type TwoFactorStatus = { enabled: boolean; enabledAt: string | null; recoveryCodesRemaining: number };
 type TwoFactorSetup = { secret: string; provisioningUri: string };
 
+function AuthenticatorQrCode({ value }: { value: string }) {
+  const [image, setImage] = useState("");
+  const [error, setError] = useState(false);
+  useEffect(() => {
+    let active = true;
+    setImage(""); setError(false);
+    void QRCode.toDataURL(value, {
+      errorCorrectionLevel: "M", margin: 2, width: 224,
+      color: { dark: "#102f3b", light: "#ffffff" },
+    }).then((dataUrl) => { if (active) setImage(dataUrl); }).catch(() => { if (active) setError(true); });
+    return () => { active = false; };
+  }, [value]);
+  if (error) return <p className="totp-qr-status" role="status">QR code could not be generated. Use the setup key below instead.</p>;
+  return <div className="totp-qr">
+    {image ? <img className="totp-qr-image" src={image} alt="Authenticator app setup QR code" width="224" height="224" /> : <div className="totp-qr-loading" role="status">Preparing secure QR code…</div>}
+    <div><strong>Scan with your authenticator app</strong><span>Open Google Authenticator, Microsoft Authenticator, 1Password or another TOTP app and scan this code. It is generated on this device; the setup secret is not sent to a QR service.</span></div>
+  </div>;
+}
+
 export function AccountSecurity({ onToast, required = false, mandatory = false, onSecurityChanged }: { onToast: (message: string) => void; required?: boolean; mandatory?: boolean; onSecurityChanged?: () => void }) {
   const [status, setStatus] = useState<TwoFactorStatus | null>(null);
   const [setup, setSetup] = useState<TwoFactorSetup | null>(null);
@@ -117,7 +137,7 @@ export function AccountSecurity({ onToast, required = false, mandatory = false, 
     <section className="card settings-panel account-security-card"><div className="card-heading"><div><h2>Two-factor authentication</h2><p>Use a time-based code from an authenticator app in addition to your password.</p></div><span className={`status-badge ${status?.enabled ? "active" : required ? "pending" : "pending"}`}>{status ? status.enabled ? "Enabled" : required ? "Required" : "Not enabled" : "Loading"}</span></div>
       {!status ? <p className="subscription-note">Loading security status…</p> : status.enabled ? <><div className="security-note"><ShieldCheck size={18} /><div><strong>Your account requires an authenticator code at sign-in</strong><span>{status.recoveryCodesRemaining} unused recovery codes remain. Keep them somewhere private.</span></div></div>
         {!mandatory && <form className="two-factor-form" onSubmit={disable}><label>Current password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label><label>Authenticator or recovery code<input value={code} onChange={(event) => setCode(event.target.value)} autoComplete="one-time-code" required placeholder="6-digit code or one-time recovery code" /></label><button className="button secondary" disabled={busy}>{busy ? "Please wait…" : "Disable two-factor authentication"}</button></form>}</>
-        : setup ? <><div className="security-note"><ShieldCheck size={18} /><div><strong>Add this account to an authenticator app</strong><span>In Google Authenticator, Microsoft Authenticator, 1Password or another TOTP app, choose manual setup and enter the secret below. Setup expires in 10 minutes and locks after five incorrect codes.</span></div></div><div className="totp-secret"><span>Setup key</span><code>{setup.secret}</code><button className="button secondary" type="button" onClick={() => void navigator.clipboard?.writeText(setup.secret)}><Copy size={14} /> Copy key</button></div><details className="totp-details"><summary>Advanced setup URI</summary><code>{setup.provisioningUri}</code></details><form className="two-factor-form" onSubmit={enable}><label>6-digit code from your authenticator<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value)} required pattern="[0-9 ]{6,8}" placeholder="000000" /></label><div className="full"><button className="button primary" disabled={busy}>{busy ? "Verifying…" : "Verify and enable"}</button>{!required && <button className="button secondary" type="button" onClick={() => { setSetup(null); setCode(""); }}>Cancel</button>}</div></form></>
+        : setup ? <><div className="security-note"><ShieldCheck size={18} /><div><strong>Add this account to an authenticator app</strong><span>Setup expires in 10 minutes and locks after five incorrect codes. Keep the QR code and setup key private.</span></div></div><AuthenticatorQrCode value={setup.provisioningUri} /><div className="totp-secret"><span>Manual setup key</span><code>{setup.secret}</code><button className="button secondary" type="button" onClick={() => void navigator.clipboard?.writeText(setup.secret)}><Copy size={14} /> Copy key</button></div><details className="totp-details"><summary>Advanced setup URI</summary><code>{setup.provisioningUri}</code></details><form className="two-factor-form" onSubmit={enable}><label>6-digit code from your authenticator<input inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(event) => setCode(event.target.value)} required pattern="[0-9 ]{6,8}" placeholder="000000" /></label><div className="full"><button className="button primary" disabled={busy}>{busy ? "Verifying…" : "Verify and enable"}</button>{!required && <button className="button secondary" type="button" onClick={() => { setSetup(null); setCode(""); }}>Cancel</button>}</div></form></>
         : <><div className="security-note"><ShieldCheck size={18} /><div><strong>Additional sign-in protection is off</strong><span>After enabling, each sign-in on web and mobile will require a code from your authenticator.</span></div></div><form className="two-factor-form" onSubmit={start}><label>Confirm your current password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label><button className="button primary" disabled={busy}>{busy ? "Preparing…" : "Set up two-factor authentication"}</button></form></>}
     </section>
     {recoveryCodes.length > 0 && <section className="card settings-panel recovery-panel"><div className="card-heading"><div><h2>Save your recovery codes</h2><p>Each code works once if you cannot access your authenticator. This list is shown only now.</p></div><Check size={18} /></div><div className="recovery-code-grid">{recoveryCodes.map((item) => <code key={item}>{item}</code>)}</div><button className="button secondary" onClick={() => void navigator.clipboard?.writeText(recoveryCodes.join("\n"))}><Copy size={14} /> Copy recovery codes</button><p className="subscription-note">Store these codes securely. You cannot view them again after leaving this page.</p></section>}
