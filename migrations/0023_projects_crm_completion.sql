@@ -1,4 +1,5 @@
 -- Projects portfolio, governance, client access and CRM completion models.
+UPDATE organization_modules SET features_json='{"portfolios":true,"programmes":true,"gantt":true,"timesheets":true,"budgets":true,"risks":true,"change_control":true,"meetings":true,"templates":true,"client_portal":true,"advanced_reports":true,"ai":false}' WHERE module_key='projects';
 CREATE TABLE IF NOT EXISTS project_portfolios (
   id TEXT PRIMARY KEY,
   organization_id TEXT NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
