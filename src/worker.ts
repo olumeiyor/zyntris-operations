@@ -23,13 +23,15 @@ type AuthContext = {
   role: string;
   isDemo: boolean;
   isPlatformAdmin: boolean;
+  mfaMandatory: boolean;
+  mfaEnrollmentRequired: boolean;
   permissions: Set<string>;
 };
 
 const json = (data: unknown, init: ResponseInit = {}) =>
   new Response(JSON.stringify(data), {
     ...init,
-    headers: { "content-type": "application/json; charset=utf-8", ...(init.headers || {}) },
+    headers: { "content-type": "application/json; charset=utf-8", "cache-control": "private, no-store", ...(init.headers || {}) },
   });
 
 const error = (message: string, status = 400) => json({ error: message }, { status });
@@ -228,7 +230,8 @@ function withSecurityHeaders(response: Response) {
   headers.set("x-frame-options", "DENY");
   headers.set("referrer-policy", "strict-origin-when-cross-origin");
   headers.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
-  headers.set("content-security-policy", "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self' https://app.zyntris.org");
+  headers.set("content-security-policy", "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; form-action 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; script-src 'self'; connect-src 'self' https://app.zyntris.org");
+  headers.set("strict-transport-security", "max-age=31536000; includeSubDomains");
   headers.set("x-request-id", requestId());
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
@@ -246,6 +249,37 @@ async function hashToken(value: string) {
   const bytes = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function validUploadContent(file: File, allowedTypes: string[]) {
+  if (!allowedTypes.includes(file.type)) return false;
+  const bytes = new Uint8Array(await file.slice(0, 16).arrayBuffer());
+  const startsWith = (...signature: number[]) => signature.every((byte, index) => bytes[index] === byte);
+  if (file.type === "application/pdf") return new TextDecoder().decode(bytes.slice(0, 5)) === "%PDF-";
+  if (file.type === "image/jpeg") return startsWith(0xff, 0xd8, 0xff);
+  if (file.type === "image/png") return startsWith(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a);
+  if (file.type === "image/webp") return new TextDecoder().decode(bytes.slice(0, 4)) === "RIFF" && new TextDecoder().decode(bytes.slice(8, 12)) === "WEBP";
+  if (file.type === "application/vnd.openxmlformats-officedocument.wordprocessingml.document") return file.name.toLowerCase().endsWith(".docx") && startsWith(0x50, 0x4b, 0x03, 0x04);
+  if (file.type === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") return file.name.toLowerCase().endsWith(".xlsx") && startsWith(0x50, 0x4b, 0x03, 0x04);
+  if (file.type === "text/csv") {
+    if (!file.name.toLowerCase().endsWith(".csv")) return false;
+    try { const sample = await file.slice(0, 4096).text(); return !sample.includes("\u0000"); } catch { return false; }
+  }
+  return false;
+}
+
+async function reserveTenantStorage(env: Env, organizationId: string, bytes: number) {
+  const storage = await env.DB.prepare(`SELECT storage_limit_bytes as storageLimit FROM subscriptions WHERE organization_id = ?`).bind(organizationId).first<{ storageLimit: number }>();
+  if (!storage) return { available: false, withinLimit: false };
+  const reservation = await env.DB.batch([
+    env.DB.prepare(`INSERT OR IGNORE INTO tenant_storage_usage (organization_id, used_bytes) VALUES (?, 0)`).bind(organizationId),
+    env.DB.prepare(`UPDATE tenant_storage_usage SET used_bytes = used_bytes + ?, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ? AND used_bytes + ? <= ?`).bind(bytes, organizationId, bytes, storage.storageLimit),
+  ]);
+  return { available: true, withinLimit: reservation[1].meta.changes === 1 };
+}
+
+async function releaseTenantStorage(env: Env, organizationId: string, bytes: number) {
+  if (bytes > 0) await env.DB.prepare(`UPDATE tenant_storage_usage SET used_bytes = MAX(0, used_bytes - ?), updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(bytes, organizationId).run();
 }
 
 const escapeIcs = (value: string) => value.replace(/\\/g, "\\\\").replace(/\r?\n/g, "\\n").replace(/,/g, "\\,").replace(/;/g, "\\;");
@@ -286,6 +320,13 @@ async function auth(request: Request, env: Env): Promise<AuthContext | null> {
   const token = authorization?.match(/^Bearer\s+([a-f0-9]{64})$/i)?.[1] || getCookie(request, "zyntris_session");
   if (!token) return null;
   const tokenHash = await hashToken(token);
+  if (mobileRequest) {
+    const touched = await env.DB.prepare(`UPDATE sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP AND last_seen_at > datetime('now', '-2 minutes')`).bind(tokenHash).run();
+    if (touched.meta.changes !== 1) return null;
+  } else {
+    const active = await env.DB.prepare(`SELECT 1 as active FROM sessions WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP AND last_seen_at > datetime('now', '-2 minutes')`).bind(tokenHash).first();
+    if (!active) return null;
+  }
   const result = await env.DB.prepare(`
     SELECT m.user_id as userId, m.organization_id as organizationId, u.email as email, r.name as role, r.id as roleId, s.is_demo as isDemo
     FROM sessions s
@@ -300,15 +341,30 @@ async function auth(request: Request, env: Env): Promise<AuthContext | null> {
   if (!result) return null;
   const rows = await env.DB.prepare(`SELECT p.code FROM role_permissions rp JOIN permissions p ON p.id = rp.permission_id WHERE rp.role_id = ?`).bind(result.roleId).all<{ code: string }>();
   const platformEmails = (env.PLATFORM_ADMIN_EMAILS || "").split(",").map((email) => email.trim().toLowerCase()).filter(Boolean);
+  const isPlatformAdmin = platformEmails.includes(result.email.toLowerCase());
+  const permissions = new Set((rows.results || []).map((row) => row.code));
+  const privilegedRole = ["admin", "organization admin", "hr admin", "finance admin", "ceo"].includes(result.role.trim().toLowerCase());
+  const requiresMfa = isPlatformAdmin || privilegedRole || permissions.has("roles.manage") || permissions.has("settings.manage");
+  const factor = await env.DB.prepare(`SELECT 1 as enabled FROM user_two_factor WHERE user_id = ? AND enabled_at IS NOT NULL`).bind(result.userId).first<{ enabled: number }>();
   return {
     userId: result.userId,
     organizationId: result.organizationId,
     email: result.email,
     role: result.role,
     isDemo: result.isDemo === 1,
-    isPlatformAdmin: platformEmails.includes(result.email.toLowerCase()),
-    permissions: new Set((rows.results || []).map((row) => row.code)),
+    isPlatformAdmin,
+    mfaMandatory: requiresMfa,
+    mfaEnrollmentRequired: requiresMfa && !factor,
+    permissions,
   };
+}
+
+function mfaEnrollmentAllowed(path: string, method: string) {
+  return (path === "/api/me" && method === "GET")
+    || (path === "/api/auth/activity" && method === "POST")
+    || (path === "/api/auth/2fa/status" && method === "GET")
+    || (path === "/api/auth/2fa/setup" && method === "POST")
+    || (path === "/api/auth/2fa/enable" && method === "POST");
 }
 
 function hasPermission(context: AuthContext, permission: string) {
@@ -454,7 +510,7 @@ async function createSession(env: Env, userId: string, organizationId: string, i
 }
 
 function cookieResponse(data: unknown, token: string, maxAge = 12 * 60 * 60, status = 200) {
-  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "set-cookie": setCookie("zyntris_session", token, maxAge) } });
+  return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "private, no-store", "set-cookie": setCookie("zyntris_session", token, maxAge) } });
 }
 
 function originAllowed(request: Request, env: Env) {
@@ -462,9 +518,10 @@ function originAllowed(request: Request, env: Env) {
   return !origin || origin === env.APP_ORIGIN;
 }
 
-async function consumeAuthLimit(env: Env, request: Request, action: string, limit: number, windowMinutes: number) {
+async function consumeAuthLimit(env: Env, request: Request, action: string, limit: number, windowMinutes: number, subject?: string) {
   const ip = request.headers.get("cf-connecting-ip") || "unknown";
-  const key = `${action}:${await hashToken(ip)}`;
+  const scope = subject ? `subject:${await hashToken(subject.trim().toLowerCase())}` : `ip:${await hashToken(ip)}`;
+  const key = `${action}:${scope}`;
   await env.DB.prepare(`INSERT INTO auth_rate_limits (bucket_key, attempt_count, window_started_at) VALUES (?, 1, CURRENT_TIMESTAMP)
     ON CONFLICT(bucket_key) DO UPDATE SET attempt_count = CASE WHEN window_started_at <= datetime('now', ?) THEN 1 ELSE attempt_count + 1 END,
     window_started_at = CASE WHEN window_started_at <= datetime('now', ?) THEN CURRENT_TIMESTAMP ELSE window_started_at END`)
@@ -748,6 +805,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     const body = await request.json<{ email?: string }>();
     const email = body.email?.trim().toLowerCase();
     if (!email || email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return error("Enter a valid email address.");
+    if (!(await consumeAuthLimit(env, request, "forgot-password", 3, 60, email))) return error("Too many password reset requests. Try again later.", 429);
     const user = await env.DB.prepare(`SELECT u.id as userId, u.email, u.full_name as fullName, m.organization_id as organizationId, o.name as organizationName FROM users u JOIN memberships m ON m.user_id = u.id JOIN organizations o ON o.id = m.organization_id WHERE lower(u.email) = ? AND u.status = 'active' AND m.status = 'active' ORDER BY m.created_at LIMIT 1`).bind(email).first<{ userId: string; email: string; fullName: string; organizationId: string; organizationName: string }>();
     if (user) {
       const token = [...crypto.getRandomValues(new Uint8Array(32))].map((byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -825,6 +883,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     if (!(await consumeAuthLimit(env, request, "login", 20, 15))) return error("Too many sign-in attempts. Try again later.", 429);
     const body = await request.json<{ email?: string; password?: string }>();
     const email = body.email?.trim().toLowerCase() || "";
+    if (email && !(await consumeAuthLimit(env, request, "login", 8, 15, email))) return error("Too many sign-in attempts. Try again later.", 429);
     const user = await env.DB.prepare(`SELECT id, password_hash as passwordHash, email_verified_at as verifiedAt, status FROM users WHERE email = ?`).bind(email).first<{ id: string; passwordHash: string | null; verifiedAt: string | null; status: string }>();
     if (!user?.passwordHash || user.status !== "active" || !(await verifyPassword(body.password || "", user.passwordHash))) return error("Email or password is incorrect.", 401);
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
@@ -1413,6 +1472,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!(await consumeAuthLimit(env, request, "login", 20, 15))) return error("Too many sign-in attempts. Try again later.", 429);
     const body = await request.json<{ email?: string; password?: string }>();
     const email = body.email?.trim().toLowerCase() || "";
+    if (email && !(await consumeAuthLimit(env, request, "login", 8, 15, email))) return error("Too many sign-in attempts. Try again later.", 429);
     const user = await env.DB.prepare(`SELECT id, password_hash as passwordHash, email_verified_at as verifiedAt, status FROM users WHERE email = ?`).bind(email).first<{ id: string; passwordHash: string | null; verifiedAt: string | null; status: string }>();
     if (!user?.passwordHash || user.status !== "active" || !(await verifyPassword(body.password || "", user.passwordHash))) return error("Email or password is incorrect.", 401);
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
@@ -1440,12 +1500,23 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!originAllowed(request, env)) return error("Request origin rejected", 403);
     const token = getCookie(request, "zyntris_session");
     if (token) await env.DB.prepare(`DELETE FROM sessions WHERE token_hash = ?`).bind(await hashToken(decodeURIComponent(token))).run();
-    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json", "set-cookie": setCookie("zyntris_session", "", 0) } });
+    return new Response(JSON.stringify({ ok: true }), { headers: { "content-type": "application/json", "cache-control": "private, no-store", "set-cookie": setCookie("zyntris_session", "", 0) } });
   }
 
   const secured = await requireAuth(request, env);
   if ("response" in secured && secured.response) return secured.response;
   const context = secured.context;
+
+  if (context.mfaEnrollmentRequired && !mfaEnrollmentAllowed(path, request.method)) return error("Authenticator-based two-factor authentication is required before using this privileged account. Open Account security to complete setup.", 403);
+
+  if (request.method === "POST" && path === "/api/auth/activity") {
+    if (!originAllowed(request, env)) return error("Request origin rejected", 403);
+    const token = mobilePath ? request.headers.get("authorization")?.match(/^Bearer\s+([a-f0-9]{64})$/i)?.[1] : getCookie(request, "zyntris_session");
+    if (!token) return error("Authentication required", 401);
+    const touched = await env.DB.prepare(`UPDATE sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP AND last_seen_at > datetime('now', '-2 minutes')`).bind(await hashToken(decodeURIComponent(token))).run();
+    if (touched.meta.changes !== 1) return error("Your session expired after inactivity. Sign in again.", 401);
+    return json({ ok: true });
+  }
 
   if (context.isDemo && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method)) return error("The demo sandbox is read-only. Changes are not allowed.", 403);
 
@@ -1552,6 +1623,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && path === "/api/auth/2fa/setup") {
+    if (!(await consumeAuthLimit(env, request, "2fa-setup", 10, 15, context.userId))) return error("Too many authenticator setup attempts. Try again later.", 429);
     const body = await request.json<{ password?: string }>();
     if (!body.password || body.password.length > 128) return error("Enter your current password to set up two-factor authentication.");
     const user = await env.DB.prepare(`SELECT password_hash as passwordHash FROM users WHERE id = ? AND status = 'active'`).bind(context.userId).first<{ passwordHash: string | null }>();
@@ -1560,8 +1632,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (current?.enabledAt) return error("Two-factor authentication is already enabled.", 409);
     const secret = base32Encode(crypto.getRandomValues(new Uint8Array(20)));
     const encrypted = await encryptTwoFactorSecret(env, secret);
-    await env.DB.prepare(`INSERT INTO user_two_factor (user_id, pending_secret_enc, pending_expires_at) VALUES (?, ?, datetime('now', '+10 minutes'))
-      ON CONFLICT(user_id) DO UPDATE SET pending_secret_enc = excluded.pending_secret_enc, pending_expires_at = excluded.pending_expires_at, updated_at = CURRENT_TIMESTAMP WHERE user_two_factor.enabled_at IS NULL`)
+    await env.DB.prepare(`INSERT INTO user_two_factor (user_id, pending_secret_enc, pending_expires_at, pending_attempts) VALUES (?, ?, datetime('now', '+10 minutes'), 0)
+      ON CONFLICT(user_id) DO UPDATE SET pending_secret_enc = excluded.pending_secret_enc, pending_expires_at = excluded.pending_expires_at, pending_attempts = 0, updated_at = CURRENT_TIMESTAMP WHERE user_two_factor.enabled_at IS NULL`)
       .bind(context.userId, encrypted).run();
     const account = encodeURIComponent(`${context.email} (Zyntris)`);
     const issuer = encodeURIComponent("Zyntris");
@@ -1571,13 +1643,18 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && path === "/api/auth/2fa/enable") {
+    if (!(await consumeAuthLimit(env, request, "2fa-enroll", 10, 15)) || !(await consumeAuthLimit(env, request, "2fa-enroll", 8, 15, context.userId))) return error("Too many authenticator setup attempts. Start setup again later.", 429);
     const body = await request.json<{ code?: string }>();
-    const pending = await env.DB.prepare(`SELECT pending_secret_enc as secretEnc FROM user_two_factor WHERE user_id = ? AND enabled_at IS NULL AND pending_expires_at > CURRENT_TIMESTAMP`).bind(context.userId).first<{ secretEnc: string | null }>();
+    const pending = await env.DB.prepare(`SELECT pending_secret_enc as secretEnc, pending_attempts as attempts FROM user_two_factor WHERE user_id = ? AND enabled_at IS NULL AND pending_expires_at > CURRENT_TIMESTAMP`).bind(context.userId).first<{ secretEnc: string | null; attempts: number }>();
     if (!pending?.secretEnc || !body.code) return error("Start setup again; the authenticator setup has expired.", 409);
+    if (pending.attempts >= 5) return error("Too many incorrect setup codes. Start authenticator setup again.", 429);
     const counter = await matchTotp(await decryptTwoFactorSecret(env, pending.secretEnc), body.code);
-    if (counter === null) return error("That code is not valid yet. Check your device time and try again.", 401);
+    if (counter === null) {
+      const failed = await env.DB.prepare(`UPDATE user_two_factor SET pending_attempts = pending_attempts + 1, pending_secret_enc = CASE WHEN pending_attempts + 1 >= 5 THEN NULL ELSE pending_secret_enc END, pending_expires_at = CASE WHEN pending_attempts + 1 >= 5 THEN NULL ELSE pending_expires_at END, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND enabled_at IS NULL AND pending_secret_enc = ? AND pending_expires_at > CURRENT_TIMESTAMP AND pending_attempts < 5`).bind(context.userId, pending.secretEnc).run();
+      return error(failed.meta.changes ? "That code is not valid. Setup expires after five incorrect attempts; start again if necessary." : "Setup expired or was already completed. Start setup again.", failed.meta.changes ? 401 : 409);
+    }
     const codes = makeRecoveryCodes();
-    const updated = await env.DB.prepare(`UPDATE user_two_factor SET secret_enc = pending_secret_enc, pending_secret_enc = NULL, pending_expires_at = NULL, enabled_at = CURRENT_TIMESTAMP, last_counter = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND enabled_at IS NULL AND pending_secret_enc = ? AND pending_expires_at > CURRENT_TIMESTAMP`)
+    const updated = await env.DB.prepare(`UPDATE user_two_factor SET secret_enc = pending_secret_enc, pending_secret_enc = NULL, pending_expires_at = NULL, pending_attempts = 0, enabled_at = CURRENT_TIMESTAMP, last_counter = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND enabled_at IS NULL AND pending_secret_enc = ? AND pending_expires_at > CURRENT_TIMESTAMP AND pending_attempts < 5`)
       .bind(counter - 1, context.userId, pending.secretEnc).run();
     if (!updated.meta.changes) return error("Setup expired or was already completed. Start setup again.", 409);
     const codeHashes = await Promise.all(codes.map((code) => hashToken(code.replace(/-/g, "").toLowerCase())));
@@ -1588,6 +1665,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "POST" && path === "/api/auth/2fa/disable") {
+    if (context.isPlatformAdmin || ["admin", "organization admin", "hr admin", "finance admin", "ceo"].includes(context.role.trim().toLowerCase()) || context.permissions.has("roles.manage") || context.permissions.has("settings.manage")) return error("Two-factor authentication is mandatory for this privileged account.", 403);
     const body = await request.json<{ password?: string; code?: string }>();
     const user = await env.DB.prepare(`SELECT password_hash as passwordHash FROM users WHERE id = ? AND status = 'active'`).bind(context.userId).first<{ passwordHash: string | null }>();
     if (!user?.passwordHash || !(await verifyPassword(body.password || "", user.passwordHash))) return error("Your current password is incorrect.", 401);
@@ -1770,7 +1848,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "GET" && path === "/api/me") {
     const user = await env.DB.prepare(`SELECT u.id, u.email, u.full_name as fullName, r.name as role, o.id as organizationId, o.name as organizationName, s.trial_ends_at as trialEndsAt, s.status as subscriptionStatus FROM users u JOIN memberships m ON m.user_id = u.id JOIN roles r ON r.id = m.role_id JOIN organizations o ON o.id = m.organization_id LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE u.id = ? AND o.id = ?`).bind(context.userId, context.organizationId).first();
-    return json({ ...(user || { id: context.userId, role: context.role, organizationId: context.organizationId }), permissions: [...context.permissions], isPlatformAdmin: context.isPlatformAdmin, isDemo: context.isDemo });
+    return json({ ...(user || { id: context.userId, role: context.role, organizationId: context.organizationId }), permissions: [...context.permissions], isPlatformAdmin: context.isPlatformAdmin, isDemo: context.isDemo, mfaMandatory: context.mfaMandatory, mfaEnrollmentRequired: context.mfaEnrollmentRequired });
   }
 
   if (path === "/api/settings/organization" && request.method === "GET") {
@@ -1878,6 +1956,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
         const archived = await env.FILES.get(file.backupKey);
         if (archived) { await env.FILES.put(file.originalKey, archived.body, { httpMetadata: archived.httpMetadata }); restoredFiles += 1; }
       }
+      await env.DB.prepare(`INSERT INTO tenant_storage_usage (organization_id, used_bytes, updated_at) SELECT ?, (SELECT COALESCE(SUM(size_bytes),0) FROM documents WHERE organization_id = ?) + (SELECT COALESCE(SUM(receipt_size_bytes),0) FROM expenses WHERE organization_id = ?), CURRENT_TIMESTAMP ON CONFLICT(organization_id) DO UPDATE SET used_bytes = excluded.used_bytes, updated_at = CURRENT_TIMESTAMP`).bind(context.organizationId, context.organizationId, context.organizationId).run();
       await audit(env, context, "restored_merge", "tenant_backups", backupMatch[1], { restoredCount, restoredFiles });
       return json({ ok: true, mode: "non-destructive merge", restoredCount, restoredFiles });
     } catch (cause) {
@@ -2624,8 +2703,9 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (payrollRunMatch[2] === "export") {
       const headers = ["Employee number", "Employee", "Job title", "Base salary", "Gross pay", "PAYE", "Employee pension", "Other deductions", "Net pay", "Employer pension", "Employer contributions"];
       const values = (items.results || []).map((row: Record<string, unknown>) => [row.employeeNumber, row.employeeName, row.jobTitle, row.baseSalary, row.grossPay, row.payeTax, row.employeePension, row.otherDeductions, row.netPay, row.employerPension, row.employerContributions]);
-      const csv = [headers, ...values].map((row) => row.map((value) => `"${String(value ?? "").replace(/"/g, '""')}"`).join(",")).join("\r\n");
-      return new Response(csv, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="zyntris-payroll-${runId}.csv"` } });
+      const cell = (value: unknown) => { let text = String(value ?? ""); if (/^[\s]*[=+@-]/.test(text)) text = `'${text}`; return `"${text.replaceAll('"', '""').replace(/[\r\n]+/g, " ")}"`; };
+      const csv = [headers, ...values].map((row) => row.map(cell).join(",")).join("\r\n");
+      return new Response(csv, { headers: { "content-type": "text/csv; charset=utf-8", "content-disposition": `attachment; filename="zyntris-payroll-${runId}.csv"`, "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
     }
     if (payrollRunMatch[2] === "payout") return error("Zyntris is a remuneration record system and does not generate bank payout files or initiate transfers.", 410);
     return json({ run, items: items.results || [] });
@@ -3301,6 +3381,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "POST" && path === "/api/expenses") {
     if (!hasPermission(context, "employees.view")) return error("Only organization members can submit expense records.", 403);
+    const contentLength = Number(request.headers.get("content-length") || 0);
+    if (contentLength > 10 * 1024 * 1024 + 64 * 1024) return error("Receipt uploads must be 10MB or smaller.", 413);
     let body: { category?: string; amount?: number | string; expenseDate?: string; description?: string; project?: string };
     let receipt: File | null = null;
     if ((request.headers.get("content-type") || "").toLowerCase().includes("multipart/form-data")) {
@@ -3316,7 +3398,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const policy = await env.DB.prepare(`SELECT expense_max_amount as maxAmount, expense_receipt_required as receiptRequired FROM organization_settings WHERE organization_id = ?`).bind(context.organizationId).first<{ maxAmount: number | null; receiptRequired: number }>();
     if (policy?.maxAmount && amount > policy.maxAmount) return error(`This claim exceeds the organization’s per-claim limit of ₦${policy.maxAmount.toLocaleString("en-NG")}.`, 400);
     if (policy?.receiptRequired && !receipt) return error("A receipt attachment is required by your organization’s expense policy.");
-    if (receipt && (receipt.size > 10 * 1024 * 1024 || !["image/jpeg", "image/png", "image/webp", "application/pdf"].includes(receipt.type))) return error("Attach a JPEG, PNG, WebP or PDF receipt no larger than 10MB.");
+    if (receipt && (receipt.size > 10 * 1024 * 1024 || !(await validUploadContent(receipt, ["image/jpeg", "image/png", "image/webp", "application/pdf"])))) return error("Attach a valid JPEG, PNG, WebP or PDF receipt no larger than 10MB.");
     if (receipt && !env.FILES) return error("Receipt storage is unavailable. Contact your administrator.", 503);
     const employee = await env.DB.prepare(`SELECT id, first_name as firstName, last_name as lastName FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId, context.userId).first<{ id: string; firstName: string; lastName: string }>();
     const employeeId = employee?.id;
@@ -3329,11 +3411,25 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const expenseSla = await env.DB.prepare(`SELECT due_hours as dueHours FROM workflow_sla_settings WHERE organization_id = ? AND request_type = 'Expense'`).bind(context.organizationId).first<{ dueHours: number }>();
     const expenseDueAt = new Date(Date.now() + (expenseSla?.dueHours || 48) * 3600000).toISOString();
     const receiptKey = receipt ? `expense-receipts/${context.organizationId}/${id}/${crypto.randomUUID()}` : null;
-    if (receipt && receiptKey) await env.FILES.put(receiptKey, receipt.stream(), { httpMetadata: { contentType: receipt.type } });
-    await env.DB.batch([
-      env.DB.prepare(`INSERT INTO expenses (id, organization_id, employee_id, category, amount, currency, expense_date, description, receipt_key, status) VALUES (?, ?, ?, ?, ?, 'NGN', ?, ?, ?, 'submitted')`).bind(id, context.organizationId, employeeId, category, amount, body.expenseDate, description, receiptKey),
-      env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json, due_at) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'CEO', 'pending', 1, ?, ?)`).bind(requestIdValue, context.organizationId, id, description, context.userId, amount, JSON.stringify({ category, project: body.project || null, approvalPolicy: ["CEO"] }), expenseDueAt),
-    ]);
+    if (receipt) {
+      const reservation = await reserveTenantStorage(env, context.organizationId, receipt.size);
+      if (!reservation.available) return error("Organization storage allowance is unavailable. Contact support.", 503);
+      if (!reservation.withinLimit) return error("This receipt would exceed the organization’s storage allowance. Remove unused files or contact Zyntris.", 413);
+    }
+    try {
+      if (receipt && receiptKey) await env.FILES.put(receiptKey, receipt.stream(), { httpMetadata: { contentType: receipt.type } });
+      await env.DB.batch([
+        env.DB.prepare(`INSERT INTO expenses (id, organization_id, employee_id, category, amount, currency, expense_date, description, receipt_key, receipt_size_bytes, status) VALUES (?, ?, ?, ?, ?, 'NGN', ?, ?, ?, ?, 'submitted')`).bind(id, context.organizationId, employeeId, category, amount, body.expenseDate, description, receiptKey, receipt?.size || 0),
+        env.DB.prepare(`INSERT INTO approval_requests (id, organization_id, request_type, source_record_id, title, requester_id, amount, currency, required_role, status, current_step, metadata_json, due_at) VALUES (?, ?, 'Expense', ?, ?, ?, ?, 'NGN', 'CEO', 'pending', 1, ?, ?)`).bind(requestIdValue, context.organizationId, id, description, context.userId, amount, JSON.stringify({ category, project: body.project || null, approvalPolicy: ["CEO"] }), expenseDueAt),
+      ]);
+    } catch (cause) {
+      if (receipt && receiptKey) {
+        let objectRemoved = false;
+        try { await env.FILES.delete(receiptKey); objectRemoved = true; } catch (cleanupError) { console.error("Failed to clean up expense receipt; storage reservation retained", cleanupError); }
+        if (objectRemoved) await releaseTenantStorage(env, context.organizationId, receipt.size);
+      }
+      throw cause;
+    }
     await audit(env, context, "submitted", "expenses", id, { category, amount, description });
     await notifyApprovers(env, context, "CEO", description, `A financial request for ₦${amount.toLocaleString("en-NG")} is pending your approval.`);
     return json({ id, requestId: requestIdValue, status: "submitted", employee: `${employee.firstName} ${employee.lastName}` }, { status: 201 });
@@ -3669,8 +3765,11 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "GET" && path === "/api/files") {
-    const result = await env.DB.prepare(`SELECT id, name, category, content_type as contentType, size_bytes as sizeBytes, expires_at as expiresAt, created_at as createdAt FROM documents WHERE organization_id = ? ORDER BY created_at DESC LIMIT 100`).bind(context.organizationId).all();
-    return json({ data: result.results || [] });
+    const [result, storage] = await Promise.all([
+      env.DB.prepare(`SELECT id, name, category, content_type as contentType, size_bytes as sizeBytes, expires_at as expiresAt, created_at as createdAt FROM documents WHERE organization_id = ? ORDER BY created_at DESC LIMIT 100`).bind(context.organizationId).all(),
+      env.DB.prepare(`SELECT s.storage_limit_bytes as storageLimitBytes, COALESCE(u.used_bytes,0) as usedBytes FROM subscriptions s LEFT JOIN tenant_storage_usage u ON u.organization_id=s.organization_id WHERE s.organization_id=?`).bind(context.organizationId).first<{ storageLimitBytes: number; usedBytes: number }>(),
+    ]);
+    return json({ data: result.results || [], storageLimitBytes: storage?.storageLimitBytes || 0, usedBytes: storage?.usedBytes || 0 });
   }
 
   const fileMatch = path.match(/^\/api\/files\/([^/]+)$/);
@@ -3683,19 +3782,43 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     return new Response(object.body, { headers: { "content-type": doc.contentType || "application/octet-stream", "content-disposition": `attachment; filename="${safeName}"`, "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
   }
 
+  if (request.method === "DELETE" && fileMatch) {
+    if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to delete documents.", 403);
+    const doc = await env.DB.prepare(`SELECT r2_key as r2Key, name, size_bytes as sizeBytes FROM documents WHERE id = ? AND organization_id = ?`).bind(fileMatch[1], context.organizationId).first<{ r2Key: string; name: string; sizeBytes: number }>();
+    if (!doc) return error("Document not found.", 404);
+    await env.FILES.delete(doc.r2Key);
+    const deleted = await env.DB.prepare(`DELETE FROM documents WHERE id = ? AND organization_id = ?`).bind(fileMatch[1], context.organizationId).run();
+    if (deleted.meta.changes === 1) await env.DB.prepare(`UPDATE tenant_storage_usage SET used_bytes = MAX(0, used_bytes - ?), updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(doc.sizeBytes, context.organizationId).run();
+    await audit(env, context, "deleted", "documents", fileMatch[1], { name: doc.name, size: doc.sizeBytes });
+    return json({ ok: true });
+  }
+
   if (request.method === "POST" && path === "/api/files") {
+    const contentLength = Number(request.headers.get("content-length") || 0);
+    if (contentLength > 10 * 1024 * 1024 + 64 * 1024) return error("Files must be 10MB or smaller.", 413);
     const form = await request.formData();
     const file = form.get("file");
     if (!(file instanceof File)) return error("A file is required");
-    if (file.size > 10 * 1024 * 1024) return error("Files must be 10MB or smaller");
+    if (file.size > 10 * 1024 * 1024) return error("Files must be 10MB or smaller", 413);
+    if (!(await validUploadContent(file, ["application/pdf", "image/jpeg", "image/png", "image/webp", "text/csv", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"]))) return error("Unsupported file type or file content. Use a valid PDF, image, CSV, DOCX or XLSX file.", 415);
+    const reservation = await reserveTenantStorage(env, context.organizationId, file.size);
+    if (!reservation.available) return error("Organization storage allowance is unavailable. Contact support.", 503);
+    if (!reservation.withinLimit) return error("This upload would exceed the organization’s storage allowance. Remove unused files or contact Zyntris.", 413);
     const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "-");
     const key = `${context.organizationId}/${crypto.randomUUID()}-${safeName}`;
-    await env.FILES.put(key, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
     const id = `doc-${crypto.randomUUID().slice(0, 8)}`;
-    await env.DB.prepare(`INSERT INTO documents (id, organization_id, name, category, r2_key, content_type, size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)`)
-      .bind(id, context.organizationId, file.name, String(form.get("category") || "General"), key, file.type || "application/octet-stream", file.size).run();
+    try {
+      await env.FILES.put(key, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
+      await env.DB.prepare(`INSERT INTO documents (id, organization_id, name, category, r2_key, content_type, size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+        .bind(id, context.organizationId, file.name, String(form.get("category") || "General"), key, file.type || "application/octet-stream", file.size).run();
+    } catch (cause) {
+      let objectRemoved = false;
+      try { await env.FILES.delete(key); objectRemoved = true; } catch (cleanupError) { console.error("Failed to clean up document upload object; storage reservation retained", cleanupError); }
+      if (objectRemoved) await releaseTenantStorage(env, context.organizationId, file.size);
+      throw cause;
+    }
     await audit(env, context, "uploaded", "documents", id, { name: file.name, size: file.size });
-    return json({ id, key, name: file.name }, { status: 201 });
+    return json({ id, name: file.name }, { status: 201 });
   }
 
   return error("Not found", 404);
@@ -3728,13 +3851,30 @@ export default {
       if (request.method === "GET" && projectPortalPageMatch) return withSecurityHeaders(await publicProjectPortal(projectPortalPageMatch[1], env, true));
       if (request.method === "GET" && url.pathname === "/api/calendar/oauth/callback") return withSecurityHeaders(await handleCalendarOAuthCallback(request, env));
       if (url.pathname.startsWith("/api/")) return withSecurityHeaders(await handleApi(request, env));
-      return env.ASSETS.fetch(request);
+      return withSecurityHeaders(await env.ASSETS.fetch(request));
     } catch (cause) {
       console.error("Unhandled request error", cause);
       return withSecurityHeaders(error("Something went wrong. Please try again.", 500));
     }
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM auth_rate_limits WHERE window_started_at < datetime('now', '-1 day')`),
+      env.DB.prepare(`DELETE FROM sessions WHERE expires_at <= CURRENT_TIMESTAMP OR last_seen_at <= datetime('now', '-2 minutes')`),
+      env.DB.prepare(`DELETE FROM two_factor_challenges WHERE expires_at <= CURRENT_TIMESTAMP`),
+      env.DB.prepare(`DELETE FROM password_reset_tokens WHERE expires_at <= CURRENT_TIMESTAMP OR (used_at IS NOT NULL AND created_at < datetime('now', '-1 day'))`),
+      env.DB.prepare(`DELETE FROM email_verification_tokens WHERE expires_at <= CURRENT_TIMESTAMP OR (used_at IS NOT NULL AND created_at < datetime('now', '-1 day'))`),
+      env.DB.prepare(`DELETE FROM calendar_oauth_states WHERE expires_at <= CURRENT_TIMESTAMP`),
+    ]);
+    const legacyReceipts = await env.DB.prepare(`SELECT id, organization_id as organizationId, receipt_key as receiptKey FROM expenses WHERE receipt_key IS NOT NULL AND receipt_size_bytes = 0 ORDER BY created_at LIMIT 200`).all<{ id: string; organizationId: string; receiptKey: string }>();
+    for (const receipt of legacyReceipts.results || []) {
+      const object = await env.FILES.head(receipt.receiptKey);
+      if (!object) continue;
+      const updated = await env.DB.prepare(`UPDATE expenses SET receipt_size_bytes = ? WHERE id = ? AND organization_id = ? AND receipt_size_bytes = 0 AND receipt_key = ?`).bind(object.size, receipt.id, receipt.organizationId, receipt.receiptKey).run();
+      if (updated.meta.changes === 1) {
+        await env.DB.prepare(`INSERT INTO tenant_storage_usage (organization_id, used_bytes, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(organization_id) DO UPDATE SET used_bytes = used_bytes + excluded.used_bytes, updated_at = CURRENT_TIMESTAMP`).bind(receipt.organizationId, object.size).run();
+      }
+    }
     await expireTrials(env);
     const expiredModules=await env.DB.prepare(`SELECT id,organization_id as organizationId,module_key as moduleKey FROM module_subscriptions WHERE status='active' AND ends_at IS NOT NULL AND ends_at<=CURRENT_TIMESTAMP LIMIT 200`).all<{id:string;organizationId:string;moduleKey:string}>();
     for(const item of expiredModules.results||[]){
@@ -3747,7 +3887,7 @@ export default {
     await syncExternalCalendars(env);
     const pending = await env.DB.prepare(`SELECT a.id, a.organization_id as organizationId, a.requester_id as requesterId, a.request_type as requestType, a.title, a.required_role as requiredRole, a.amount, a.due_at as dueAt, a.reminder_sent_at as reminderSentAt, a.escalated_at as escalatedAt, s.reminder_hours as reminderHours, s.escalation_role as escalationRole, os.financial_fallback_role as financialFallbackRole FROM approval_requests a LEFT JOIN workflow_sla_settings s ON s.organization_id = a.organization_id AND s.request_type = a.request_type LEFT JOIN organization_settings os ON os.organization_id = a.organization_id WHERE a.status = 'pending' AND a.due_at IS NOT NULL ORDER BY a.due_at LIMIT 500`).all<{ id: string; organizationId: string; requesterId: string; requestType: string; title: string; requiredRole: string; amount: number | null; dueAt: string; reminderSentAt: string | null; escalatedAt: string | null; reminderHours: number | null; escalationRole: string | null; financialFallbackRole: string | null }>();
     for (const item of pending.results || []) {
-      const systemContext: AuthContext = { userId: item.requesterId, organizationId: item.organizationId, email: "", role: "System", isDemo: false, isPlatformAdmin: false, permissions: new Set() };
+      const systemContext: AuthContext = { userId: item.requesterId, organizationId: item.organizationId, email: "", role: "System", isDemo: false, isPlatformAdmin: false, mfaMandatory: false, mfaEnrollmentRequired: false, permissions: new Set() };
       const overdue = Date.parse(`${item.dueAt.replace(" ", "T")}Z`) <= Date.now();
       const reminderDue = Date.parse(`${item.dueAt.replace(" ", "T")}Z`) - (item.reminderHours || 24) * 3600000 <= Date.now();
       const financial = item.amount !== null || ["expense","purchase","budget","payroll","reimbursement","payment","financial","asset purchase"].includes(item.requestType.toLowerCase());

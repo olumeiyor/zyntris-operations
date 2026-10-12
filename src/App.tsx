@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import {
   Activity, AlertTriangle, ArrowDownRight, ArrowUpRight, Award, BarChart3, Bell, BriefcaseBusiness, Building2,
   CalendarDays, CheckCircle2, ChevronDown, ChevronLeft, CircleHelp, ClipboardCheck, Clock3, Cloud,
   Command, CreditCard, FileText, FolderKanban, Grid2x2, LayoutDashboard, LifeBuoy, ListTodo, LockKeyhole,
   Menu, MessageSquareText, Megaphone, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Plus, Search, Settings, ShieldCheck, Target,
-  Sparkles, TrendingUp, UploadCloud, UserRound, UserRoundMinus, Users, WalletCards, X,
+  Sparkles, TrendingUp, Trash2, UploadCloud, UserRound, UserRoundMinus, Users, WalletCards, X,
 } from "lucide-react";
 import { demoDashboard, demoEmployees, demoUser } from "./data/demo";
 import { AttendanceWorkspace, OperationalWorkspace } from "./operations";
@@ -71,7 +71,7 @@ export default function App() {
   const [page, setPage] = useState<PageId>(adminPortal ? "platform" : "dashboard");
   const [collapsed, setCollapsed] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
-  const [user, setUser] = useState<{ id: string; fullName: string; email: string; role: string; organizationId: string; organizationName: string; permissions?: string[]; trialEndsAt?: string | null; subscriptionStatus?: string; isPlatformAdmin?: boolean; isDemo?: boolean } | null>(null);
+  const [user, setUser] = useState<{ id: string; fullName: string; email: string; role: string; organizationId: string; organizationName: string; permissions?: string[]; trialEndsAt?: string | null; subscriptionStatus?: string; isPlatformAdmin?: boolean; isDemo?: boolean; mfaMandatory?: boolean; mfaEnrollmentRequired?: boolean } | null>(null);
   const [dashboard, setDashboard] = useState<DashboardData>(demoDashboard);
   const [employees, setEmployees] = useState<Employee[]>(demoEmployees);
   const [connected, setConnected] = useState(false);
@@ -88,6 +88,8 @@ export default function App() {
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<GlobalSearchResult[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
+  const lastUserActivityAt = useRef(Date.now());
+  const lastSessionHeartbeatAt = useRef(Date.now());
 
   useEffect(() => {
     const load = async () => {
@@ -98,14 +100,12 @@ export default function App() {
           window.history.replaceState({}, "", window.location.pathname);
           setAuthNotice("Your email is verified. Your organization workspace is ready.");
         }
-        if (adminPortal) {
-          const me = await api<NonNullable<typeof user>>("/api/me");
-          setUser(me); setConnected(true);
-        } else {
-          const [me, data, people] = await Promise.all([
-            api<NonNullable<typeof user>>("/api/me"), api<DashboardData>("/api/dashboard"), api<{ data: Employee[] }>("/api/employees"),
-          ]);
-          setUser(me); setDashboard(data); setEmployees(people.data); setConnected(true);
+        const me = await api<NonNullable<typeof user>>("/api/me");
+        setUser(me); setConnected(true);
+        if (me.mfaEnrollmentRequired) { setPage("security"); return; }
+        if (!adminPortal) {
+          const [data, people] = await Promise.all([api<DashboardData>("/api/dashboard"), api<{ data: Employee[] }>("/api/employees")]);
+          setDashboard(data); setEmployees(people.data);
         }
       } catch {
         setConnected(false);
@@ -115,6 +115,48 @@ export default function App() {
     };
     void load();
   }, []);
+
+  useEffect(() => {
+    if (!user?.id) return;
+    const idleLimitMs = 2 * 60 * 1000;
+    lastUserActivityAt.current = Date.now();
+    lastSessionHeartbeatAt.current = Date.now();
+    let expired = false;
+    const expireSession = () => {
+      if (expired) return;
+      expired = true;
+      void fetch("/api/auth/logout", { method: "POST", credentials: "include" }).catch(() => undefined);
+      setUser(null);
+      setConnected(false);
+      setNotifications([]);
+      setUnreadNotifications(0);
+      setAuthNotice("You were signed out after two minutes of inactivity. Sign in to continue.");
+    };
+    const markActivity = () => {
+      const now = Date.now();
+      lastUserActivityAt.current = now;
+      if (now - lastSessionHeartbeatAt.current >= 15_000) {
+        lastSessionHeartbeatAt.current = now;
+        void fetch("/api/auth/activity", { method: "POST", credentials: "include" })
+          .then((response) => { if (response.status === 401) expireSession(); })
+          .catch(() => undefined);
+      }
+    };
+    const checkSession = () => {
+      const now = Date.now();
+      if (now - lastUserActivityAt.current >= idleLimitMs) { expireSession(); return; }
+    };
+    const onVisibilityChange = () => { if (document.visibilityState === "visible") checkSession(); };
+    const activityEvents: (keyof WindowEventMap)[] = ["pointerdown", "pointermove", "keydown", "scroll", "touchstart", "wheel"];
+    for (const eventName of activityEvents) window.addEventListener(eventName, markActivity, { passive: true });
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    const timer = window.setInterval(checkSession, 1000);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      for (const eventName of activityEvents) window.removeEventListener(eventName, markActivity);
+    };
+  }, [user?.id]);
 
   useEffect(() => {
     const keyboard = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") { event.preventDefault(); setSearchOpen(true); } if (event.key === "Escape") setSearchOpen(false); };
@@ -158,14 +200,12 @@ export default function App() {
   const reloadWorkspace = async () => {
     setAuthLoading(true);
     try {
-      if (adminPortal) {
-        const me = await api<NonNullable<typeof user>>("/api/me");
-        setUser(me); setConnected(true); setAuthNotice("");
-      } else {
-        const [me, data, people] = await Promise.all([
-          api<NonNullable<typeof user>>("/api/me"), api<DashboardData>("/api/dashboard"), api<{ data: Employee[] }>("/api/employees"),
-        ]);
-        setUser(me); setDashboard(data); setEmployees(people.data); setConnected(true); setAuthNotice("");
+      const me = await api<NonNullable<typeof user>>("/api/me");
+      setUser(me); setConnected(true); setAuthNotice("");
+      if (me.mfaEnrollmentRequired) { setPage("security"); return; }
+      if (!adminPortal) {
+        const [data, people] = await Promise.all([api<DashboardData>("/api/dashboard"), api<{ data: Employee[] }>("/api/employees")]);
+        setDashboard(data); setEmployees(people.data);
       }
     } catch { setUser(null); }
     finally { setAuthLoading(false); }
@@ -209,6 +249,11 @@ export default function App() {
 
   if (authLoading) return <main className="auth-loading"><img src="/zyntris-mark.png" alt="" /><span>Opening your secure workspace…</span></main>;
   if (!user) return <Onboarding onAuthenticated={() => void reloadWorkspace()} initialNotice={authNotice} adminPortal={adminPortal} />;
+
+  if (user.mfaEnrollmentRequired) return <div className="admin-portal-shell">
+    <header className="admin-portal-header"><div className="admin-portal-brand"><img src="/zyntris-mark.png" alt="" /><span>Zyntris <small>Security setup required</small></span></div><div className="admin-portal-account"><span><strong>{user.fullName}</strong><small>{user.email}</small></span><button className="button secondary" onClick={async () => { await api("/api/auth/logout", { method: "POST" }); setUser(null); }}>Sign out</button></div></header>
+    <main className="admin-portal-content"><AccountSecurity required mandatory onSecurityChanged={() => void reloadWorkspace()} onToast={setToast} /></main>
+  </div>;
 
   if (adminPortal) return <div className="admin-portal-shell">
     <header className="admin-portal-header"><a className="admin-portal-brand" href="/admin"><img src="/zyntris-mark.png" alt="" /><span>Zyntris <small>Platform Admin</small></span></a><div className="admin-portal-account"><span><strong>{user.fullName}</strong><small>{user.email}</small></span><button className="button secondary" onClick={async () => { await api("/api/auth/logout", { method: "POST" }); setUser(null); }}>Sign out</button></div></header>
@@ -288,17 +333,17 @@ export default function App() {
           {page === "calendar" && <><WorkCalendarWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><WorkCalendarConnections canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /></>}
           {page === "customers" && <CrmWorkspace onToast={setToast} canManageCrm={userPermissions.has("crm.manage")} canConfigure={userPermissions.has("crm.configure")} canQuotes={userPermissions.has("crm.quotes.manage")} canReport={userPermissions.has("crm.report")} canImport={userPermissions.has("crm.import")} />}
           {(["expenses", "requests", "budgets", "assets", "vendors", "helpdesk"] as PageId[]).includes(page) && <OperationalWorkspace page={page} role={user.role} onToast={setToast} />}
-          {page === "documents" && <Documents version={documentsVersion} onUpload={() => setShowUpload(true)} onToast={setToast} />}
+          {page === "documents" && <Documents version={documentsVersion} canManage={userPermissions.has("operations.manage")} onUpload={() => setShowUpload(true)} onToast={setToast} />}
           {page === "reports" && <Reports onToast={setToast} />}
           {page === "payroll" && (userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") ? <PayrollWorkspace onToast={setToast} role={user.role} readOnly={Boolean(user.isDemo)} /> : <EmployeePayslips />)}
           {page === "settings" && <OrganizationSettings onToast={setToast} currentEmail={user.email} />}
-          {page === "security" && <AccountSecurity onToast={setToast} />}
+          {page === "security" && <AccountSecurity mandatory={user.mfaMandatory} onToast={setToast} />}
           {page === "platform" && user.isPlatformAdmin && <PlatformAdminWorkspace />}
         </div>
       </main>
 
       {showAddEmployee && <Modal title="Onboard employee" onClose={() => setShowAddEmployee(false)}><form className="modal-form" onSubmit={createEmployee}><div className="security-note"><ShieldCheck size={17} /><div><strong>HR-controlled onboarding</strong><span>We’ll create the employee profile, assign the selected least-privilege role and email a one-time setup link.</span></div></div><div className="form-grid"><label>First name<input name="firstName" required placeholder="e.g. Ada" /></label><label>Last name<input name="lastName" required placeholder="e.g. Nwosu" /></label></div><label>Work email<input type="email" name="email" required placeholder="ada@company.com" /></label><div className="form-grid"><label>Job title<input name="jobTitle" required placeholder="e.g. Product Manager" /></label><label>Access level<select name="roleName" defaultValue="Employee"><option>Employee</option><option>Manager</option><option>Finance Admin</option><option>HR Admin</option>{user.role === "Organization Admin" && <><option>CEO</option><option>Organization Admin</option></>}</select></label></div><div className="form-grid"><label>Department<input name="departmentName" placeholder="e.g. Operations" /></label><label>Team<input name="teamName" placeholder="e.g. Customer Success" /></label></div><div className="form-grid"><label>Employment type<select name="employmentType" defaultValue="Full-time"><option>Full-time</option><option>Part-time</option><option>Contract</option><option>Temporary</option><option>Intern</option></select></label><label>Work location<select name="workLocation" defaultValue="Hybrid"><option>Office</option><option>Hybrid</option><option>Remote</option></select></label></div><label>Start date<input type="date" name="startDate" required /></label><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setShowAddEmployee(false)}>Cancel</button><button className="button primary" type="submit"><Plus size={16} /> Send onboarding invite</button></div></form></Modal>}
-      {showUpload && <Modal title="Upload document" onClose={() => setShowUpload(false)}><form className="modal-form" onSubmit={uploadDocument}><label>Document category<select name="category" defaultValue="Policy"><option>Policy</option><option>Employee document</option><option>Vendor contract</option><option>Finance</option></select></label><label className="file-drop"><UploadCloud size={24} /><span>Choose a file or drop it here</span><small>Private R2 storage · 10MB max</small><input name="file" type="file" required /></label><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setShowUpload(false)}>Cancel</button><button className="button primary" type="submit"><UploadCloud size={16} /> Upload securely</button></div></form></Modal>}
+      {showUpload && <Modal title="Upload document" onClose={() => setShowUpload(false)}><form className="modal-form" onSubmit={uploadDocument}><label>Document category<select name="category" defaultValue="Policy"><option>Policy</option><option>Employee document</option><option>Vendor contract</option><option>Finance</option></select></label><label className="file-drop"><UploadCloud size={24} /><span>Choose a file or drop it here</span><small>PDF, JPEG, PNG, WebP, CSV, DOCX or XLSX · 10MB max</small><input name="file" type="file" accept="application/pdf,image/jpeg,image/png,image/webp,text/csv,.docx,.xlsx" required /></label><div className="modal-actions"><button type="button" className="button secondary" onClick={() => setShowUpload(false)}>Cancel</button><button className="button primary" type="submit"><UploadCloud size={16} /> Upload securely</button></div></form></Modal>}
       {searchOpen && <div className="modal-backdrop search-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSearchOpen(false); }}><section className="modal global-search-modal"><div className="global-search-input"><Search size={18} /><input autoFocus value={searchQuery} onChange={(event) => setSearchQuery(event.target.value)} placeholder="Search authorized workspace records…" /><kbd>ESC</kbd><button className="icon-button" aria-label="Close search" onClick={() => setSearchOpen(false)}><X size={16} /></button></div><div className="global-search-results">{searchQuery.trim().length < 2 ? <div className="work-empty">Search across records you’re authorized to access.</div> : searchLoading ? <div className="work-loading">Searching…</div> : searchResults.length ? searchResults.map((result) => <button key={`${result.module}-${result.id}`} onClick={() => openSearchResult(result)}><span className="search-result-icon"><Search size={14} /></span><span><strong>{result.title}</strong><small>{titleCase(result.module)} · {result.subtitle}</small></span><ArrowUpRight size={14} /></button>) : <div className="work-empty">No matching records found.</div>}</div></section></div>}
       {toast && <div className="toast"><CheckCircle2 size={18} /><span>{toast}</span><button className="toast-close" onClick={() => setToast(null)}><X size={14} /></button></div>}
     </div>
@@ -405,12 +450,14 @@ function Projects({ onToast }: { onToast: (message: string) => void }) { const p
 function Expenses({ onToast }: { onToast: (message: string) => void }) { const expenses = [{ name: "Daniel Adeyemi", category: "Software", amount: "₦185,000", status: "Submitted", date: "23 Sep 2026" }, { name: "Fatima Musa", category: "Travel", amount: "₦420,000", status: "Approved", date: "18 Sep 2026" }, { name: "Ifeanyi Obi", category: "Operations", amount: "₦96,000", status: "Paid", date: "16 Sep 2026" }]; return <><PageHeader eyebrow="FINANCE / EXPENSES" title="Expenses" description="Bring spend visibility and approvals into one calm, auditable workflow." action={<button className="button primary" onClick={() => onToast("Expense claim composer opened")}><Plus size={16} /> Submit expense</button>} /><div className="mini-stat-grid"><MiniStat label="Total this month" value="₦18.45m" detail="12.6% vs last month" tone="blue" /><MiniStat label="Awaiting approval" value="₦605k" detail="3 claims" tone="orange" /><MiniStat label="Approved this month" value="₦12.2m" detail="71 claims" tone="green" /><MiniStat label="Average claim" value="₦258k" detail="Across all departments" tone="violet" /></div><section className="card table-card"><div className="table-toolbar"><div><h2 className="toolbar-title">Recent expenses</h2><p className="toolbar-subtitle">A complete audit trail for every claim.</p></div><button className="filter-button">This month <ChevronDown size={14} /></button></div><div className="table-scroll"><table><thead><tr><th>Employee</th><th>Category</th><th>Date</th><th>Amount</th><th>Status</th><th></th></tr></thead><tbody>{expenses.map((expense) => <tr key={expense.name}><td><div className="employee-cell"><div className="avatar avatar-small">{expense.name.split(" ").map((name) => name[0]).join("")}</div><strong>{expense.name}</strong></div></td><td>{expense.category}</td><td>{expense.date}</td><td><strong>{expense.amount}</strong></td><td><span className={`status-badge ${expense.status.toLowerCase()}`}>{expense.status}</span></td><td><button className="text-button" onClick={() => onToast("Expense detail opened")}>View</button></td></tr>)}</tbody></table></div></section></> }
 
 type StoredDocument = { id: string; name: string; category: string; contentType: string; sizeBytes: number; createdAt: string };
-function Documents({ onUpload, onToast, version }: { onUpload: () => void; onToast: (message: string) => void; version: number }) {
+function Documents({ onUpload, onToast, version, canManage }: { onUpload: () => void; onToast: (message: string) => void; version: number; canManage: boolean }) {
   const [docs, setDocs] = useState<StoredDocument[]>([]); const [query, setQuery] = useState(""); const [error, setError] = useState(""); const [loading, setLoading] = useState(true);
-  useEffect(() => { let active = true; setLoading(true); fetch("/api/files", { credentials: "include" }).then(async (response) => { if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || "Could not load documents"); return response.json() as Promise<{ data: StoredDocument[] }>; }).then((result) => { if (active) { setDocs(result.data); setError(""); } }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : "Could not load documents"); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, [version]);
+  const [storageUsage, setStorageUsage] = useState({ usedBytes: 0, limitBytes: 10 * 1024 * 1024 * 1024 });
+  useEffect(() => { let active = true; setLoading(true); fetch("/api/files", { credentials: "include", cache: "no-store" }).then(async (response) => { if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || "Could not load documents"); return response.json() as Promise<{ data: StoredDocument[]; usedBytes: number; storageLimitBytes: number }>; }).then((result) => { if (active) { setDocs(result.data); setStorageUsage({ usedBytes: result.usedBytes, limitBytes: result.storageLimitBytes || 10 * 1024 * 1024 * 1024 }); setError(""); } }).catch((cause) => { if (active) setError(cause instanceof Error ? cause.message : "Could not load documents"); }).finally(() => { if (active) setLoading(false); }); return () => { active = false; }; }, [version]);
   const download = async (doc: StoredDocument) => { try { const response = await fetch(`/api/files/${encodeURIComponent(doc.id)}`, { credentials: "include" }); if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || "Could not download document"); const url = URL.createObjectURL(await response.blob()); const anchor = document.createElement("a"); anchor.href = url; anchor.download = doc.name; anchor.click(); URL.revokeObjectURL(url); } catch (cause) { onToast(cause instanceof Error ? cause.message : "Could not download document"); } };
-  const filtered = docs.filter((doc) => `${doc.name} ${doc.category}`.toLowerCase().includes(query.toLowerCase())); const totalBytes = docs.reduce((sum, doc) => sum + doc.sizeBytes, 0); const sizeLabel = totalBytes >= 1024 * 1024 ? `${(totalBytes / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(totalBytes / 1024)} KB`;
-  return <><PageHeader eyebrow="OPERATIONS / DOCUMENTS" title="Documents" description="A secure home for the files your business relies on." action={<button className="button primary" onClick={onUpload}><UploadCloud size={16} /> Upload document</button>} /><div className="storage-banner"><div className="storage-icon"><LockKeyhole size={18} /></div><div><strong>Private R2 storage</strong><span>Files are private to this organization and only served after access checks.</span></div><div className="storage-meter"><span>{sizeLabel} · {docs.length} files</span><div><i style={{ width: `${Math.min(100, totalBytes / (10 * 1024 * 1024 * 1024) * 100)}%` }} /></div></div></div>{error && <div className="work-error" role="alert">{error}</div>}<section className="card table-card"><div className="table-toolbar"><div className="table-search"><Search size={16} /><input placeholder="Search documents" value={query} onChange={(event) => setQuery(event.target.value)} /></div></div>{loading ? <div className="work-loading">Loading documents…</div> : filtered.length ? <div className="document-grid">{filtered.map((doc) => <button className="document-card" key={doc.id} onClick={() => void download(doc)}><div className="document-card-top"><span className="file-icon"><FileText size={19} /></span><MoreHorizontal size={17} /></div><strong>{doc.name}</strong><span>{doc.category} · {doc.sizeBytes < 1024 * 1024 ? `${Math.ceil(doc.sizeBytes / 1024)} KB` : `${(doc.sizeBytes / 1024 / 1024).toFixed(1)} MB`}</span><div className="document-footer"><span>{new Date(doc.createdAt).toLocaleDateString()}</span><span>Download</span></div></button>)}</div> : <div className="work-empty">{query ? "No documents match your search." : "No documents uploaded yet. Upload policies, contracts, and employee files to keep them organized."}</div>}</section></>;
+  const remove = async (doc: StoredDocument) => { if (!window.confirm(`Permanently remove “${doc.name}” from this organization’s document storage?`)) return; try { const response = await fetch(`/api/files/${encodeURIComponent(doc.id)}`, { method: "DELETE", credentials: "include" }); if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || "Could not delete document"); setDocs((items) => items.filter((item) => item.id !== doc.id)); setStorageUsage((current) => ({ ...current, usedBytes: Math.max(0, current.usedBytes - doc.sizeBytes) })); onToast("Document deleted and storage released."); } catch (cause) { onToast(cause instanceof Error ? cause.message : "Could not delete document"); } };
+  const filtered = docs.filter((doc) => `${doc.name} ${doc.category}`.toLowerCase().includes(query.toLowerCase())); const sizeLabel = storageUsage.usedBytes >= 1024 * 1024 ? `${(storageUsage.usedBytes / 1024 / 1024).toFixed(1)} MB` : `${Math.ceil(storageUsage.usedBytes / 1024)} KB`;
+  return <><PageHeader eyebrow="OPERATIONS / DOCUMENTS" title="Documents" description="A secure home for the files your business relies on." action={<button className="button primary" onClick={onUpload}><UploadCloud size={16} /> Upload document</button>} /><div className="storage-banner"><div className="storage-icon"><LockKeyhole size={18} /></div><div><strong>Private R2 storage</strong><span>Tenant-scoped files · verified file types · organization storage allowance enforced.</span></div><div className="storage-meter"><span>{sizeLabel} of {(storageUsage.limitBytes / 1024 / 1024 / 1024).toFixed(0)} GB · {docs.length} recent files shown</span><div><i style={{ width: `${Math.min(100, storageUsage.usedBytes / storageUsage.limitBytes * 100)}%` }} /></div></div></div>{error && <div className="work-error" role="alert">{error}</div>}<section className="card table-card"><div className="table-toolbar"><div className="table-search"><Search size={16} /><input placeholder="Search documents" value={query} onChange={(event) => setQuery(event.target.value)} /></div></div>{loading ? <div className="work-loading">Loading documents…</div> : filtered.length ? <div className="document-grid">{filtered.map((doc) => <article className="document-card" key={doc.id}><button type="button" className="document-card-open" onClick={() => void download(doc)}><div className="document-card-top"><span className="file-icon"><FileText size={19} /></span><MoreHorizontal size={17} /></div><strong>{doc.name}</strong><span>{doc.category} · {doc.sizeBytes < 1024 * 1024 ? `${Math.ceil(doc.sizeBytes / 1024)} KB` : `${(doc.sizeBytes / 1024 / 1024).toFixed(1)} MB`}</span><div className="document-footer"><span>{new Date(doc.createdAt).toLocaleDateString()}</span><span>Download</span></div></button>{canManage && <button type="button" className="document-delete" aria-label={`Delete ${doc.name}`} onClick={() => void remove(doc)}><Trash2 size={14} /> Delete</button>}</article>)}</div> : <div className="work-empty">{query ? "No documents match your search." : "No documents uploaded yet. Upload policies, contracts, and employee files to keep them organized."}</div>}</section></>;
 }
 
 type ReportSummary = { people: { total?: number; active?: number }; expenses: { count?: number; total?: number; pending?: number }; leave: { pending?: number; approved?: number; rejected?: number }; tasks: { total?: number; completed?: number; overdue?: number }; tickets: { open?: number; resolved?: number }; approvals: { pending?: number; approved?: number; rejected?: number }; appraisals: { total?: number; completed?: number; inProgress?: number }; departments: { name: string; count: number }[]; monthlySpend: { month: string; amount: number }[] };
