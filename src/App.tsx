@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import { demoDashboard, demoEmployees, demoUser } from "./data/demo";
 import { AttendanceWorkspace, OperationalWorkspace } from "./operations";
+import { CrmWorkspace } from "./crm";
 import { Onboarding } from "./onboarding";
 import { EmployeePayslips, PayrollWorkspace } from "./payroll";
 import { PlatformAdminWorkspace } from "./platform-admin";
@@ -181,6 +182,8 @@ export default function App() {
   const visibleNavItems = navItems.filter((item) => {
     if (item.id === "platform") return Boolean(user?.isPlatformAdmin);
     if (item.id === "settings") return userPermissions.has("settings.manage");
+    if (item.id === "customers") return userPermissions.has("crm.view") || userPermissions.has("crm.manage");
+    if (item.id === "projects") return userPermissions.has("projects.view") || userPermissions.has("projects.manage") || userPermissions.has("operations.view");
     if (item.id === "security") return true;
     if (["employees", "leave", "attendance"].includes(item.id)) return userPermissions.has("employees.view");
     if (item.id === "payroll") return userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") || userPermissions.has("payroll.self.view");
@@ -281,9 +284,10 @@ export default function App() {
           {page === "goals" && <GoalsWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "announcements" && <AnnouncementsWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "tasks" && <WorkTasksWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
-          {page === "projects" && <WorkProjectsWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
+          {page === "projects" && <WorkProjectsWorkspace canManage={userPermissions.has("projects.manage") || userPermissions.has("projects.edit") || userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "calendar" && <><WorkCalendarWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><WorkCalendarConnections canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /></>}
-          {(["expenses", "requests", "budgets", "assets", "vendors", "helpdesk", "customers"] as PageId[]).includes(page) && <OperationalWorkspace page={page} role={user.role} onToast={setToast} />}
+          {page === "customers" && <CrmWorkspace onToast={setToast} canManageCrm={userPermissions.has("crm.manage")} canConfigure={userPermissions.has("crm.configure")} canQuotes={userPermissions.has("crm.quotes.manage")} canReport={userPermissions.has("crm.report")} canImport={userPermissions.has("crm.import")} />}
+          {(["expenses", "requests", "budgets", "assets", "vendors", "helpdesk"] as PageId[]).includes(page) && <OperationalWorkspace page={page} role={user.role} onToast={setToast} />}
           {page === "documents" && <Documents version={documentsVersion} onUpload={() => setShowUpload(true)} onToast={setToast} />}
           {page === "reports" && <Reports onToast={setToast} />}
           {page === "payroll" && (userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") ? <PayrollWorkspace onToast={setToast} role={user.role} readOnly={Boolean(user.isDemo)} /> : <EmployeePayslips />)}
