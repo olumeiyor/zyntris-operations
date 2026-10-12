@@ -20,7 +20,7 @@ Cloudflare-native operations SaaS for **Zyntris — One Platform. Every Operatio
 - Separate Expo / React Native iOS and Android app in [`mobile/`](mobile/README.md). It uses a mobile-only bearer-token API prefix and does not enter the Cloudflare web build.
 - Read-only platform administration for onboarded organization and audit-activity summaries, restricted to explicitly allowlisted verified accounts.
 - Password-gated, read-only demo sandbox backed only by fictional demo-tenant records.
-- Optional authenticator-app two-factor authentication for web and mobile sign-in, with encrypted TOTP secrets, replay protection and one-use recovery codes.
+- Mandatory authenticator-app two-factor authentication for privileged accounts, with locally generated QR setup, encrypted TOTP secrets, replay protection and one-use recovery codes.
 - Custom Domain configuration for `app.zyntris.org`.
 
 ## Local development
