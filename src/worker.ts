@@ -3943,7 +3943,18 @@ export default {
       return withSecurityHeaders(await env.ASSETS.fetch(request));
     } catch (cause) {
       const incidentId = requestId();
-      console.error("Unhandled request error", { incidentId, cause });
+      const url = new URL(request.url);
+      const failure = cause instanceof Error
+        ? { errorName: cause.name.slice(0, 80), errorMessage: cause.message.replace(/[\r\n\t]/g, " ").slice(0, 500) }
+        : { errorName: "NonErrorThrown", errorMessage: "A non-Error value was thrown." };
+      // Log primitive fields: Cloudflare's structured logger drops nested Error objects,
+      // which otherwise leaves production incident IDs without actionable diagnostics.
+      console.error("Unhandled request error", {
+        incidentId,
+        method: request.method,
+        path: url.pathname,
+        ...failure,
+      });
       const response = error(`Something went wrong. Please try again. Reference: ${incidentId}`, 500);
       response.headers.set("x-zyntris-request-id", incidentId);
       return withSecurityHeaders(response);
