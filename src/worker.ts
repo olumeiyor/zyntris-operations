@@ -1,8 +1,10 @@
-import { allowedBrowserOrigin, isTenantObjectKey, tenantDocumentKey, tenantReceiptKey } from "./security-boundaries";
+import { allowedBrowserOrigin, isTenantObjectKey, isTenantBackupObjectKey, tenantBackupKey, tenantDocumentKey, tenantReceiptKey } from "./security-boundaries";
+import { passwordHash, verifyPassword } from "./password-hashing";
 
 export interface Env {
   DB: D1Database;
   FILES: R2Bucket;
+  BACKUPS: R2Bucket;
   ASSETS: Fetcher;
   APP_ORIGIN: string;
   ENVIRONMENT: string;
@@ -59,6 +61,13 @@ const BACKUP_TABLES = [
 
 const isoDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
 
+async function getTenantBackupObject(env: Env, organizationId: string, backupId: string, key: string) {
+  if (!isTenantBackupObjectKey(key, organizationId, backupId)) return null;
+  // New snapshots are in a dedicated bucket; fall back to the application bucket
+  // only for snapshots written before the backup-target migration.
+  return await env.BACKUPS.get(key) || await env.FILES.get(key);
+}
+
 async function createTenantBackup(env: Env, organizationId: string, createdBy: string) {
   const id = `backup-${crypto.randomUUID()}`;
   const tableSnapshots = await env.DB.batch(BACKUP_TABLES.map((table) => env.DB.prepare(`SELECT * FROM ${table} WHERE organization_id = ?`).bind(organizationId)));
@@ -71,13 +80,13 @@ async function createTenantBackup(env: Env, organizationId: string, createdBy: s
     if (!isTenantObjectKey(doc.r2_key, organizationId)) throw new Error("A document references storage outside its organization boundary.");
     const source = await env.FILES.get(doc.r2_key);
     if (!source) throw new Error("A referenced document is missing from R2 storage.");
-    const backupKey = `tenant-backups/${organizationId}/${id}/files/${await hashToken(doc.r2_key)}`;
-    await env.FILES.put(backupKey, source.body, { httpMetadata: source.httpMetadata, customMetadata: { originalKeyHash: await hashToken(doc.r2_key) } });
+    const backupKey = tenantBackupKey(organizationId, id, `files/${await hashToken(doc.r2_key)}`);
+    await env.BACKUPS.put(backupKey, source.body, { httpMetadata: source.httpMetadata, customMetadata: { originalKeyHash: await hashToken(doc.r2_key) } });
     files.push({ originalKey: doc.r2_key, backupKey });
   }
   const payload = JSON.stringify({ schemaVersion: 1, organizationId, generatedAt: new Date().toISOString(), tables, files });
-  const checksum = await hashToken(payload); const objectKey = `tenant-backups/${organizationId}/${id}/snapshot.json`;
-  await env.FILES.put(objectKey, payload, { httpMetadata: { contentType: "application/json" }, customMetadata: { checksum, schemaVersion: "1" } });
+  const checksum = await hashToken(payload); const objectKey = tenantBackupKey(organizationId, id, "snapshot.json");
+  await env.BACKUPS.put(objectKey, payload, { httpMetadata: { contentType: "application/json" }, customMetadata: { checksum, schemaVersion: "1" } });
   await env.DB.prepare(`INSERT INTO tenant_backups (id, organization_id, object_key, checksum, size_bytes, record_count, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .bind(id, organizationId, objectKey, checksum, new TextEncoder().encode(payload).byteLength, recordCount, createdBy).run();
   return { id, checksum, recordCount, fileCount: files.length, createdAt: new Date().toISOString(), objectKey };
@@ -396,35 +405,8 @@ function randomToken(bytes = 32) {
   return [...value].map((part) => part.toString(16).padStart(2, "0")).join("");
 }
 
-async function derivePasswordDigest(password: string, salt: string, pepper?: string) {
-  const input = new TextEncoder().encode(password);
-  let materialBytes = input;
-  if (pepper) {
-    const pepperKey = await crypto.subtle.importKey("raw", new TextEncoder().encode(pepper), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-    materialBytes = new Uint8Array(await crypto.subtle.sign("HMAC", pepperKey, input));
-  }
-  const material = await crypto.subtle.importKey("raw", materialBytes, "PBKDF2", false, ["deriveBits"]);
-  // Workers WebCrypto caps PBKDF2 at 100,000 rounds; a server-only pepper protects
-  // stored hashes against offline cracking if the D1 database is exposed.
-  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: 100000 }, material, 256);
-  return [...new Uint8Array(bits)].map((part) => part.toString(16).padStart(2, "0")).join("");
-}
-
-async function passwordHash(password: string, pepper: string, salt = randomToken(16)) {
-  const digest = await derivePasswordDigest(password, salt, pepper);
-  return `pbkdf2-sha256-peppered$100000$${salt}$${digest}`;
-}
-
-async function verifyPassword(password: string, encoded: string, pepper?: string) {
-  const [algorithm, rounds, salt, expected] = encoded.split("$");
-  if (rounds !== "100000" || !salt || !/^[a-f0-9]{64}$/i.test(expected || "")) return false;
-  if (algorithm === "pbkdf2-sha256") return safeEqual(await derivePasswordDigest(password, salt), expected);
-  if (algorithm !== "pbkdf2-sha256-peppered" || !pepper) return false;
-  return safeEqual(await derivePasswordDigest(password, salt, pepper), expected);
-}
-
 async function upgradeLegacyPassword(env: Env, userId: string, password: string, encoded: string) {
-  if (!env.PASSWORD_PEPPER || !encoded.startsWith("pbkdf2-sha256$")) return;
+  if (!env.PASSWORD_PEPPER || encoded.startsWith("$argon2id$")) return;
   const upgraded = await passwordHash(password, env.PASSWORD_PEPPER);
   await env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND password_hash = ?`).bind(upgraded, userId, encoded).run();
 }
@@ -764,6 +746,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
         env.DB.prepare(`WITH sources(name) AS (VALUES ('Website'),('Referral'),('Social Media'),('LinkedIn'),('Event'),('Webinar'),('Advertisement'),('Email Campaign'),('Direct Outreach'),('Partner'),('Existing Customer'),('Walk-in'),('Other')) INSERT INTO crm_lead_sources (id,organization_id,name) SELECT 'crm-source-' || ? || '-' || lower(replace(name,' ','-')), ?, name FROM sources`).bind(orgId,orgId),
         env.DB.prepare(`INSERT INTO crm_pipeline_stages (id,organization_id,stage_key,name,probability,sort_order) VALUES ('crm-stage-' || ? || '-qualification',?,'qualification','Qualification',10,1),('crm-stage-' || ? || '-discovery',?,'discovery','Discovery',25,2),('crm-stage-' || ? || '-proposal',?,'proposal','Proposal',50,3),('crm-stage-' || ? || '-negotiation',?,'negotiation','Negotiation',75,4),('crm-stage-' || ? || '-won',?,'won','Won',100,5),('crm-stage-' || ? || '-lost',?,'lost','Lost',0,6)`).bind(orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId),
         env.DB.prepare(`INSERT INTO organization_settings (organization_id) VALUES (?)`).bind(orgId),
+        env.DB.prepare(`INSERT INTO tenant_backup_settings (organization_id, enabled, frequency, retention_days, alert_email) VALUES (?, 1, 'daily', 30, ?)`).bind(orgId, email),
         env.DB.prepare(`INSERT INTO users (id, email, full_name, password_hash, status) VALUES (?, ?, ?, ?, 'active')`).bind(userId, email, fullName, await passwordHash(password, env.PASSWORD_PEPPER)),
         env.DB.prepare(`INSERT INTO roles (id, organization_id, name, description, is_system) VALUES (?, ?, 'Organization Admin', 'Organization owner and administrator', 1)`).bind(roleId, orgId),
         env.DB.prepare(`INSERT INTO roles (id, organization_id, name, description, is_system) VALUES (?, ?, 'HR Admin', 'Manage people, teams and onboarding', 1)`).bind(hrRoleId, orgId),
@@ -1928,7 +1911,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
     const backup = await env.DB.prepare(`SELECT object_key as objectKey, checksum FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(backupMatch[1], context.organizationId).first<{ objectKey: string; checksum: string }>();
     if (!backup) return error("Backup not found.", 404);
-    const object = await env.FILES.get(backup.objectKey);
+    const object = await getTenantBackupObject(env, context.organizationId, backupMatch[1], backup.objectKey);
     if (!object) return error("Backup file is missing from private storage.", 410);
     const payload = await object.text();
     if (await hashToken(payload) !== backup.checksum) return error("Backup integrity verification failed. Do not use this copy for recovery.", 409);
@@ -1941,7 +1924,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const body = await request.json<{ dryRun?: boolean; confirmation?: string }>();
     const backup = await env.DB.prepare(`SELECT object_key as objectKey, checksum FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(backupMatch[1], context.organizationId).first<{ objectKey: string; checksum: string }>();
     if (!backup) return error("Backup not found.", 404);
-    const object = await env.FILES.get(backup.objectKey);
+    const object = await getTenantBackupObject(env, context.organizationId, backupMatch[1], backup.objectKey);
     if (!object) return error("Backup file is missing from private storage.", 410);
     const serialized = await object.text();
     if (await hashToken(serialized) !== backup.checksum) return error("Backup integrity verification failed. Do not use this copy for recovery.", 409);
@@ -1959,7 +1942,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       })) return error("Backup contains an invalid or out-of-tenant record.", 409);
     }
     for (const file of snapshot.files || []) {
-      if (!file.originalKey.startsWith(`${context.organizationId}/`) || !file.backupKey.startsWith(`tenant-backups/${context.organizationId}/${backupMatch[1]}/files/`) || !await env.FILES.head(file.backupKey)) return error("Backup file manifest contains a missing or out-of-tenant object.", 409);
+      if (!isTenantObjectKey(file.originalKey, context.organizationId) || !isTenantBackupObjectKey(file.backupKey, context.organizationId, backupMatch[1]) || !file.backupKey.includes("/files/") || !await getTenantBackupObject(env, context.organizationId, backupMatch[1], file.backupKey)) return error("Backup file manifest contains a missing or out-of-tenant object.", 409);
     }
     if (body.dryRun) return json({ valid: true, mode: "non-destructive merge", rows: counts, fileCount: snapshot.files?.length || 0, note: "Existing records are never overwritten or deleted. Missing records and files are restored where their references remain valid." });
     if (body.confirmation !== "RESTORE MERGE") return error("Type RESTORE MERGE to confirm recovery. This is a non-destructive merge; current rows will not be overwritten or deleted.");
@@ -1980,9 +1963,9 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       }
       let restoredFiles = 0;
       for (const file of snapshot.files || []) {
-        if (!file.originalKey.startsWith(`${context.organizationId}/`) || !file.backupKey.startsWith(`tenant-backups/${context.organizationId}/${backupMatch[1]}/files/`)) continue;
+        if (!isTenantObjectKey(file.originalKey, context.organizationId) || !isTenantBackupObjectKey(file.backupKey, context.organizationId, backupMatch[1]) || !file.backupKey.includes("/files/")) continue;
         if (await env.FILES.head(file.originalKey)) continue;
-        const archived = await env.FILES.get(file.backupKey);
+        const archived = await getTenantBackupObject(env, context.organizationId, backupMatch[1], file.backupKey);
         if (archived) { await env.FILES.put(file.originalKey, archived.body, { httpMetadata: archived.httpMetadata }); restoredFiles += 1; }
       }
       await env.DB.prepare(`INSERT INTO tenant_storage_usage (organization_id, used_bytes, updated_at) SELECT ?, (SELECT COALESCE(SUM(size_bytes),0) FROM documents WHERE organization_id = ?) + (SELECT COALESCE(SUM(receipt_size_bytes),0) FROM expenses WHERE organization_id = ?), CURRENT_TIMESTAMP ON CONFLICT(organization_id) DO UPDATE SET used_bytes = excluded.used_bytes, updated_at = CURRENT_TIMESTAMP`).bind(context.organizationId, context.organizationId, context.organizationId).run();
@@ -3959,7 +3942,7 @@ export default {
       if (schedule.lastRunAt && Date.now() - Date.parse(`${schedule.lastRunAt.replace(" ", "T")}Z`) < interval) continue;
       try {
         const backup = await createTenantBackup(env, schedule.organizationId, schedule.createdBy);
-        const stored = await env.FILES.get(backup.objectKey);
+        const stored = await getTenantBackupObject(env, schedule.organizationId, backup.id, backup.objectKey);
         const serialized = stored ? await stored.text() : "";
         let valid = Boolean(stored && await hashToken(serialized) === backup.checksum);
         if (valid) {
@@ -3967,8 +3950,8 @@ export default {
             const snapshot = JSON.parse(serialized) as { schemaVersion?: number; organizationId?: string; tables?: Record<string, unknown[]>; files?: { originalKey: string; backupKey: string }[] };
             valid = snapshot.schemaVersion === 1 && snapshot.organizationId === schedule.organizationId && !!snapshot.tables && !Array.isArray(snapshot.tables)
               && Object.values(snapshot.tables).every((rows) => Array.isArray(rows) && rows.every((row) => !!row && typeof row === "object" && (row as { organization_id?: unknown }).organization_id === schedule.organizationId))
-              && Array.isArray(snapshot.files) && snapshot.files.every((file) => file && file.originalKey.startsWith(`${schedule.organizationId}/`) && file.backupKey.startsWith(`tenant-backups/${schedule.organizationId}/${backup.id}/files/`));
-            if (valid) for (const file of snapshot.files || []) if (!await env.FILES.head(file.backupKey)) { valid = false; break; }
+              && Array.isArray(snapshot.files) && snapshot.files.every((file) => file && isTenantObjectKey(file.originalKey, schedule.organizationId) && isTenantBackupObjectKey(file.backupKey, schedule.organizationId, backup.id) && file.backupKey.includes("/files/"));
+            if (valid) for (const file of snapshot.files || []) if (!await getTenantBackupObject(env, schedule.organizationId, backup.id, file.backupKey)) { valid = false; break; }
           } catch { valid = false; }
         }
         await env.DB.prepare(`UPDATE tenant_backup_settings SET last_run_at = CURRENT_TIMESTAMP, last_status = ?, last_error = ?, last_verified_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_verified_at END, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(valid ? "success" : "verification_failed", valid ? null : "Snapshot checksum or restore preflight verification failed", valid ? 1 : 0, schedule.organizationId).run();
@@ -3976,9 +3959,11 @@ export default {
         const cutoff = new Date(Date.now() - schedule.retentionDays * 86400000).toISOString();
         const expired = await env.DB.prepare(`SELECT id, object_key as objectKey FROM tenant_backups WHERE organization_id = ? AND created_at < ?`).bind(schedule.organizationId, cutoff).all<{ id: string; objectKey: string }>();
         for (const row of expired.results || []) {
-          await env.FILES.delete(row.objectKey);
+          if (isTenantBackupObjectKey(row.objectKey, schedule.organizationId, row.id)) await env.BACKUPS.delete(row.objectKey);
           let cursor: string | undefined;
-          do { const listed = await env.FILES.list({ prefix: `tenant-backups/${schedule.organizationId}/${row.id}/`, cursor }); if (listed.objects.length) await Promise.all(listed.objects.map((object) => env.FILES.delete(object.key))); cursor = listed.truncated ? listed.cursor : undefined; } while (cursor);
+          do { const prefix = `tenant-backups/${schedule.organizationId}/${row.id}/`; const listed = await env.BACKUPS.list({ prefix, cursor }); if (listed.objects.length) await Promise.all(listed.objects.map((object) => env.BACKUPS.delete(object.key))); cursor = listed.truncated ? listed.cursor : undefined; } while (cursor);
+          cursor = undefined;
+          do { const prefix = `tenant-backups/${schedule.organizationId}/${row.id}/`; const listed = await env.FILES.list({ prefix, cursor }); if (listed.objects.length) await Promise.all(listed.objects.map((object) => env.FILES.delete(object.key))); cursor = listed.truncated ? listed.cursor : undefined; } while (cursor);
           await env.DB.prepare(`DELETE FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(row.id, schedule.organizationId).run();
         }
       } catch (cause) {

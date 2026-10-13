@@ -11,6 +11,9 @@
 	"triggers": {
 		"crons": ["0 * * * *"]
 	},
+	"limits": {
+		"cpu_ms": 30000
+	},
 	"routes": [
 		{
 			"pattern": "app.zyntris.org",
@@ -37,6 +40,10 @@
 		{
 			"binding": "FILES",
 			"bucket_name": "zyntris-files"
+		},
+		{
+			"binding": "BACKUPS",
+			"bucket_name": "zyntris-backups"
 		}
 	],
 	"vars": {

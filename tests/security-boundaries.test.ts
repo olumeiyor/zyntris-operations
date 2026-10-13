@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { allowedBrowserOrigin, isTenantObjectKey, tenantDocumentKey, tenantReceiptKey } from "../src/security-boundaries.ts";
+import { allowedBrowserOrigin, isTenantBackupObjectKey, isTenantObjectKey, tenantBackupKey, tenantDocumentKey, tenantReceiptKey } from "../src/security-boundaries.ts";
 
 test("browser mutations require the configured origin or same-origin referer", () => {
   const app = "https://app.zyntris.org";
@@ -21,6 +21,10 @@ test("tenant storage keys cannot cross tenant prefixes", () => {
   assert.equal(isTenantObjectKey("org-two/private.pdf", "org-one"), false);
   assert.equal(isTenantObjectKey("expense-receipts/org-two/expense-123/file-456", "org-one"), false);
   assert.equal(isTenantObjectKey("tenant-backups/org-two/backup/file.json", "org-one"), false);
+  const backupKey = tenantBackupKey("org-one", "backup-123", "files/abc123");
+  assert.equal(isTenantBackupObjectKey(backupKey, "org-one", "backup-123"), true);
+  assert.equal(isTenantBackupObjectKey(backupKey, "org-one", "backup-other"), false);
+  assert.throws(() => tenantBackupKey("org-one", "backup-123", "../other"));
   assert.throws(() => tenantDocumentKey("org/other", "report.pdf"));
   assert.throws(() => tenantReceiptKey("org-one", "../other", "file-456"));
 });

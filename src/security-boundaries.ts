@@ -28,3 +28,18 @@ export function tenantReceiptKey(organizationId: string, expenseId: string, obje
   }
   return `expense-receipts/${organizationId}/${expenseId}/${objectId}`;
 }
+
+export function tenantBackupKey(organizationId: string, backupId: string, objectPath: string): string {
+  const safePart = (value: string) => value.length > 0 && value.split("/").every((part) => part.length > 0 && part !== "." && part !== "..");
+  if (!organizationId || organizationId.includes("/") || !backupId || backupId.includes("/") || !safePart(objectPath)) {
+    throw new Error("Invalid tenant backup key components.");
+  }
+  return `tenant-backups/${organizationId}/${backupId}/${objectPath}`;
+}
+
+export function isTenantBackupObjectKey(key: string, organizationId: string, backupId?: string): boolean {
+  if (!organizationId || organizationId.includes("/")) return false;
+  const parts = key.split("/");
+  if (parts.some((part) => !part || part === "." || part === "..") || parts[0] !== "tenant-backups" || parts[1] !== organizationId) return false;
+  return backupId === undefined || parts[2] === backupId;
+}
