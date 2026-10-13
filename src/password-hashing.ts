@@ -1,8 +1,14 @@
-import { argon2id, argon2Verify } from "hash-wasm";
+import { argon2id, argon2Verify, setWASMModules } from "argon2-wasm-edge";
 
 const textEncoder = new TextEncoder();
 const ARGON2_PREFIX = "$argon2id$v=19$m=19456,t=2,p=1$";
 const LEGACY_PBKDF2_ROUNDS = 100000;
+
+// The Worker entry point supplies statically imported Wasm modules. Tests and
+// non-Workers runtimes can continue using the package's normal runtime loader.
+export function configurePasswordHashWasm(argon2WASM: WebAssembly.Module, blake2bWASM: WebAssembly.Module) {
+  return setWASMModules({ argon2WASM, blake2bWASM });
+}
 
 function toHex(bytes: Uint8Array): string {
   return [...bytes].map((byte) => byte.toString(16).padStart(2, "0")).join("");

@@ -1,5 +1,14 @@
 import { allowedBrowserOrigin, isTenantObjectKey, isTenantBackupObjectKey, tenantBackupKey, tenantDocumentKey, tenantReceiptKey } from "./security-boundaries";
-import { passwordHash, verifyPassword } from "./password-hashing";
+import { configurePasswordHashWasm, passwordHash, verifyPassword } from "./password-hashing";
+// Wrangler imports these as precompiled WebAssembly.Module values. Registering
+// them prevents the Argon2 library from calling WebAssembly.compile at runtime,
+// which Cloudflare Workers intentionally disallows for embedded Wasm bytes.
+// @ts-expect-error Cloudflare Wrangler provides the `.wasm` module loader.
+import argon2WASM from "argon2-wasm-edge/wasm/argon2.wasm";
+// @ts-expect-error Cloudflare Wrangler provides the `.wasm` module loader.
+import blake2bWASM from "argon2-wasm-edge/wasm/blake2b.wasm";
+
+configurePasswordHashWasm(argon2WASM, blake2bWASM);
 
 export interface Env {
   DB: D1Database;
@@ -853,10 +862,13 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     if (!body.token || body.token.length !== 64 || !body.password || body.password.length < 12 || body.password.length > 128) return error("Use a valid reset link and a password of at least 12 characters.");
     const reset = await env.DB.prepare(`SELECT id, user_id as userId FROM password_reset_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP LIMIT 1`).bind(await hashToken(body.token)).first<{ id: string; userId: string }>();
     if (!reset) return error("This password reset link is invalid, expired, or already used. Ask the platform administrator to send a new one.", 400);
+    // Hash before claiming the single-use link so transient crypto/runtime failures
+    // leave the user's valid reset token usable for a retry.
+    const newPasswordHash = await passwordHash(body.password, env.PASSWORD_PEPPER);
     const claimId = requestId();
     const claimed = await env.DB.prepare(`UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP, claim_id = ? WHERE id = ? AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`).bind(claimId, reset.id).run();
     if (!claimed.meta.changes) return error("This password reset link has already been used. Ask the platform administrator to send a new one.", 409);
-    const saved = await env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'active'`).bind(await passwordHash(body.password, env.PASSWORD_PEPPER), reset.userId).run();
+    const saved = await env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'active'`).bind(newPasswordHash, reset.userId).run();
     if (!saved.meta.changes) return error("This account cannot reset its password. Contact your organization administrator.", 409);
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(reset.userId),
