@@ -3942,8 +3942,11 @@ export default {
       if (url.pathname.startsWith("/api/")) return withSecurityHeaders(await handleApi(request, env));
       return withSecurityHeaders(await env.ASSETS.fetch(request));
     } catch (cause) {
-      console.error("Unhandled request error", cause);
-      return withSecurityHeaders(error("Something went wrong. Please try again.", 500));
+      const incidentId = requestId();
+      console.error("Unhandled request error", { incidentId, cause });
+      const response = error(`Something went wrong. Please try again. Reference: ${incidentId}`, 500);
+      response.headers.set("x-zyntris-request-id", incidentId);
+      return withSecurityHeaders(response);
     }
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
