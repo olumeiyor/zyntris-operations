@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && tsc -p tsconfig.worker.json && vite build",
+    "test:security": "node --experimental-strip-types --test tests/security-boundaries.test.ts",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.worker.json",
     "deploy": "npm run build && wrangler deploy",

@@ -1,4 +1,5 @@
 SESSION_SECRET="replace-with-a-long-random-secret"
+PASSWORD_PEPPER="replace-with-a-different-long-random-secret"
 BREVO_API_KEY="replace-with-brevo-api-key"
 EMAIL_SENDER="Zyntris <no-reply@your-verified-domain.example>"
 APP_ORIGIN="http://localhost:5173"

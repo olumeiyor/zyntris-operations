@@ -58,6 +58,7 @@ Set production secrets in Wrangler (the values are entered interactively and mus
 
 ```bash
 npx wrangler secret put SESSION_SECRET
+npx wrangler secret put PASSWORD_PEPPER
 npx wrangler secret put BREVO_API_KEY
 npx wrangler secret put DEMO_ACCESS_PASSWORD
 npm run deploy
@@ -65,7 +66,7 @@ npm run deploy
 
 The allowlisted main administrator email is a non-secret Worker variable in `wrangler.jsonc` (`PLATFORM_ADMIN_EMAILS`). Change that config only when deliberately changing platform-admin access. `Olumeiyor@gmail.com` is the configured main administrator for this deployment.
 
-`EMAIL_SENDER` must be a sender identity registered and verified with Brevo. The Worker sends signup-verification and employee-invitation links through Brevo's transactional email API; these actions fail closed when `BREVO_API_KEY` is absent or delivery fails. Keep the existing `SESSION_SECRET` stable for session security and encryption of stored employee bank details.
+`EMAIL_SENDER` must be a sender identity registered and verified with Brevo. The Worker sends signup-verification and employee-invitation links through Brevo's transactional email API; these actions fail closed when `BREVO_API_KEY` is absent or delivery fails. `PASSWORD_PEPPER` must be a separate, high-entropy secret configured before deployment; account creation, invitation acceptance, and password resets fail closed without it. Keep both `PASSWORD_PEPPER` and the existing `SESSION_SECRET` stable. Changing the pepper without a coordinated password rehash will prevent users with peppered hashes from signing in. Legacy password hashes remain verifiable and are upgraded after successful sign-in when the pepper is configured.
 
 `wrangler.jsonc` declares the custom domain `app.zyntris.org`. Cloudflare will provision the DNS record and certificate when the zone is active in the same account. If the hostname currently has a CNAME, remove that record before deploying the Custom Domain.
 

@@ -1,3 +1,5 @@
+import { allowedBrowserOrigin, isTenantObjectKey, tenantDocumentKey, tenantReceiptKey } from "./security-boundaries";
+
 export interface Env {
   DB: D1Database;
   FILES: R2Bucket;
@@ -5,6 +7,7 @@ export interface Env {
   APP_ORIGIN: string;
   ENVIRONMENT: string;
   SESSION_SECRET?: string;
+  PASSWORD_PEPPER?: string;
   BREVO_API_KEY?: string;
   EMAIL_SENDER?: string;
   PLATFORM_ADMIN_EMAILS?: string;
@@ -65,6 +68,7 @@ async function createTenantBackup(env: Env, organizationId: string, createdBy: s
   const files: { originalKey: string; backupKey: string }[] = [];
   for (const doc of (tables.documents || []) as { r2_key?: string }[]) {
     if (!doc.r2_key) continue;
+    if (!isTenantObjectKey(doc.r2_key, organizationId)) throw new Error("A document references storage outside its organization boundary.");
     const source = await env.FILES.get(doc.r2_key);
     if (!source) throw new Error("A referenced document is missing from R2 storage.");
     const backupKey = `tenant-backups/${organizationId}/${id}/files/${await hashToken(doc.r2_key)}`;
@@ -287,7 +291,7 @@ const icsDate = (value: string) => new Date(value).toISOString().replace(/[-:]/g
 
 async function publicCalendarFeed(token: string, env: Env) {
   if (!/^[a-f0-9]{64}$/i.test(token)) return error("Calendar feed not found.", 404);
-  const feed = await env.DB.prepare(`SELECT organization_id as organizationId FROM calendar_feed_tokens WHERE token_hash = ? AND revoked_at IS NULL`).bind(await hashToken(token)).first<{ organizationId: string }>();
+  const feed = await env.DB.prepare(`SELECT organization_id as organizationId FROM calendar_feed_tokens WHERE token_hash = ? AND revoked_at IS NULL AND datetime(expires_at) > CURRENT_TIMESTAMP`).bind(await hashToken(token)).first<{ organizationId: string }>();
   if (!feed) return error("Calendar feed not found or revoked.", 404);
   const [organization, events] = await Promise.all([
     env.DB.prepare(`SELECT name FROM organizations WHERE id = ?`).bind(feed.organizationId).first<{ name: string }>(),
@@ -392,19 +396,37 @@ function randomToken(bytes = 32) {
   return [...value].map((part) => part.toString(16).padStart(2, "0")).join("");
 }
 
-async function passwordHash(password: string, salt = randomToken(16)) {
-  const material = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
-  // Cloudflare Workers WebCrypto rejects PBKDF2 iteration counts above 100,000.
+async function derivePasswordDigest(password: string, salt: string, pepper?: string) {
+  const input = new TextEncoder().encode(password);
+  let materialBytes = input;
+  if (pepper) {
+    const pepperKey = await crypto.subtle.importKey("raw", new TextEncoder().encode(pepper), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    materialBytes = new Uint8Array(await crypto.subtle.sign("HMAC", pepperKey, input));
+  }
+  const material = await crypto.subtle.importKey("raw", materialBytes, "PBKDF2", false, ["deriveBits"]);
+  // Workers WebCrypto caps PBKDF2 at 100,000 rounds; a server-only pepper protects
+  // stored hashes against offline cracking if the D1 database is exposed.
   const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: new TextEncoder().encode(salt), iterations: 100000 }, material, 256);
-  const digest = [...new Uint8Array(bits)].map((part) => part.toString(16).padStart(2, "0")).join("");
-  return `pbkdf2-sha256$100000$${salt}$${digest}`;
+  return [...new Uint8Array(bits)].map((part) => part.toString(16).padStart(2, "0")).join("");
 }
 
-async function verifyPassword(password: string, encoded: string) {
+async function passwordHash(password: string, pepper: string, salt = randomToken(16)) {
+  const digest = await derivePasswordDigest(password, salt, pepper);
+  return `pbkdf2-sha256-peppered$100000$${salt}$${digest}`;
+}
+
+async function verifyPassword(password: string, encoded: string, pepper?: string) {
   const [algorithm, rounds, salt, expected] = encoded.split("$");
-  if (algorithm !== "pbkdf2-sha256" || rounds !== "100000" || !salt || !expected) return false;
-  const actual = await passwordHash(password, salt);
-  return safeEqual(actual.split("$")[3] || "", expected);
+  if (rounds !== "100000" || !salt || !/^[a-f0-9]{64}$/i.test(expected || "")) return false;
+  if (algorithm === "pbkdf2-sha256") return safeEqual(await derivePasswordDigest(password, salt), expected);
+  if (algorithm !== "pbkdf2-sha256-peppered" || !pepper) return false;
+  return safeEqual(await derivePasswordDigest(password, salt, pepper), expected);
+}
+
+async function upgradeLegacyPassword(env: Env, userId: string, password: string, encoded: string) {
+  if (!env.PASSWORD_PEPPER || !encoded.startsWith("pbkdf2-sha256$")) return;
+  const upgraded = await passwordHash(password, env.PASSWORD_PEPPER);
+  await env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND password_hash = ?`).bind(upgraded, userId, encoded).run();
 }
 
 function base32Encode(bytes: Uint8Array) {
@@ -515,7 +537,7 @@ function cookieResponse(data: unknown, token: string, maxAge = 12 * 60 * 60, sta
 
 function originAllowed(request: Request, env: Env) {
   const origin = request.headers.get("origin");
-  return !origin || origin === env.APP_ORIGIN;
+  return allowedBrowserOrigin(origin, request.headers.get("referer"), env.APP_ORIGIN);
 }
 
 async function consumeAuthLimit(env: Env, request: Request, action: string, limit: number, windowMinutes: number, subject?: string) {
@@ -677,6 +699,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
   if (request.method === "GET" && path === "/api/auth/config") return json({ emailVerificationEnabled: Boolean(env.BREVO_API_KEY), demoEnabled: Boolean(env.DEMO_ACCESS_PASSWORD) });
   if (request.method === "POST" && path === "/api/auth/accept-invite") {
     if (!originAllowed(request, env)) return error("Request origin rejected", 403);
+    if (!env.PASSWORD_PEPPER) return error("Secure password setup is temporarily unavailable. Contact Zyntris support.", 503);
     if (!(await consumeAuthLimit(env, request, "accept-invite", 10, 30))) return error("Too many attempts. Try again later.", 429);
     const body = await request.json<{ token?: string; password?: string }>();
     if (!body.token || body.token.length !== 64 || !body.password || body.password.length < 12 || body.password.length > 128) return error("Use a valid invitation and a password of at least 12 characters.");
@@ -687,7 +710,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     const claimedInvite = await env.DB.prepare(`UPDATE employee_invites SET accepted_at = CURRENT_TIMESTAMP WHERE id = ? AND accepted_at IS NULL AND expires_at > CURRENT_TIMESTAMP`).bind(invite.inviteId).run();
     if (!claimedInvite.meta.changes) return error("This invitation has already been used.", 409);
     await env.DB.batch([
-      env.DB.prepare(`UPDATE users SET password_hash = ?, status = 'active', email_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(await passwordHash(body.password), invite.userId),
+      env.DB.prepare(`UPDATE users SET password_hash = ?, status = 'active', email_verified_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(await passwordHash(body.password, env.PASSWORD_PEPPER), invite.userId),
       env.DB.prepare(`UPDATE memberships SET status = 'active' WHERE user_id = ? AND organization_id = ?`).bind(invite.userId, invite.organizationId),
       env.DB.prepare(`UPDATE employees SET onboarding_status = 'active', status = 'active', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND organization_id = ?`).bind(invite.employeeId, invite.organizationId),
       env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id) VALUES (?, ?, ?, 'accepted_invitation', 'hr', 'employee', ?)`).bind(`audit-${crypto.randomUUID()}`, invite.organizationId, invite.userId, invite.employeeId),
@@ -708,6 +731,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
   }
   if (request.method === "POST" && path === "/api/auth/register") {
     if (!originAllowed(request, env)) return error("Request origin rejected", 403);
+    if (!env.PASSWORD_PEPPER) return error("Secure account setup is temporarily unavailable. Contact Zyntris support.", 503);
     if (!env.BREVO_API_KEY) return error("Email verification is not configured yet. Contact Zyntris support to finish account setup.", 503);
     if (!(await consumeAuthLimit(env, request, "register", 8, 60))) return error("Too many signup attempts. Try again later.", 429);
     const body = await request.json<{ organizationName?: string; industry?: string; fullName?: string; email?: string; password?: string }>();
@@ -740,7 +764,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
         env.DB.prepare(`WITH sources(name) AS (VALUES ('Website'),('Referral'),('Social Media'),('LinkedIn'),('Event'),('Webinar'),('Advertisement'),('Email Campaign'),('Direct Outreach'),('Partner'),('Existing Customer'),('Walk-in'),('Other')) INSERT INTO crm_lead_sources (id,organization_id,name) SELECT 'crm-source-' || ? || '-' || lower(replace(name,' ','-')), ?, name FROM sources`).bind(orgId,orgId),
         env.DB.prepare(`INSERT INTO crm_pipeline_stages (id,organization_id,stage_key,name,probability,sort_order) VALUES ('crm-stage-' || ? || '-qualification',?,'qualification','Qualification',10,1),('crm-stage-' || ? || '-discovery',?,'discovery','Discovery',25,2),('crm-stage-' || ? || '-proposal',?,'proposal','Proposal',50,3),('crm-stage-' || ? || '-negotiation',?,'negotiation','Negotiation',75,4),('crm-stage-' || ? || '-won',?,'won','Won',100,5),('crm-stage-' || ? || '-lost',?,'lost','Lost',0,6)`).bind(orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId),
         env.DB.prepare(`INSERT INTO organization_settings (organization_id) VALUES (?)`).bind(orgId),
-        env.DB.prepare(`INSERT INTO users (id, email, full_name, password_hash, status) VALUES (?, ?, ?, ?, 'active')`).bind(userId, email, fullName, await passwordHash(password)),
+        env.DB.prepare(`INSERT INTO users (id, email, full_name, password_hash, status) VALUES (?, ?, ?, ?, 'active')`).bind(userId, email, fullName, await passwordHash(password, env.PASSWORD_PEPPER)),
         env.DB.prepare(`INSERT INTO roles (id, organization_id, name, description, is_system) VALUES (?, ?, 'Organization Admin', 'Organization owner and administrator', 1)`).bind(roleId, orgId),
         env.DB.prepare(`INSERT INTO roles (id, organization_id, name, description, is_system) VALUES (?, ?, 'HR Admin', 'Manage people, teams and onboarding', 1)`).bind(hrRoleId, orgId),
         env.DB.prepare(`INSERT INTO roles (id, organization_id, name, description, is_system) VALUES (?, ?, 'CEO', 'Executive review and final approvals', 1)`).bind(ceoRoleId, orgId),
@@ -801,6 +825,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
   }
   if (request.method === "POST" && path === "/api/auth/request-password-reset") {
     if (!mobile && !originAllowed(request, env)) return error("Request origin rejected", 403);
+    if (!env.PASSWORD_PEPPER) return error("Secure password recovery is temporarily unavailable. Contact your administrator.", 503);
     if (!(await consumeAuthLimit(env, request, "forgot-password", 5, 30))) return error("Too many password reset requests. Try again later.", 429);
     const body = await request.json<{ email?: string }>();
     const email = body.email?.trim().toLowerCase();
@@ -824,6 +849,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
   }
   if (request.method === "POST" && path === "/api/auth/reset-password") {
     if (!mobile && !originAllowed(request, env)) return error("Request origin rejected", 403);
+    if (!env.PASSWORD_PEPPER) return error("Secure password reset is temporarily unavailable. Contact your administrator.", 503);
     if (!(await consumeAuthLimit(env, request, "reset-password", 10, 30))) return error("Too many password reset attempts. Try again later.", 429);
     const body = await request.json<{ token?: string; password?: string }>();
     if (!body.token || body.token.length !== 64 || !body.password || body.password.length < 12 || body.password.length > 128) return error("Use a valid reset link and a password of at least 12 characters.");
@@ -832,7 +858,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     const claimId = requestId();
     const claimed = await env.DB.prepare(`UPDATE password_reset_tokens SET used_at = CURRENT_TIMESTAMP, claim_id = ? WHERE id = ? AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP`).bind(claimId, reset.id).run();
     if (!claimed.meta.changes) return error("This password reset link has already been used. Ask the platform administrator to send a new one.", 409);
-    const saved = await env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'active'`).bind(await passwordHash(body.password), reset.userId).run();
+    const saved = await env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'active'`).bind(await passwordHash(body.password, env.PASSWORD_PEPPER), reset.userId).run();
     if (!saved.meta.changes) return error("This account cannot reset its password. Contact your organization administrator.", 409);
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(reset.userId),
@@ -885,7 +911,8 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     const email = body.email?.trim().toLowerCase() || "";
     if (email && !(await consumeAuthLimit(env, request, "login", 8, 15, email))) return error("Too many sign-in attempts. Try again later.", 429);
     const user = await env.DB.prepare(`SELECT id, password_hash as passwordHash, email_verified_at as verifiedAt, status FROM users WHERE email = ?`).bind(email).first<{ id: string; passwordHash: string | null; verifiedAt: string | null; status: string }>();
-    if (!user?.passwordHash || user.status !== "active" || !(await verifyPassword(body.password || "", user.passwordHash))) return error("Email or password is incorrect.", 401);
+    if (!user?.passwordHash || user.status !== "active" || !(await verifyPassword(body.password || "", user.passwordHash, env.PASSWORD_PEPPER))) return error("Email or password is incorrect.", 401);
+    await upgradeLegacyPassword(env, user.id, body.password || "", user.passwordHash);
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
     const membership = await env.DB.prepare(`SELECT organization_id as organizationId FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created_at LIMIT 1`).bind(user.id).first<{ organizationId: string }>();
     if (!membership) return error("No active organization is linked to this account.", 403);
@@ -1474,7 +1501,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const email = body.email?.trim().toLowerCase() || "";
     if (email && !(await consumeAuthLimit(env, request, "login", 8, 15, email))) return error("Too many sign-in attempts. Try again later.", 429);
     const user = await env.DB.prepare(`SELECT id, password_hash as passwordHash, email_verified_at as verifiedAt, status FROM users WHERE email = ?`).bind(email).first<{ id: string; passwordHash: string | null; verifiedAt: string | null; status: string }>();
-    if (!user?.passwordHash || user.status !== "active" || !(await verifyPassword(body.password || "", user.passwordHash))) return error("Email or password is incorrect.", 401);
+    if (!user?.passwordHash || user.status !== "active" || !(await verifyPassword(body.password || "", user.passwordHash, env.PASSWORD_PEPPER))) return error("Email or password is incorrect.", 401);
+    await upgradeLegacyPassword(env, user.id, body.password || "", user.passwordHash);
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
     const membership = await env.DB.prepare(`SELECT organization_id as organizationId FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created_at LIMIT 1`).bind(user.id).first<{ organizationId: string }>();
     if (!membership) return error("No active organization is linked to this account.", 403);
@@ -1627,7 +1655,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const body = await request.json<{ password?: string }>();
     if (!body.password || body.password.length > 128) return error("Enter your current password to set up two-factor authentication.");
     const user = await env.DB.prepare(`SELECT password_hash as passwordHash FROM users WHERE id = ? AND status = 'active'`).bind(context.userId).first<{ passwordHash: string | null }>();
-    if (!user?.passwordHash || !(await verifyPassword(body.password, user.passwordHash))) return error("Your current password is incorrect.", 401);
+    if (!user?.passwordHash || !(await verifyPassword(body.password, user.passwordHash, env.PASSWORD_PEPPER))) return error("Your current password is incorrect.", 401);
     const current = await env.DB.prepare(`SELECT enabled_at as enabledAt FROM user_two_factor WHERE user_id = ?`).bind(context.userId).first<{ enabledAt: string | null }>();
     if (current?.enabledAt) return error("Two-factor authentication is already enabled.", 409);
     const secret = base32Encode(crypto.getRandomValues(new Uint8Array(20)));
@@ -1668,7 +1696,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (context.isPlatformAdmin || ["admin", "organization admin", "hr admin", "finance admin", "ceo"].includes(context.role.trim().toLowerCase()) || context.permissions.has("roles.manage") || context.permissions.has("settings.manage")) return error("Two-factor authentication is mandatory for this privileged account.", 403);
     const body = await request.json<{ password?: string; code?: string }>();
     const user = await env.DB.prepare(`SELECT password_hash as passwordHash FROM users WHERE id = ? AND status = 'active'`).bind(context.userId).first<{ passwordHash: string | null }>();
-    if (!user?.passwordHash || !(await verifyPassword(body.password || "", user.passwordHash))) return error("Your current password is incorrect.", 401);
+    if (!user?.passwordHash || !(await verifyPassword(body.password || "", user.passwordHash, env.PASSWORD_PEPPER))) return error("Your current password is incorrect.", 401);
     const factor = await env.DB.prepare(`SELECT secret_enc as secretEnc, enabled_at as enabledAt, last_counter as lastCounter FROM user_two_factor WHERE user_id = ?`).bind(context.userId).first<{ secretEnc: string | null; enabledAt: string | null; lastCounter: number }>();
     if (!factor?.enabledAt || !factor.secretEnc) return error("Two-factor authentication is not enabled.", 409);
     let verified = false;
@@ -1762,6 +1790,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
     const userResetMatch = path.match(/^\/api\/platform\/organizations\/([^/]+)\/users\/([^/]+)\/password-reset$/);
     if (request.method === "POST" && userResetMatch) {
+      if (!env.PASSWORD_PEPPER) return error("Secure password recovery is not configured. Set PASSWORD_PEPPER before sending reset links.", 503);
       if (!(await consumeAuthLimit(env, request, "platform-password-reset", 15, 60))) return error("The password reset limit has been reached. Wait before sending more reset emails.", 429);
       const target = await env.DB.prepare(`SELECT u.id, u.email, u.full_name as fullName, o.id as organizationId, o.name as organizationName, r.name as role FROM users u JOIN memberships m ON m.user_id = u.id JOIN roles r ON r.id = m.role_id JOIN organizations o ON o.id = m.organization_id WHERE o.id = ? AND u.id = ? AND m.status = 'active' AND u.status = 'active' AND u.email_verified_at IS NOT NULL AND o.is_demo = 0 AND r.name IN ('Organization Admin','CEO') LIMIT 1`).bind(userResetMatch[1], userResetMatch[2]).first<{ id: string; email: string; fullName: string; organizationId: string; organizationName: string; role: string }>();
       if (!target) return error("An active, verified Organization Admin or CEO account for this tenant was not found.", 404);
@@ -3288,19 +3317,20 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (path === "/api/calendar/feed" && request.method === "GET") {
-    const active = await env.DB.prepare(`SELECT id, created_at as createdAt FROM calendar_feed_tokens WHERE organization_id = ? AND revoked_at IS NULL ORDER BY created_at DESC LIMIT 1`).bind(context.organizationId).first<{ id: string; createdAt: string }>();
-    return json({ enabled: Boolean(active), createdAt: active?.createdAt || null });
+    const active = await env.DB.prepare(`SELECT id, created_at as createdAt, expires_at as expiresAt FROM calendar_feed_tokens WHERE organization_id = ? AND revoked_at IS NULL AND datetime(expires_at) > CURRENT_TIMESTAMP ORDER BY created_at DESC LIMIT 1`).bind(context.organizationId).first<{ id: string; createdAt: string; expiresAt: string }>();
+    return json({ enabled: Boolean(active), createdAt: active?.createdAt || null, expiresAt: active?.expiresAt || null });
   }
 
   if (path === "/api/calendar/feed" && request.method === "POST") {
     if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to manage calendar subscriptions.", 403);
     const token = randomToken(32); const id = `calendar-feed-${crypto.randomUUID()}`;
+    const expiresAt = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString();
     await env.DB.batch([
       env.DB.prepare(`UPDATE calendar_feed_tokens SET revoked_at = CURRENT_TIMESTAMP WHERE organization_id = ? AND revoked_at IS NULL`).bind(context.organizationId),
-      env.DB.prepare(`INSERT INTO calendar_feed_tokens (id, organization_id, token_hash, created_by) VALUES (?, ?, ?, ?)`).bind(id, context.organizationId, await hashToken(token), context.userId),
+      env.DB.prepare(`INSERT INTO calendar_feed_tokens (id, organization_id, token_hash, created_by, expires_at) VALUES (?, ?, ?, ?, ?)`).bind(id, context.organizationId, await hashToken(token), context.userId, expiresAt),
     ]);
-    await audit(env, context, "created", "calendar_feed", id, { access: "read-only subscription" });
-    return json({ enabled: true, url: `${new URL(request.url).origin}/calendar/feed/${token}.ics` }, { status: 201 });
+    await audit(env, context, "created", "calendar_feed", id, { access: "read-only subscription", expiresAt });
+    return json({ enabled: true, expiresAt, url: `${new URL(request.url).origin}/calendar/feed/${token}.ics` }, { status: 201 });
   }
 
   if (path === "/api/calendar/feed" && request.method === "DELETE") {
@@ -3410,7 +3440,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const requestIdValue = `request-${crypto.randomUUID()}`;
     const expenseSla = await env.DB.prepare(`SELECT due_hours as dueHours FROM workflow_sla_settings WHERE organization_id = ? AND request_type = 'Expense'`).bind(context.organizationId).first<{ dueHours: number }>();
     const expenseDueAt = new Date(Date.now() + (expenseSla?.dueHours || 48) * 3600000).toISOString();
-    const receiptKey = receipt ? `expense-receipts/${context.organizationId}/${id}/${crypto.randomUUID()}` : null;
+    const receiptKey = receipt ? tenantReceiptKey(context.organizationId, id, crypto.randomUUID()) : null;
     if (receipt) {
       const reservation = await reserveTenantStorage(env, context.organizationId, receipt.size);
       if (!reservation.available) return error("Organization storage allowance is unavailable. Contact support.", 503);
@@ -3440,6 +3470,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const record = await env.DB.prepare(`SELECT x.receipt_key as receiptKey, x.employee_id as employeeId, e.user_id as userId FROM expenses x JOIN employees e ON e.id = x.employee_id WHERE x.id = ? AND x.organization_id = ?`).bind(expenseReceiptMatch[1], context.organizationId).first<{ receiptKey: string | null; employeeId: string; userId: string | null }>();
     if (!record || !record.receiptKey) return error("Receipt not found.", 404);
     if (record.userId !== context.userId && !hasPermission(context, "expenses.manage")) return error("You do not have permission to view this receipt.", 403);
+    if (!isTenantObjectKey(record.receiptKey, context.organizationId)) return error("Receipt not found.", 404);
     const object = await env.FILES.get(record.receiptKey);
     if (!object) return error("Receipt file is unavailable.", 404);
     return new Response(object.body, { headers: { "content-type": object.httpMetadata?.contentType || "application/octet-stream", "content-disposition": "attachment; filename=expense-receipt", "cache-control": "private, no-store", "x-content-type-options": "nosniff" } });
@@ -3776,6 +3807,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET" && fileMatch) {
     const doc = await env.DB.prepare(`SELECT name, r2_key as r2Key, content_type as contentType FROM documents WHERE id = ? AND organization_id = ?`).bind(fileMatch[1], context.organizationId).first<{ name: string; r2Key: string; contentType: string }>();
     if (!doc) return error("Document not found.", 404);
+    if (!isTenantObjectKey(doc.r2Key, context.organizationId)) return error("Document not found.", 404);
     const object = await env.FILES.get(doc.r2Key);
     if (!object) return error("Document contents are unavailable.", 404);
     const safeName = doc.name.replace(/[\r\n"\\]/g, "_");
@@ -3786,6 +3818,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!hasPermission(context, "operations.manage")) return error("Operations manager permission is required to delete documents.", 403);
     const doc = await env.DB.prepare(`SELECT r2_key as r2Key, name, size_bytes as sizeBytes FROM documents WHERE id = ? AND organization_id = ?`).bind(fileMatch[1], context.organizationId).first<{ r2Key: string; name: string; sizeBytes: number }>();
     if (!doc) return error("Document not found.", 404);
+    if (!isTenantObjectKey(doc.r2Key, context.organizationId)) return error("Document not found.", 404);
     await env.FILES.delete(doc.r2Key);
     const deleted = await env.DB.prepare(`DELETE FROM documents WHERE id = ? AND organization_id = ?`).bind(fileMatch[1], context.organizationId).run();
     if (deleted.meta.changes === 1) await env.DB.prepare(`UPDATE tenant_storage_usage SET used_bytes = MAX(0, used_bytes - ?), updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(doc.sizeBytes, context.organizationId).run();
@@ -3805,7 +3838,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!reservation.available) return error("Organization storage allowance is unavailable. Contact support.", 503);
     if (!reservation.withinLimit) return error("This upload would exceed the organization’s storage allowance. Remove unused files or contact Zyntris.", 413);
     const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "-");
-    const key = `${context.organizationId}/${crypto.randomUUID()}-${safeName}`;
+    const key = tenantDocumentKey(context.organizationId, `${crypto.randomUUID()}-${safeName}`);
     const id = `doc-${crypto.randomUUID().slice(0, 8)}`;
     try {
       await env.FILES.put(key, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
