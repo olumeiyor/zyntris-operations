@@ -71,7 +71,7 @@ export default function App() {
   const [page, setPage] = useState<PageId>(adminPortal ? "platform" : "dashboard");
   const [collapsed, setCollapsed] = useState(false);
   const [mobileNav, setMobileNav] = useState(false);
-  const [user, setUser] = useState<{ id: string; fullName: string; email: string; role: string; organizationId: string; organizationName: string; permissions?: string[]; trialEndsAt?: string | null; subscriptionStatus?: string; isPlatformAdmin?: boolean; isDemo?: boolean; mfaMandatory?: boolean; mfaEnrollmentRequired?: boolean } | null>(null);
+  const [user, setUser] = useState<{ id: string; fullName: string; email: string; role: string; organizationId: string; organizationName: string; permissions?: string[]; enabledModules?: string[]; trialEndsAt?: string | null; subscriptionStatus?: string; isPlatformAdmin?: boolean; isDemo?: boolean; mfaMandatory?: boolean; mfaEnrollmentRequired?: boolean } | null>(null);
   const [dashboard, setDashboard] = useState<DashboardData>(demoDashboard);
   const [employees, setEmployees] = useState<Employee[]>(demoEmployees);
   const [connected, setConnected] = useState(false);
@@ -219,7 +219,15 @@ export default function App() {
 
   const currentLabel = navItems.find((item) => item.id === page)?.label || "Dashboard";
   const userPermissions = new Set(user?.permissions || []);
+  const enabledModules = new Set(user?.enabledModules || []);
+  const pageModule: Partial<Record<PageId, string>> = {
+    employees: "hr", goals: "hr", appraisals: "hr", talent: "hr", exit: "hr", leave: "hr", attendance: "hr",
+    payroll: "payroll", expenses: "finance", requests: "finance", budgets: "finance",
+    projects: "projects", customers: "crm", assets: "operations", documents: "operations", vendors: "operations", helpdesk: "operations", tasks: "operations", calendar: "operations", announcements: "operations", reports: "reports",
+  };
   const visibleNavItems = navItems.filter((item) => {
+    const requiredModule = pageModule[item.id];
+    if (requiredModule && !enabledModules.has(requiredModule)) return false;
     if (item.id === "platform") return Boolean(user?.isPlatformAdmin);
     if (item.id === "settings") return userPermissions.has("settings.manage");
     if (item.id === "customers") return userPermissions.has("crm.view") || userPermissions.has("crm.manage");

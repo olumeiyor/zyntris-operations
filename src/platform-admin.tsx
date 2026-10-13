@@ -6,6 +6,7 @@ type Summary = { organizations: number; active: number; trialing: number; suspen
 type Organization = { id: string; name: string; slug: string; industry: string | null; status: string; isDemo: number; serviceEnabled: number; createdAt: string; plan: string | null; subscriptionStatus: string | null; trialEndsAt: string | null; members: number; employees: number; lastActivity: string | null };
 type TenantUser = { id: string; fullName: string; email: string; status: string; emailVerifiedAt: string | null; role: string; createdAt: string };
 type ActivityEntry = { id: string; organizationName: string; actorName: string | null; action: string; module: string; recordType: string | null; createdAt: string };
+type TenantModule = { key: string; label: string; description: string; enabled: boolean; status: string; planCode: string; endsAt: string | null; notes: string };
 
 async function platformApi<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { credentials: "include", ...init, headers: { "content-type": "application/json", ...(init?.headers || {}) } });
@@ -22,6 +23,7 @@ export function PlatformAdminWorkspace() {
   const [activity, setActivity] = useState<ActivityEntry[]>([]);
   const [tenantUsers, setTenantUsers] = useState<TenantUser[]>([]);
   const [tenantActivity, setTenantActivity] = useState<ActivityEntry[]>([]);
+  const [tenantModules, setTenantModules] = useState<TenantModule[]>([]);
   const [selectedOrg, setSelectedOrg] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [query, setQuery] = useState("");
@@ -68,15 +70,34 @@ export function PlatformAdminWorkspace() {
   };
 
   const manageTenant = async (org: Organization) => {
-    if (selectedOrg === org.id) { setSelectedOrg(null); setTenantUsers([]); setTenantActivity([]); return; }
-    setSelectedOrg(org.id); setTenantUsers([]); setTenantActivity([]); setError("");
+    if (selectedOrg === org.id) { setSelectedOrg(null); setTenantUsers([]); setTenantActivity([]); setTenantModules([]); return; }
+    setSelectedOrg(org.id); setTenantUsers([]); setTenantActivity([]); setTenantModules([]); setError("");
     try {
-      const [users, events] = await Promise.all([
+      const [users, events, modules] = await Promise.all([
         platformApi<{ data: TenantUser[] }>(`/api/platform/organizations/${encodeURIComponent(org.id)}/users`),
         platformApi<{ data: ActivityEntry[] }>(`/api/platform/activity?organizationId=${encodeURIComponent(org.id)}&limit=20&offset=0`),
+        platformApi<{ data: TenantModule[] }>(`/api/platform/organizations/${encodeURIComponent(org.id)}/modules`),
       ]);
-      setTenantUsers(users.data); setTenantActivity(events.data);
+      setTenantUsers(users.data); setTenantActivity(events.data); setTenantModules(modules.data);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Tenant maintenance details could not be loaded."); }
+  };
+
+  const saveModule = async (org: Organization, module: TenantModule, enabled: boolean) => {
+    const status = enabled ? "active" : "paused";
+    const action = enabled ? "activate" : "turn off";
+    if (!window.confirm(`${action[0].toUpperCase()}${action.slice(1)} ${module.label} for ${org.name}? This changes access for this tenant only.`)) return;
+    setBusyAction(`module:${org.id}:${module.key}`); setError(""); setNotice("");
+    try {
+      await platformApi(`/api/platform/organizations/${encodeURIComponent(org.id)}/modules/${encodeURIComponent(module.key)}`, {
+        method: "PATCH",
+        body: JSON.stringify({ status, planCode: module.planCode, endsAt: module.endsAt || null, notes: module.notes }),
+      });
+      setTenantModules((items) => items.map((item) => item.key === module.key ? { ...item, enabled, status } : item));
+      const events = await platformApi<{ data: ActivityEntry[] }>(`/api/platform/activity?organizationId=${encodeURIComponent(org.id)}&limit=20&offset=0`);
+      setTenantActivity(events.data);
+      setNotice(`${module.label} ${enabled ? "activated" : "turned off"} for ${org.name}.`);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Tenant module could not be updated."); }
+    finally { setBusyAction(""); }
   };
 
   const toggleTenant = async (org: Organization) => {
@@ -123,7 +144,7 @@ export function PlatformAdminWorkspace() {
     <section className="card platform-card">
       <div className="card-heading"><div><h2>All tenants</h2><p>{orgTotal.toLocaleString()} workspaces, including the protected demo tenant</p></div><form className="platform-search" onSubmit={(event) => { event.preventDefault(); setOrgOffset(0); setQuery(search.trim()); }}><Search size={16} /><input aria-label="Search tenants" placeholder="Search tenants" value={search} onChange={(event) => setSearch(event.target.value)} /><button type="submit">Search</button></form></div>
       <div className="table-scroll"><table><thead><tr><th>Tenant</th><th>Subscription</th><th>Service access</th><th>Plan</th><th>Members</th><th>Employees</th><th>Last activity</th><th>Onboarded</th><th>Manage</th></tr></thead><tbody>
-        {organizations.map((org) => <TenantRows key={org.id} org={org} selected={selectedOrg === org.id} users={tenantUsers} activity={tenantActivity} busyAction={busyAction} onManage={() => void manageTenant(org)} onToggle={() => void toggleTenant(org)} onReset={(user) => void sendPasswordReset(org, user)} />)}
+        {organizations.map((org) => <TenantRows key={org.id} org={org} selected={selectedOrg === org.id} users={tenantUsers} activity={tenantActivity} modules={tenantModules} busyAction={busyAction} onManage={() => void manageTenant(org)} onToggle={() => void toggleTenant(org)} onReset={(user) => void sendPasswordReset(org, user)} onSaveModule={(module, enabled) => void saveModule(org, module, enabled)} onModuleField={(key, field, value) => setTenantModules((items) => items.map((item) => item.key === key ? { ...item, [field]: value } : item))} />)}
         {!loading && !organizations.length && <tr><td colSpan={9} className="platform-empty">No tenants match this search.</td></tr>}
       </tbody></table></div>
       {orgOffset < orgTotal && <div className="platform-more"><button className="button secondary" onClick={() => void loadMoreOrganizations()} disabled={loading}>Load more tenants</button></div>}
@@ -140,7 +161,7 @@ export function PlatformAdminWorkspace() {
   </div>;
 }
 
-function TenantRows({ org, selected, users, activity, busyAction, onManage, onToggle, onReset }: { org: Organization; selected: boolean; users: TenantUser[]; activity: ActivityEntry[]; busyAction: string; onManage: () => void; onToggle: () => void; onReset: (user: TenantUser) => void }) {
+function TenantRows({ org, selected, users, activity, modules, busyAction, onManage, onToggle, onReset, onSaveModule, onModuleField }: { org: Organization; selected: boolean; users: TenantUser[]; activity: ActivityEntry[]; modules: TenantModule[]; busyAction: string; onManage: () => void; onToggle: () => void; onReset: (user: TenantUser) => void; onSaveModule: (module: TenantModule, enabled: boolean) => void; onModuleField: (key: string, field: "planCode" | "endsAt" | "notes", value: string) => void }) {
   const enabled = Boolean(org.serviceEnabled);
   return <>
     <tr>
@@ -150,7 +171,9 @@ function TenantRows({ org, selected, users, activity, busyAction, onManage, onTo
       <td>{org.plan || "—"}</td><td>{org.members}</td><td>{org.employees}</td><td>{date(org.lastActivity)}</td><td>{date(org.createdAt)}</td>
       <td className="platform-row-actions"><button className="platform-link-button" onClick={onManage}>{selected ? "Close" : "Manage"}</button><button className="button secondary platform-toggle" onClick={onToggle} disabled={Boolean(org.isDemo) || busyAction === `service:${org.id}`}>{busyAction === `service:${org.id}` ? "Saving…" : enabled ? <><LockKeyhole size={13} /> Disable</> : <><ShieldCheck size={13} /> Enable</>}</button></td>
     </tr>
-    {selected && <tr><td colSpan={9} className="platform-members-cell"><div className="platform-members"><div className="platform-members-heading"><div><strong>Tenant maintenance</strong><span>{users.length} tenant accounts · service access is managed above</span></div></div><div className="table-scroll"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Account</th><th>Verified</th><th>Admin recovery</th></tr></thead><tbody>
+    {selected && <tr><td colSpan={9} className="platform-members-cell"><div className="platform-members"><div className="platform-members-heading"><div><strong>Tenant maintenance</strong><span>{users.length} tenant accounts · tenant-wide service access is managed above</span></div></div>
+      <section className="platform-modules"><div className="platform-members-heading"><div><strong>Subscribed services and modules</strong><span>Turn each service on or off for this tenant. Module access is enforced by the application and recorded in the audit log.</span></div></div>{Boolean(org.isDemo) && <p className="platform-reset-note">The synthetic demo tenant is protected; module controls are read-only.</p>}<div className="platform-module-grid">{modules.map((module) => <article className="platform-module" key={module.key}><div className="platform-module-top"><div><strong>{module.label}</strong><span>{module.description}</span></div><span className={`platform-status ${module.enabled ? "active" : "suspended"}`}>{module.enabled ? "Active" : module.status}</span></div><div className="platform-module-fields"><label>Plan / scope<input aria-label={`${module.label} plan or scope`} value={module.planCode} maxLength={80} disabled={Boolean(org.isDemo)} onChange={(event) => onModuleField(module.key, "planCode", event.target.value)} /></label><label>Access through<input aria-label={`${module.label} access expiry`} type="date" value={module.endsAt?.slice(0, 10) || ""} disabled={Boolean(org.isDemo)} onChange={(event) => onModuleField(module.key, "endsAt", event.target.value)} /></label></div><label className="platform-module-notes">Scope notes<textarea aria-label={`${module.label} scope notes`} value={module.notes} maxLength={1000} disabled={Boolean(org.isDemo)} onChange={(event) => onModuleField(module.key, "notes", event.target.value)} rows={2} /></label><button className={`button ${module.enabled ? "secondary" : "primary"}`} disabled={Boolean(org.isDemo) || busyAction === `module:${org.id}:${module.key}`} onClick={() => onSaveModule(module, !module.enabled)}>{busyAction === `module:${org.id}:${module.key}` ? "Saving…" : module.enabled ? "Turn off module" : "Activate module"}</button></article>)}</div><p className="platform-reset-note">A module can be activated only while the tenant-wide service is enabled and its subscription or trial is valid. Setting an end date automatically expires the module.</p></section>
+      <div className="table-scroll"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Account</th><th>Verified</th><th>Admin recovery</th></tr></thead><tbody>
       {users.map((user) => { const isTenantAdmin = user.role === "Organization Admin" || user.role === "CEO"; return <tr key={user.id}><td><strong>{user.fullName}</strong></td><td>{user.email}</td><td>{user.role}</td><td>{user.status}</td><td>{user.emailVerifiedAt ? "Yes" : "No"}</td><td>{isTenantAdmin ? <button className="platform-reset-button" onClick={() => onReset(user)} disabled={!user.emailVerifiedAt || user.status !== "active" || Boolean(org.isDemo) || busyAction === `reset:${user.id}`}>{busyAction === `reset:${user.id}` ? "Sending…" : <><KeyRound size={13} /> Send hard-reset link</>}</button> : <span className="platform-reset-note">Admin only</span>}</td></tr>; })}
       {!users.length && <tr><td colSpan={6} className="platform-empty">No member accounts are attached to this tenant.</td></tr>}
     </tbody></table></div><p className="platform-reset-note">Hard resets are available only for verified Organization Admin or CEO accounts. The one-time email link expires in 30 minutes; sessions are revoked only after Brevo accepts the email.</p>

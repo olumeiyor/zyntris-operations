@@ -384,6 +384,21 @@ function hasPermission(context: AuthContext, permission: string) {
   return context.permissions.has(permission);
 }
 
+function requiredTenantModule(path: string): string | null {
+  if (path === "/api/projects/subscription") return null;
+  if (path === "/api/projects" || path.startsWith("/api/projects/")) return "projects";
+  if (path === "/api/crm" || path.startsWith("/api/crm/") || path === "/api/customers" || path.startsWith("/api/customers/")) return "crm";
+  if (path === "/api/payroll" || path.startsWith("/api/payroll/")) return "payroll";
+  if (["/api/employees", "/api/leave", "/api/attendance", "/api/appraisals", "/api/appraisal-cycles", "/api/hr"]
+    .some((prefix) => path === prefix || path.startsWith(`${prefix}/`)) || path.startsWith("/api/appraisal-360/")) return "hr";
+  if (["/api/expenses", "/api/expense-policy", "/api/requests", "/api/approval-workflows", "/api/budgets", "/api/purchases"]
+    .some((prefix) => path === prefix || path.startsWith(`${prefix}/`))) return "finance";
+  if (["/api/tasks", "/api/assets", "/api/vendors", "/api/tickets", "/api/calendar", "/api/files", "/api/announcements", "/api/operations/members"]
+    .some((prefix) => path === prefix || path.startsWith(`${prefix}/`))) return "operations";
+  if (path === "/api/reports" || path.startsWith("/api/reports/")) return "reports";
+  return null;
+}
+
 async function workspaceAccessError(env: Env, organizationId: string) {
   const workspace = await env.DB.prepare(`SELECT o.status as organizationStatus, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt FROM organizations o LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE o.id = ?`).bind(organizationId).first<{ organizationStatus: string; subscriptionStatus: string | null; trialEndsAt: string | null }>();
   if (!workspace) return "The organization workspace is unavailable. Contact Zyntris support.";
@@ -742,7 +757,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     try {
       await env.DB.batch([
         env.DB.prepare(`INSERT INTO organizations (id, name, slug, industry, status) VALUES (?, ?, ?, ?, 'trial')`).bind(orgId, organizationName, slug, body.industry?.trim() || null),
-        env.DB.prepare(`INSERT INTO organization_modules (organization_id,module_key,enabled,features_json) VALUES (?,'projects',1,'{"portfolios":true,"programmes":true,"gantt":true,"timesheets":true,"budgets":true,"risks":true,"change_control":true,"meetings":true,"templates":true,"client_portal":true,"advanced_reports":true,"ai":false}'),(?,'crm',1,'{}')`).bind(orgId,orgId),
+        env.DB.prepare(`INSERT INTO organization_modules (organization_id,module_key,enabled,features_json) VALUES (?,'projects',1,'{"portfolios":true,"programmes":true,"gantt":true,"timesheets":true,"budgets":true,"risks":true,"change_control":true,"meetings":true,"templates":true,"client_portal":true,"advanced_reports":true,"ai":false}'),(?,'crm',1,'{}'),(?,'hr',1,'{}'),(?,'payroll',1,'{}'),(?,'finance',1,'{}'),(?,'operations',1,'{}'),(?,'reports',1,'{}')`).bind(orgId,orgId,orgId,orgId,orgId,orgId,orgId),
         env.DB.prepare(`WITH sources(name) AS (VALUES ('Website'),('Referral'),('Social Media'),('LinkedIn'),('Event'),('Webinar'),('Advertisement'),('Email Campaign'),('Direct Outreach'),('Partner'),('Existing Customer'),('Walk-in'),('Other')) INSERT INTO crm_lead_sources (id,organization_id,name) SELECT 'crm-source-' || ? || '-' || lower(replace(name,' ','-')), ?, name FROM sources`).bind(orgId,orgId),
         env.DB.prepare(`INSERT INTO crm_pipeline_stages (id,organization_id,stage_key,name,probability,sort_order) VALUES ('crm-stage-' || ? || '-qualification',?,'qualification','Qualification',10,1),('crm-stage-' || ? || '-discovery',?,'discovery','Discovery',25,2),('crm-stage-' || ? || '-proposal',?,'proposal','Proposal',50,3),('crm-stage-' || ? || '-negotiation',?,'negotiation','Negotiation',75,4),('crm-stage-' || ? || '-won',?,'won','Won',100,5),('crm-stage-' || ? || '-lost',?,'lost','Lost',0,6)`).bind(orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId,orgId),
         env.DB.prepare(`INSERT INTO organization_settings (organization_id) VALUES (?)`).bind(orgId),
@@ -1450,6 +1465,8 @@ async function handleHRTalent(request: Request, env: Env, context: AuthContext, 
 
 async function dashboard(env: Env, context: AuthContext) {
   const { organizationId, userId } = context;
+  const moduleRows = await env.DB.prepare(`SELECT m.module_key as moduleKey FROM organization_modules m LEFT JOIN module_subscriptions s ON s.organization_id=m.organization_id AND s.module_key=m.module_key WHERE m.organization_id=? AND m.enabled=1 AND (s.id IS NULL OR (s.status='active' AND (s.ends_at IS NULL OR datetime(s.ends_at)>CURRENT_TIMESTAMP)))`).bind(organizationId).all<{ moduleKey: string }>();
+  const activeModules = new Set((moduleRows.results || []).map((item) => item.moduleKey));
   const employee = await env.DB.prepare(`SELECT id FROM employees WHERE organization_id = ? AND user_id = ? AND deleted_at IS NULL LIMIT 1`).bind(organizationId, userId).first<{ id: string }>();
   const canManageLeave = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve");
   const canViewAllRequests = hasPermission(context, "requests.manage");
@@ -1464,7 +1481,16 @@ async function dashboard(env: Env, context: AuthContext) {
     env.DB.prepare(`SELECT d.name, COUNT(e.id) as count FROM departments d LEFT JOIN employees e ON e.department_id = d.id AND e.deleted_at IS NULL WHERE d.organization_id = ? GROUP BY d.id ORDER BY count DESC`).bind(organizationId).all(),
     env.DB.prepare(`SELECT action, module, created_at FROM audit_logs WHERE organization_id = ? ORDER BY created_at DESC LIMIT 6`).bind(organizationId).all(),
   ]);
-  return { people: people || { total: 0, active: 0, onLeave: 0 }, leave: { pending: leave?.pending || 0, visiblePending: visibleLeave?.pending || 0 }, requests: requests || { pending: 0 }, projects: projects || { active: 0 }, tasks: tasks || { overdue: 0 }, expenses: expenses || { total: 0 }, departments: departments.results || [], recentActivity: recentActivity.results || [] };
+  return {
+    people: activeModules.has("hr") ? people || { total: 0, active: 0, onLeave: 0 } : { total: 0, active: 0, onLeave: 0 },
+    leave: activeModules.has("hr") ? { pending: leave?.pending || 0, visiblePending: visibleLeave?.pending || 0 } : { pending: 0, visiblePending: 0 },
+    requests: activeModules.has("finance") ? requests || { pending: 0 } : { pending: 0 },
+    projects: activeModules.has("projects") ? projects || { active: 0 } : { active: 0 },
+    tasks: activeModules.has("operations") ? tasks || { overdue: 0 } : { overdue: 0 },
+    expenses: activeModules.has("finance") ? expenses || { total: 0 } : { total: 0 },
+    departments: activeModules.has("hr") ? departments.results || [] : [],
+    recentActivity: recentActivity.results || [],
+  };
 }
 
 async function handleApi(request: Request, env: Env): Promise<Response> {
@@ -1519,6 +1545,13 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const context = secured.context;
 
   if (context.mfaEnrollmentRequired && !mfaEnrollmentAllowed(path, request.method)) return error("Authenticator-based two-factor authentication is required before using this privileged account. Open Account security to complete setup.", 403);
+
+  const requiredModule = requiredTenantModule(path);
+  if (requiredModule) {
+    const entitlement = await env.DB.prepare(`SELECT m.enabled,s.status,CASE WHEN s.ends_at IS NULL OR datetime(s.ends_at)>CURRENT_TIMESTAMP THEN 1 ELSE 0 END as withinTerm FROM organization_modules m LEFT JOIN module_subscriptions s ON s.organization_id=m.organization_id AND s.module_key=m.module_key WHERE m.organization_id=? AND m.module_key=?`).bind(context.organizationId, requiredModule).first<{ enabled: number; status: string | null; withinTerm: number }>();
+    const subscriptionActive = !entitlement?.status || (entitlement.status === "active" && entitlement.withinTerm === 1);
+    if (!entitlement || entitlement.enabled !== 1 || !subscriptionActive) return error(`The ${requiredModule.replaceAll("_", " ")} module is not active for this organization. Contact your Zyntris administrator.`, 403);
+  }
 
   if (request.method === "POST" && path === "/api/auth/activity") {
     if (!originAllowed(request, env)) return error("Request origin rejected", 403);
@@ -1587,7 +1620,10 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     }
     if (hasPermission(context, "hr.talent.view") || hasPermission(context, "hr.talent.manage")) add(await env.DB.prepare(`SELECT id, title, category as subtitle, 'talent' as module FROM learning_courses WHERE organization_id = ? AND status = 'active' AND (title LIKE ? OR description LIKE ?) ORDER BY updated_at DESC LIMIT 8`).bind(context.organizationId, like, like).all());
     if (hasPermission(context, "goals.view")) add(await env.DB.prepare(`SELECT id, title, level || ' goal · ' || status as subtitle, 'goals' as module FROM goals WHERE organization_id = ? AND title LIKE ? ORDER BY updated_at DESC LIMIT 8`).bind(context.organizationId, like).all());
-    return json({ data: data.slice(0, 50) });
+    const activeRows = await env.DB.prepare(`SELECT m.module_key as moduleKey FROM organization_modules m LEFT JOIN module_subscriptions s ON s.organization_id=m.organization_id AND s.module_key=m.module_key WHERE m.organization_id=? AND m.enabled=1 AND (s.id IS NULL OR (s.status='active' AND (s.ends_at IS NULL OR datetime(s.ends_at)>CURRENT_TIMESTAMP)))`).bind(context.organizationId).all<{ moduleKey: string }>();
+    const activeModules = new Set((activeRows.results || []).map((item) => item.moduleKey));
+    const resultModule = (module: string) => ["employees", "talent", "goals"].includes(module) ? "hr" : ["tasks", "vendors", "helpdesk", "documents"].includes(module) ? "operations" : module === "projects" ? "projects" : module === "customers" ? "crm" : null;
+    return json({ data: data.filter((item) => { const required = resultModule(item.module); return !required || activeModules.has(required); }).slice(0, 50) });
   }
 
   const exitManagementResponse = await handleExitManagement(request, env, context, path);
@@ -1722,19 +1758,55 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (path.startsWith("/api/platform/")) {
     if (!context.isPlatformAdmin) return error("Platform administrator access is required.", 403);
 
-    const projectEntitlementMatch=path.match(/^\/api\/platform\/organizations\/([^/]+)\/modules\/projects$/);
-    if(request.method==="PATCH"&&projectEntitlementMatch){
-      const body=await request.json<{status?:string;planCode?:string;endsAt?:string|null;notes?:string;features?:Record<string,boolean>}>();
-      if(!body.status||!['active','paused','cancelled','expired'].includes(body.status)||body.endsAt&&Number.isNaN(Date.parse(body.endsAt))||body.notes&&body.notes.length>1000)return error("Choose a valid module status, optional expiry date and note.");
-      if(body.features&&Object.entries(body.features).some(([key,value])=>!['portfolios','programmes','gantt','timesheets','budgets','risks','change_control','meetings','templates','client_portal','advanced_reports','ai'].includes(key)||typeof value!=="boolean"))return error("Project feature entitlements contain an unsupported feature or invalid value.");
-      const org=await env.DB.prepare(`SELECT id,is_demo as isDemo FROM organizations WHERE id=?`).bind(projectEntitlementMatch[1]).first<{id:string;isDemo:number}>();if(!org)return error("Tenant was not found.",404);if(org.isDemo)return error("The synthetic demo tenant is protected.",403);
-      const before=await env.DB.prepare(`SELECT enabled,features_json as featuresJson FROM organization_modules WHERE organization_id=? AND module_key='projects'`).bind(org.id).first<{enabled:number;featuresJson:string}>();
-      const featureSet=body.features||JSON.parse(before?.featuresJson||"{}");
+    const moduleCatalog = [
+      { key: "hr", label: "HR & People", description: "Employee records, leave, attendance, teams, appraisals and exits." },
+      { key: "payroll", label: "Payroll", description: "Remuneration records, payroll review and employee payslips." },
+      { key: "finance", label: "Expenses & Finance", description: "Expenses, financial requests, approval rules, budgets and purchasing." },
+      { key: "operations", label: "Operations", description: "Tasks, assets, vendors, documents, helpdesk and calendar." },
+      { key: "projects", label: "Project Management", description: "Project plans, portfolios, Gantt, timesheets, budgets and client portal." },
+      { key: "crm", label: "CRM", description: "Customers, contacts, pipeline, quotations and CRM reporting." },
+      { key: "reports", label: "Reports & Analytics", description: "Cross-workspace reports and downloadable operational summaries." },
+    ];
+    const tenantModulesMatch = path.match(/^\/api\/platform\/organizations\/([^/]+)\/modules(?:\/([a-z-]+))?$/);
+    if (tenantModulesMatch && request.method === "GET" && !tenantModulesMatch[2]) {
+      const org = await env.DB.prepare(`SELECT id FROM organizations WHERE id=?`).bind(tenantModulesMatch[1]).first<{ id: string }>();
+      if (!org) return error("Tenant was not found.", 404);
+      const [entitlements, subscriptions] = await Promise.all([
+        env.DB.prepare(`SELECT module_key as moduleKey,enabled,features_json as featuresJson FROM organization_modules WHERE organization_id=?`).bind(org.id).all<{ moduleKey: string; enabled: number; featuresJson: string }>(),
+        env.DB.prepare(`SELECT module_key as moduleKey,plan_code as planCode,status,ends_at as endsAt,notes,CASE WHEN ends_at IS NULL OR datetime(ends_at)>CURRENT_TIMESTAMP THEN 1 ELSE 0 END as withinTerm FROM module_subscriptions WHERE organization_id=?`).bind(org.id).all<{ moduleKey: string; planCode: string; status: string; endsAt: string | null; notes: string | null; withinTerm: number }>(),
+      ]);
+      const entitlementByKey = new Map((entitlements.results || []).map((item) => [item.moduleKey, item]));
+      const subscriptionByKey = new Map((subscriptions.results || []).map((item) => [item.moduleKey, item]));
+      return json({ data: moduleCatalog.map((module) => {
+        const entitlement = entitlementByKey.get(module.key);
+        const subscription = subscriptionByKey.get(module.key);
+        const enabled = entitlement?.enabled === 1 && (!subscription || (subscription.status === "active" && subscription.withinTerm === 1));
+        return { ...module, enabled, status: subscription?.status || (enabled ? "active" : "paused"), planCode: subscription?.planCode || "manual", endsAt: subscription?.endsAt || null, notes: subscription?.notes || "" };
+      }) });
+    }
+    if (tenantModulesMatch && request.method === "PATCH" && tenantModulesMatch[2]) {
+      const module = moduleCatalog.find((item) => item.key === tenantModulesMatch[2]);
+      if (!module) return error("Unknown tenant module.", 404);
+      const body = await request.json<{ status?: string; planCode?: string; endsAt?: string | null; notes?: string }>();
+      if (!body.status || !["active", "paused", "cancelled", "expired"].includes(body.status)) return error("Choose active or inactive module service status.");
+      if ((body.planCode || "").trim().length > 80 || (body.notes || "").trim().length > 1000 || (body.endsAt && Number.isNaN(Date.parse(body.endsAt)))) return error("Check the plan name, expiry date and notes.");
+      if (body.status === "active" && body.endsAt && new Date(`${body.endsAt.slice(0, 10)}T23:59:59Z`).getTime() <= Date.now()) return error("An active module must have an expiry date in the future.");
+      const org = await env.DB.prepare(`SELECT id,is_demo as isDemo FROM organizations WHERE id=?`).bind(tenantModulesMatch[1]).first<{ id: string; isDemo: number }>();
+      if (!org) return error("Tenant was not found.", 404);
+      if (org.isDemo) return error("The synthetic demo tenant is protected.", 403);
+      const before = await env.DB.prepare(`SELECT enabled,features_json as featuresJson FROM organization_modules WHERE organization_id=? AND module_key=?`).bind(org.id, module.key).first<{ enabled: number; featuresJson: string }>();
+      let featuresJson = before?.featuresJson || "{}";
+      if (module.key === "projects" && !before) featuresJson = '{"portfolios":true,"programmes":true,"gantt":true,"timesheets":true,"budgets":true,"risks":true,"change_control":true,"meetings":true,"templates":true,"client_portal":true,"advanced_reports":true,"ai":false}';
+      const enabled = body.status === "active";
+      const planCode = body.planCode?.trim() || "manual";
+      const endsAt = body.endsAt ? `${body.endsAt.slice(0, 10)} 23:59:59` : null;
+      const notes = body.notes?.trim() || null;
       await env.DB.batch([
-        env.DB.prepare(`INSERT INTO organization_modules(organization_id,module_key,enabled,features_json) VALUES(?,'projects',?,?) ON CONFLICT(organization_id,module_key) DO UPDATE SET enabled=excluded.enabled,features_json=excluded.features_json,updated_at=CURRENT_TIMESTAMP`).bind(org.id,body.status==="active"?1:0,JSON.stringify(featureSet)),
-        env.DB.prepare(`INSERT INTO module_subscriptions(id,organization_id,module_key,plan_code,status,activated_by,starts_at,ends_at,notes) VALUES(?,?,'projects',?,?,?,CASE WHEN ?='active' THEN CURRENT_TIMESTAMP ELSE NULL END,?,?) ON CONFLICT(organization_id,module_key) DO UPDATE SET plan_code=excluded.plan_code,status=excluded.status,activated_by=excluded.activated_by,starts_at=excluded.starts_at,ends_at=excluded.ends_at,notes=excluded.notes,updated_at=CURRENT_TIMESTAMP`).bind(`module-sub-${requestId()}`,org.id,body.planCode?.trim()||"manual",body.status,context.userId,body.status,body.endsAt||null,body.notes?.trim()||null),
-        env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_user_id,action,module,record_type,record_id,previous_value_json,new_value_json) VALUES(?,?,?,?,'platform','module_subscription','projects',?,?)`).bind(`audit-${requestId()}`,org.id,context.userId,`projects_${body.status}`,JSON.stringify({enabled:before?.enabled??0}),JSON.stringify({enabled:body.status==="active",planCode:body.planCode||"manual",endsAt:body.endsAt||null,notes:body.notes||null})),
-      ]);return json({ok:true,organizationId:org.id,module:"projects",enabled:body.status==="active",status:body.status});
+        env.DB.prepare(`INSERT INTO organization_modules(organization_id,module_key,enabled,features_json) VALUES(?,?,?,?) ON CONFLICT(organization_id,module_key) DO UPDATE SET enabled=excluded.enabled,features_json=excluded.features_json,updated_at=CURRENT_TIMESTAMP`).bind(org.id, module.key, enabled ? 1 : 0, featuresJson),
+        env.DB.prepare(`INSERT INTO module_subscriptions(id,organization_id,module_key,plan_code,status,activated_by,starts_at,ends_at,notes) VALUES(?,?,?,?,?,?,CASE WHEN ?='active' THEN CURRENT_TIMESTAMP ELSE NULL END,?,?) ON CONFLICT(organization_id,module_key) DO UPDATE SET plan_code=excluded.plan_code,status=excluded.status,activated_by=excluded.activated_by,starts_at=CASE WHEN excluded.status='active' THEN CURRENT_TIMESTAMP ELSE module_subscriptions.starts_at END,ends_at=excluded.ends_at,notes=excluded.notes,updated_at=CURRENT_TIMESTAMP`).bind(`module-sub-${requestId()}`, org.id, module.key, planCode, body.status, context.userId, body.status, endsAt, notes),
+        env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_user_id,action,module,record_type,record_id,previous_value_json,new_value_json) VALUES(?,?,?,?,'platform','module_subscription',?,?,?)`).bind(`audit-${requestId()}`, org.id, context.userId, `module_${module.key}_${body.status}`, module.key, JSON.stringify({ enabled: before?.enabled === 1 }), JSON.stringify({ enabled, status: body.status, planCode, endsAt, notes })),
+      ]);
+      return json({ ok: true, organizationId: org.id, module: module.key, enabled, status: body.status });
     }
 
     const serviceMatch = path.match(/^\/api\/platform\/organizations\/([^/]+)\/service$/);
@@ -1860,7 +1932,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "GET" && path === "/api/me") {
     const user = await env.DB.prepare(`SELECT u.id, u.email, u.full_name as fullName, r.name as role, o.id as organizationId, o.name as organizationName, s.trial_ends_at as trialEndsAt, s.status as subscriptionStatus FROM users u JOIN memberships m ON m.user_id = u.id JOIN roles r ON r.id = m.role_id JOIN organizations o ON o.id = m.organization_id LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE u.id = ? AND o.id = ?`).bind(context.userId, context.organizationId).first();
-    return json({ ...(user || { id: context.userId, role: context.role, organizationId: context.organizationId }), permissions: [...context.permissions], isPlatformAdmin: context.isPlatformAdmin, isDemo: context.isDemo, mfaMandatory: context.mfaMandatory, mfaEnrollmentRequired: context.mfaEnrollmentRequired });
+    const entitlements = await env.DB.prepare(`SELECT m.module_key as moduleKey FROM organization_modules m LEFT JOIN module_subscriptions s ON s.organization_id=m.organization_id AND s.module_key=m.module_key WHERE m.organization_id=? AND m.enabled=1 AND (s.id IS NULL OR (s.status='active' AND (s.ends_at IS NULL OR datetime(s.ends_at)>CURRENT_TIMESTAMP)))`).bind(context.organizationId).all<{ moduleKey: string }>();
+    return json({ ...(user || { id: context.userId, role: context.role, organizationId: context.organizationId }), permissions: [...context.permissions], enabledModules: (entitlements.results || []).map((item) => item.moduleKey), isPlatformAdmin: context.isPlatformAdmin, isDemo: context.isDemo, mfaMandatory: context.mfaMandatory, mfaEnrollmentRequired: context.mfaEnrollmentRequired });
   }
 
   if (path === "/api/settings/organization" && request.method === "GET") {
