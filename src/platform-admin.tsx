@@ -103,8 +103,8 @@ export function PlatformAdminWorkspace() {
   const toggleTenant = async (org: Organization) => {
     const enabled = !Boolean(org.serviceEnabled);
     const message = enabled
-      ? `Enable services for ${org.name}? If its trial expired, this administrator action activates the subscription.`
-      : `Disable services for ${org.name}? All current tenant sessions will be signed out.`;
+      ? `Enable tenant access for ${org.name}? Its subscription must already be active, or its trial must still be valid.`
+      : `Disable tenant access for ${org.name}? All current tenant sessions will be signed out. The subscription will remain unchanged.`;
     if (!window.confirm(message)) return;
     setBusyAction(`service:${org.id}`); setError(""); setNotice("");
     try {
@@ -112,6 +112,28 @@ export function PlatformAdminWorkspace() {
       await load();
       setNotice(`${org.name} services ${enabled ? "enabled" : "disabled"}.`);
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Tenant services could not be updated."); }
+    finally { setBusyAction(""); }
+  };
+
+  const activateSubscription = async (org: Organization) => {
+    const entered = window.prompt(`Subscription term in days for ${org.name}:`, "30");
+    if (entered === null) return;
+    const durationDays = Number(entered.trim());
+    if (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 3650) {
+      setError("Enter a whole-number subscription term from 1 to 3650 days.");
+      return;
+    }
+    const plan = org.plan || "business";
+    if (!window.confirm(`Activate the ${plan} subscription for ${org.name} for ${durationDays} days? This does not enable tenant access; access is managed separately.`)) return;
+    setBusyAction(`subscription:${org.id}`); setError(""); setNotice("");
+    try {
+      await platformApi(`/api/platform/organizations/${encodeURIComponent(org.id)}/subscription`, {
+        method: "PATCH",
+        body: JSON.stringify({ plan, durationDays }),
+      });
+      await load();
+      setNotice(`${org.name}'s ${plan} subscription is active for ${durationDays} days. Tenant access was not changed.`);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Tenant subscription could not be activated."); }
     finally { setBusyAction(""); }
   };
 
@@ -144,7 +166,7 @@ export function PlatformAdminWorkspace() {
     <section className="card platform-card">
       <div className="card-heading"><div><h2>All tenants</h2><p>{orgTotal.toLocaleString()} workspaces, including the protected demo tenant</p></div><form className="platform-search" onSubmit={(event) => { event.preventDefault(); setOrgOffset(0); setQuery(search.trim()); }}><Search size={16} /><input aria-label="Search tenants" placeholder="Search tenants" value={search} onChange={(event) => setSearch(event.target.value)} /><button type="submit">Search</button></form></div>
       <div className="table-scroll"><table><thead><tr><th>Tenant</th><th>Subscription</th><th>Service access</th><th>Plan</th><th>Members</th><th>Employees</th><th>Last activity</th><th>Onboarded</th><th>Manage</th></tr></thead><tbody>
-        {organizations.map((org) => <TenantRows key={org.id} org={org} selected={selectedOrg === org.id} users={tenantUsers} activity={tenantActivity} modules={tenantModules} busyAction={busyAction} onManage={() => void manageTenant(org)} onToggle={() => void toggleTenant(org)} onReset={(user) => void sendPasswordReset(org, user)} onSaveModule={(module, enabled) => void saveModule(org, module, enabled)} onModuleField={(key, field, value) => setTenantModules((items) => items.map((item) => item.key === key ? { ...item, [field]: value } : item))} />)}
+        {organizations.map((org) => <TenantRows key={org.id} org={org} selected={selectedOrg === org.id} users={tenantUsers} activity={tenantActivity} modules={tenantModules} busyAction={busyAction} onManage={() => void manageTenant(org)} onToggle={() => void toggleTenant(org)} onActivateSubscription={() => void activateSubscription(org)} onReset={(user) => void sendPasswordReset(org, user)} onSaveModule={(module, enabled) => void saveModule(org, module, enabled)} onModuleField={(key, field, value) => setTenantModules((items) => items.map((item) => item.key === key ? { ...item, [field]: value } : item))} />)}
         {!loading && !organizations.length && <tr><td colSpan={9} className="platform-empty">No tenants match this search.</td></tr>}
       </tbody></table></div>
       {orgOffset < orgTotal && <div className="platform-more"><button className="button secondary" onClick={() => void loadMoreOrganizations()} disabled={loading}>Load more tenants</button></div>}
@@ -161,7 +183,7 @@ export function PlatformAdminWorkspace() {
   </div>;
 }
 
-function TenantRows({ org, selected, users, activity, modules, busyAction, onManage, onToggle, onReset, onSaveModule, onModuleField }: { org: Organization; selected: boolean; users: TenantUser[]; activity: ActivityEntry[]; modules: TenantModule[]; busyAction: string; onManage: () => void; onToggle: () => void; onReset: (user: TenantUser) => void; onSaveModule: (module: TenantModule, enabled: boolean) => void; onModuleField: (key: string, field: "planCode" | "endsAt" | "notes", value: string) => void }) {
+function TenantRows({ org, selected, users, activity, modules, busyAction, onManage, onToggle, onActivateSubscription, onReset, onSaveModule, onModuleField }: { org: Organization; selected: boolean; users: TenantUser[]; activity: ActivityEntry[]; modules: TenantModule[]; busyAction: string; onManage: () => void; onToggle: () => void; onActivateSubscription: () => void; onReset: (user: TenantUser) => void; onSaveModule: (module: TenantModule, enabled: boolean) => void; onModuleField: (key: string, field: "planCode" | "endsAt" | "notes", value: string) => void }) {
   const enabled = Boolean(org.serviceEnabled);
   return <>
     <tr>
@@ -169,9 +191,9 @@ function TenantRows({ org, selected, users, activity, modules, busyAction, onMan
       <td><span className={`platform-status ${org.subscriptionStatus || org.status}`}>{org.subscriptionStatus || org.status}</span>{org.trialEndsAt && org.subscriptionStatus === "trialing" && <span className="platform-org-meta">Ends {date(org.trialEndsAt)}</span>}</td>
       <td><span className={`platform-status ${enabled ? "active" : "suspended"}`}>{enabled ? "Enabled" : "Disabled"}</span></td>
       <td>{org.plan || "—"}</td><td>{org.members}</td><td>{org.employees}</td><td>{date(org.lastActivity)}</td><td>{date(org.createdAt)}</td>
-      <td className="platform-row-actions"><button className="platform-link-button" onClick={onManage}>{selected ? "Close" : "Manage"}</button><button className="button secondary platform-toggle" onClick={onToggle} disabled={Boolean(org.isDemo) || busyAction === `service:${org.id}`}>{busyAction === `service:${org.id}` ? "Saving…" : enabled ? <><LockKeyhole size={13} /> Disable</> : <><ShieldCheck size={13} /> Enable</>}</button></td>
+      <td className="platform-row-actions"><button className="platform-link-button" onClick={onManage}>{selected ? "Close" : "Manage"}</button><button className="button secondary platform-toggle" onClick={onActivateSubscription} disabled={Boolean(org.isDemo) || busyAction === `subscription:${org.id}`}>{busyAction === `subscription:${org.id}` ? "Saving…" : org.subscriptionStatus === "active" ? "Renew subscription" : "Activate subscription"}</button><button className="button secondary platform-toggle" onClick={onToggle} disabled={Boolean(org.isDemo) || busyAction === `service:${org.id}` || ( !enabled && org.subscriptionStatus !== "active" && !(org.subscriptionStatus === "trialing" && org.trialEndsAt && new Date(`${org.trialEndsAt.replace(" ", "T")}Z`).getTime() > Date.now()))}>{busyAction === `service:${org.id}` ? "Saving…" : enabled ? <><LockKeyhole size={13} /> Disable access</> : <><ShieldCheck size={13} /> Enable access</>}</button></td>
     </tr>
-    {selected && <tr><td colSpan={9} className="platform-members-cell"><div className="platform-members"><div className="platform-members-heading"><div><strong>Tenant maintenance</strong><span>{users.length} tenant accounts · tenant-wide service access is managed above</span></div></div>
+    {selected && <tr><td colSpan={9} className="platform-members-cell"><div className="platform-members"><div className="platform-members-heading"><div><strong>Tenant maintenance</strong><span>{users.length} tenant accounts · subscription and tenant access are independent controls above</span></div></div>
       <section className="platform-modules"><div className="platform-members-heading"><div><strong>Subscribed services and modules</strong><span>Turn each service on or off for this tenant. Module access is enforced by the application and recorded in the audit log.</span></div></div>{Boolean(org.isDemo) && <p className="platform-reset-note">The synthetic demo tenant is protected; module controls are read-only.</p>}<div className="platform-module-grid">{modules.map((module) => <article className="platform-module" key={module.key}><div className="platform-module-top"><div><strong>{module.label}</strong><span>{module.description}</span></div><span className={`platform-status ${module.enabled ? "active" : "suspended"}`}>{module.enabled ? "Active" : module.status}</span></div><div className="platform-module-fields"><label>Plan / scope<input aria-label={`${module.label} plan or scope`} value={module.planCode} maxLength={80} disabled={Boolean(org.isDemo)} onChange={(event) => onModuleField(module.key, "planCode", event.target.value)} /></label><label>Access through<input aria-label={`${module.label} access expiry`} type="date" value={module.endsAt?.slice(0, 10) || ""} disabled={Boolean(org.isDemo)} onChange={(event) => onModuleField(module.key, "endsAt", event.target.value)} /></label></div><label className="platform-module-notes">Scope notes<textarea aria-label={`${module.label} scope notes`} value={module.notes} maxLength={1000} disabled={Boolean(org.isDemo)} onChange={(event) => onModuleField(module.key, "notes", event.target.value)} rows={2} /></label><button className={`button ${module.enabled ? "secondary" : "primary"}`} disabled={Boolean(org.isDemo) || busyAction === `module:${org.id}:${module.key}`} onClick={() => onSaveModule(module, !module.enabled)}>{busyAction === `module:${org.id}:${module.key}` ? "Saving…" : module.enabled ? "Turn off module" : "Activate module"}</button></article>)}</div><p className="platform-reset-note">A module can be activated only while the tenant-wide service is enabled and its subscription or trial is valid. Setting an end date automatically expires the module.</p></section>
       <div className="table-scroll"><table><thead><tr><th>Name</th><th>Email</th><th>Role</th><th>Account</th><th>Verified</th><th>Admin recovery</th></tr></thead><tbody>
       {users.map((user) => { const isTenantAdmin = user.role === "Organization Admin" || user.role === "CEO"; return <tr key={user.id}><td><strong>{user.fullName}</strong></td><td>{user.email}</td><td>{user.role}</td><td>{user.status}</td><td>{user.emailVerifiedAt ? "Yes" : "No"}</td><td>{isTenantAdmin ? <button className="platform-reset-button" onClick={() => onReset(user)} disabled={!user.emailVerifiedAt || user.status !== "active" || Boolean(org.isDemo) || busyAction === `reset:${user.id}`}>{busyAction === `reset:${user.id}` ? "Sending…" : <><KeyRound size={13} /> Send hard-reset link</>}</button> : <span className="platform-reset-note">Admin only</span>}</td></tr>; })}

@@ -492,10 +492,11 @@ function requiredTenantModule(path: string): string | null {
 }
 
 async function workspaceAccessError(env: Env, organizationId: string) {
-  const workspace = await env.DB.prepare(`SELECT o.status as organizationStatus, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt FROM organizations o LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE o.id = ?`).bind(organizationId).first<{ organizationStatus: string; subscriptionStatus: string | null; trialEndsAt: string | null }>();
+  const workspace = await env.DB.prepare(`SELECT o.status as organizationStatus, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt, s.renews_at as renewsAt FROM organizations o LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE o.id = ?`).bind(organizationId).first<{ organizationStatus: string; subscriptionStatus: string | null; trialEndsAt: string | null; renewsAt: string | null }>();
   if (!workspace) return "The organization workspace is unavailable. Contact Zyntris support.";
   const trialExpired = workspace.subscriptionStatus === "expired" || (workspace.subscriptionStatus === "trialing" && (!workspace.trialEndsAt || new Date(`${workspace.trialEndsAt.replace(" ", "T")}Z`).getTime() <= Date.now()));
-  if (trialExpired) return "This organization’s trial has ended and its services are off. Contact Zyntris to reactivate the workspace.";
+  const paidTermExpired = workspace.subscriptionStatus === "active" && Boolean(workspace.renewsAt) && new Date(`${workspace.renewsAt!.replace(" ", "T")}Z`).getTime() <= Date.now();
+  if (trialExpired || paidTermExpired) return "This organization’s subscription has ended and its services are off. Contact Zyntris to reactivate the workspace.";
   if (workspace.organizationStatus === "suspended" || !["active", "trialing"].includes(workspace.subscriptionStatus || "")) return "This organization’s services are currently disabled. Contact your Zyntris administrator.";
   return null;
 }
@@ -1904,30 +1905,48 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       return json({ ok: true, organizationId: org.id, module: module.key, enabled, status: body.status });
     }
 
+    const subscriptionMatch = path.match(/^\/api\/platform\/organizations\/([^/]+)\/subscription$/);
+    if (request.method === "PATCH" && subscriptionMatch) {
+      const body = await request.json<{ plan?: string; durationDays?: number }>();
+      const plan = body.plan || "business";
+      const durationDays = body.durationDays ?? 30;
+      if (!["starter", "business", "enterprise"].includes(plan)) return error("Choose a valid subscription plan.");
+      if (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 3650) return error("Subscription term must be between 1 and 3650 days.");
+      const org = await env.DB.prepare(`SELECT o.id, o.name, o.is_demo as isDemo, s.plan, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt, s.renews_at as renewsAt FROM organizations o LEFT JOIN subscriptions s ON s.organization_id=o.id WHERE o.id=?`).bind(subscriptionMatch[1]).first<{ id: string; name: string; isDemo: number; plan: string | null; subscriptionStatus: string | null; trialEndsAt: string | null; renewsAt: string | null }>();
+      if (!org) return error("Tenant was not found.", 404);
+      if (org.isDemo) return error("The synthetic demo tenant is protected and cannot be changed.", 403);
+      if (!org.subscriptionStatus) return error("This tenant has no subscription record; contact support to provision one.", 409);
+      await env.DB.batch([
+        env.DB.prepare(`UPDATE subscriptions SET plan=?,status='active',trial_ends_at=NULL,renews_at=datetime('now', '+' || ? || ' days') WHERE organization_id=?`).bind(plan, durationDays, org.id),
+        env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_user_id,action,module,record_type,record_id,previous_value_json,new_value_json) VALUES(?,?,?,'tenant_subscription_activated','platform','subscription',?,?,?)`).bind(`audit-${crypto.randomUUID()}`, org.id, context.userId, org.id, JSON.stringify({ plan: org.plan, status: org.subscriptionStatus, trialEndsAt: org.trialEndsAt, renewsAt: org.renewsAt }), JSON.stringify({ plan, status: "active", durationDays })),
+      ]);
+      const renewed = await env.DB.prepare(`SELECT renews_at as renewsAt FROM subscriptions WHERE organization_id=?`).bind(org.id).first<{ renewsAt: string | null }>();
+      return json({ ok: true, organizationId: org.id, plan, subscriptionStatus: "active", renewsAt: renewed?.renewsAt || null });
+    }
+
     const serviceMatch = path.match(/^\/api\/platform\/organizations\/([^/]+)\/service$/);
     if (request.method === "PATCH" && serviceMatch) {
       const body = await request.json<{ enabled?: boolean }>();
       if (typeof body.enabled !== "boolean") return error("Choose whether tenant services should be enabled or disabled.");
-      const org = await env.DB.prepare(`SELECT o.id, o.name, o.status, o.is_demo as isDemo, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt FROM organizations o LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE o.id = ?`).bind(serviceMatch[1]).first<{ id: string; name: string; status: string; isDemo: number; subscriptionStatus: string | null; trialEndsAt: string | null }>();
+      const org = await env.DB.prepare(`SELECT o.id, o.name, o.status, o.is_demo as isDemo, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt, s.renews_at as renewsAt FROM organizations o LEFT JOIN subscriptions s ON s.organization_id = o.id WHERE o.id = ?`).bind(serviceMatch[1]).first<{ id: string; name: string; status: string; isDemo: number; subscriptionStatus: string | null; trialEndsAt: string | null; renewsAt: string | null }>();
       if (!org) return error("Tenant was not found.", 404);
       if (org.isDemo) return error("The synthetic demo tenant is protected and cannot be toggled.", 403);
       if (body.enabled && !org.subscriptionStatus) return error("This tenant has no subscription record; service cannot be enabled.", 409);
 
-      let subscriptionStatus = org.subscriptionStatus;
       let organizationStatus = "suspended";
       if (body.enabled) {
         const trialValid = org.subscriptionStatus === "trialing" && Boolean(org.trialEndsAt) && new Date(`${org.trialEndsAt!.replace(" ", "T")}Z`).getTime() > Date.now();
-        subscriptionStatus = org.subscriptionStatus === "active" || trialValid ? org.subscriptionStatus : "active";
-        organizationStatus = subscriptionStatus === "trialing" ? "trial" : "active";
+        const activeTermValid = org.subscriptionStatus === "active" && (!org.renewsAt || new Date(`${org.renewsAt.replace(" ", "T")}Z`).getTime() > Date.now());
+        if (!activeTermValid && !trialValid) return error("Activate or renew this tenant’s subscription before enabling access.", 409);
+        organizationStatus = org.subscriptionStatus === "trialing" ? "trial" : "active";
       }
       const platformStatements = [];
-      if (body.enabled) platformStatements.push(env.DB.prepare(`UPDATE subscriptions SET status = ? WHERE organization_id = ?`).bind(subscriptionStatus, org.id));
       platformStatements.push(env.DB.prepare(`UPDATE organizations SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(organizationStatus, org.id));
       if (!body.enabled) platformStatements.push(env.DB.prepare(`DELETE FROM sessions WHERE organization_id = ?`).bind(org.id));
       platformStatements.push(env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id, previous_value_json, new_value_json) VALUES (?, ?, ?, ?, 'platform', 'organization', ?, ?, ?)`)
-        .bind(`audit-${crypto.randomUUID()}`, org.id, context.userId, body.enabled ? "tenant_services_enabled" : "tenant_services_disabled", org.id, JSON.stringify({ organizationStatus: org.status, subscriptionStatus: org.subscriptionStatus }), JSON.stringify({ organizationStatus, subscriptionStatus })));
+        .bind(`audit-${crypto.randomUUID()}`, org.id, context.userId, body.enabled ? "tenant_access_enabled" : "tenant_access_disabled", org.id, JSON.stringify({ organizationStatus: org.status, subscriptionStatus: org.subscriptionStatus }), JSON.stringify({ organizationStatus, subscriptionStatus: org.subscriptionStatus })));
       await env.DB.batch(platformStatements);
-      return json({ ok: true, organizationId: org.id, enabled: body.enabled, organizationStatus, subscriptionStatus });
+      return json({ ok: true, organizationId: org.id, enabled: body.enabled, organizationStatus, subscriptionStatus: org.subscriptionStatus });
     }
 
     const organizationUsersMatch = path.match(/^\/api\/platform\/organizations\/([^/]+)\/users$/);
@@ -1971,7 +1990,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (path === "/api/platform/summary") {
       const summary = await env.DB.prepare(`
         SELECT COUNT(*) as organizations,
-          SUM(CASE WHEN o.status != 'suspended' AND (s.status = 'active' OR (s.status = 'trialing' AND s.trial_ends_at > CURRENT_TIMESTAMP)) THEN 1 ELSE 0 END) as active,
+          SUM(CASE WHEN o.status != 'suspended' AND ((s.status = 'active' AND (s.renews_at IS NULL OR s.renews_at > CURRENT_TIMESTAMP)) OR (s.status = 'trialing' AND s.trial_ends_at > CURRENT_TIMESTAMP)) THEN 1 ELSE 0 END) as active,
           SUM(CASE WHEN s.status = 'trialing' AND s.trial_ends_at > CURRENT_TIMESTAMP AND o.status != 'suspended' THEN 1 ELSE 0 END) as trialing,
           SUM(CASE WHEN o.status = 'suspended' OR s.status = 'expired' THEN 1 ELSE 0 END) as suspended,
           (SELECT COUNT(DISTINCT m.user_id) FROM memberships m) as users,
@@ -1991,7 +2010,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
         env.DB.prepare(`
           SELECT o.id, o.name, o.slug, o.industry, o.status, o.is_demo as isDemo, o.created_at as createdAt,
             s.plan, s.status as subscriptionStatus, s.trial_ends_at as trialEndsAt,
-            CASE WHEN o.status != 'suspended' AND s.status IN ('active','trialing') AND (s.status != 'trialing' OR s.trial_ends_at > CURRENT_TIMESTAMP) THEN 1 ELSE 0 END as serviceEnabled,
+            CASE WHEN o.status != 'suspended' AND ((s.status='active' AND (s.renews_at IS NULL OR s.renews_at>CURRENT_TIMESTAMP)) OR (s.status='trialing' AND s.trial_ends_at>CURRENT_TIMESTAMP)) THEN 1 ELSE 0 END as serviceEnabled,
             (SELECT COUNT(*) FROM memberships m WHERE m.organization_id = o.id AND m.status = 'active') as members,
             (SELECT COUNT(*) FROM employees e WHERE e.organization_id = o.id AND e.deleted_at IS NULL) as employees,
             (SELECT MAX(a.created_at) FROM audit_logs a WHERE a.organization_id = o.id) as lastActivity
@@ -4006,6 +4025,20 @@ async function expireTrials(env: Env) {
   }
 }
 
+async function expirePaidSubscriptions(env: Env) {
+  const expired = await env.DB.prepare(`SELECT organization_id as organizationId FROM subscriptions WHERE status='active' AND renews_at IS NOT NULL AND renews_at<=CURRENT_TIMESTAMP AND organization_id IN (SELECT id FROM organizations WHERE is_demo=0)`).all<{ organizationId: string }>();
+  const due = expired.results || [];
+  for (let offset = 0; offset < due.length; offset += 30) {
+    const statements = due.slice(offset, offset + 30).flatMap(({ organizationId }) => [
+      env.DB.prepare(`UPDATE subscriptions SET status='expired' WHERE organization_id=? AND status='active' AND renews_at IS NOT NULL AND renews_at<=CURRENT_TIMESTAMP`).bind(organizationId),
+      env.DB.prepare(`UPDATE organizations SET status='suspended',updated_at=CURRENT_TIMESTAMP WHERE id=? AND is_demo=0 AND EXISTS(SELECT 1 FROM subscriptions WHERE organization_id=? AND status='expired')`).bind(organizationId, organizationId),
+      env.DB.prepare(`DELETE FROM sessions WHERE organization_id=? AND EXISTS(SELECT 1 FROM organizations o JOIN subscriptions s ON s.organization_id=o.id WHERE o.id=? AND o.status='suspended' AND s.status='expired')`).bind(organizationId, organizationId),
+      env.DB.prepare(`INSERT INTO audit_logs(id,organization_id,actor_user_id,action,module,record_type,record_id,new_value_json) SELECT ?,?,NULL,'subscription_expired_access_disabled','platform','organization',?,? FROM organizations o JOIN subscriptions s ON s.organization_id=o.id WHERE o.id=? AND o.status='suspended' AND s.status='expired'`).bind(`audit-${crypto.randomUUID()}`, organizationId, organizationId, JSON.stringify({ subscriptionStatus: "expired", serviceEnabled: false }), organizationId),
+    ]);
+    if (statements.length) await env.DB.batch(statements);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     try {
@@ -4057,6 +4090,7 @@ export default {
       }
     }
     await expireTrials(env);
+    await expirePaidSubscriptions(env);
     const expiredModules=await env.DB.prepare(`SELECT id,organization_id as organizationId,module_key as moduleKey FROM module_subscriptions WHERE status='active' AND ends_at IS NOT NULL AND ends_at<=CURRENT_TIMESTAMP LIMIT 200`).all<{id:string;organizationId:string;moduleKey:string}>();
     for(const item of expiredModules.results||[]){
       await env.DB.batch([
