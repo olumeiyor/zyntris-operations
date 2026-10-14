@@ -17,7 +17,7 @@ import { Appraisals } from "./appraisals";
 import { HRTalentWorkspace } from "./hr-talent";
 import { ExitManagement } from "./exit-management";
 import { AnnouncementsWorkspace, GoalsWorkspace } from "./company-modules";
-import { ProjectDeliveryControls, ProjectSubscriptionRequest, ProjectTemplatesAndPortal, WorkCalendarConnections, WorkCalendarWorkspace, WorkLeaveWorkspace, WorkProjectsWorkspace, WorkTasksWorkspace } from "./workspaces";
+import { ProjectDeliveryControls, ProjectTemplatesAndPortal, WorkCalendarConnections, WorkCalendarWorkspace, WorkLeaveWorkspace, WorkProjectsWorkspace, WorkTasksWorkspace } from "./workspaces";
 import type { DashboardData, Employee, LeaveRequest, PageId, Task } from "./types";
 import { SESSION_IDLE_TIMEOUT_MS, SESSION_IDLE_TIMEOUT_MINUTES } from "./session-policy";
 
@@ -338,7 +338,7 @@ export default function App() {
           {page === "goals" && <GoalsWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "announcements" && <AnnouncementsWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "tasks" && <WorkTasksWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
-          {page === "projects" && <><WorkProjectsWorkspace canManage={userPermissions.has("projects.manage") || userPermissions.has("projects.edit") || userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><ProjectSubscriptionRequest canManage={userPermissions.has("projects.billing.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><ProjectDeliveryControls canManage={userPermissions.has("projects.manage") || userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><ProjectTemplatesAndPortal canManage={userPermissions.has("projects.manage")} canPortal={userPermissions.has("projects.client_portal.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /></>}
+          {page === "projects" && <><WorkProjectsWorkspace canManage={userPermissions.has("projects.manage") || userPermissions.has("projects.edit") || userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><ProjectDeliveryControls canManage={userPermissions.has("projects.manage") || userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><ProjectTemplatesAndPortal canManage={userPermissions.has("projects.manage")} canPortal={userPermissions.has("projects.client_portal.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /></>}
           {page === "calendar" && <><WorkCalendarWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><WorkCalendarConnections canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /></>}
           {page === "customers" && <CrmWorkspace onToast={setToast} canManageCrm={userPermissions.has("crm.manage")} canConfigure={userPermissions.has("crm.configure")} canQuotes={userPermissions.has("crm.quotes.manage")} canReport={userPermissions.has("crm.report")} canImport={userPermissions.has("crm.import")} />}
           {(["expenses", "requests", "budgets", "assets", "vendors", "helpdesk"] as PageId[]).includes(page) && <OperationalWorkspace page={page} role={user.role} onToast={setToast} />}

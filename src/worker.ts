@@ -395,7 +395,6 @@ function hasPermission(context: AuthContext, permission: string) {
 }
 
 function requiredTenantModule(path: string): string | null {
-  if (path === "/api/projects/subscription") return null;
   if (path === "/api/projects" || path.startsWith("/api/projects/")) return "projects";
   if (path === "/api/crm" || path.startsWith("/api/crm/") || path === "/api/customers" || path.startsWith("/api/customers/")) return "crm";
   if (path === "/api/payroll" || path.startsWith("/api/payroll/")) return "payroll";
@@ -2085,10 +2084,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const projectPath=path==="/api/projects"||path.startsWith("/api/projects/");
   if(projectPath){
     if(!hasPermission(context,"projects.view")&&!hasPermission(context,"projects.manage")&&!hasPermission(context,"operations.view"))return error("Project access is not enabled for this account.",403);
-    if(path!=="/api/projects/subscription"){
-      const entitlement=await env.DB.prepare(`SELECT enabled FROM organization_modules WHERE organization_id=? AND module_key='projects'`).bind(context.organizationId).first<{enabled:number}>();
-      if(!entitlement||entitlement.enabled!==1)return error("The Projects module is not included in this organization's entitlements.",403);
-    }
+    const entitlement=await env.DB.prepare(`SELECT enabled FROM organization_modules WHERE organization_id=? AND module_key='projects'`).bind(context.organizationId).first<{enabled:number}>();
+    if(!entitlement||entitlement.enabled!==1)return error("The Projects module is not active for this organization. Contact your platform administrator.",403);
   }
 
   const crmRoute = path === "/api/crm" || path.startsWith("/api/crm/");
@@ -3200,24 +3197,9 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     }
   }
 
-  if(path==="/api/projects/subscription"){
-    if(request.method==="GET"){
-      const [module,subscription]=await Promise.all([
-        env.DB.prepare(`SELECT enabled,features_json as featuresJson,updated_at as updatedAt FROM organization_modules WHERE organization_id=? AND module_key='projects'`).bind(context.organizationId).first(),
-        env.DB.prepare(`SELECT plan_code as planCode,status,billing_contact as billingContact,starts_at as startsAt,ends_at as endsAt,notes,created_at as requestedAt FROM module_subscriptions WHERE organization_id=? AND module_key='projects'`).bind(context.organizationId).first(),
-      ]);return json({module:module||{enabled:0,featuresJson:"{}"},subscription:subscription||null});
-    }
-    if(request.method==="POST"){
-      if(!hasPermission(context,"projects.billing.manage"))return error("Organization administrator permission is required to request a Projects subscription.",403);
-      const body=await request.json<{billingContact?:string;planCode?:string;notes?:string}>();if(body.billingContact&&!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.billingContact)||body.notes&&body.notes.length>1000)return error("Enter a valid billing email and a short request note.");
-      const existing=await env.DB.prepare(`SELECT status FROM module_subscriptions WHERE organization_id=? AND module_key='projects'`).bind(context.organizationId).first<{status:string}>();if(existing?.status==="active")return error("Projects is already active for this organization.",409);
-      const id=`module-sub-${requestId()}`;await env.DB.prepare(`INSERT INTO module_subscriptions(id,organization_id,module_key,plan_code,status,billing_contact,requested_by,notes) VALUES(?,?,'projects',?,'pending',?,?,?) ON CONFLICT(organization_id,module_key) DO UPDATE SET plan_code=excluded.plan_code,status='pending',billing_contact=excluded.billing_contact,requested_by=excluded.requested_by,notes=excluded.notes,updated_at=CURRENT_TIMESTAMP`).bind(id,context.organizationId,body.planCode?.trim()||"manual",body.billingContact?.trim().toLowerCase()||context.email,context.userId,body.notes?.trim()||null).run();await audit(env,context,"requested","module_subscriptions",id,{module:"projects",plan:body.planCode||"manual",billingContact:body.billingContact||context.email});return json({status:"pending",message:"Your request is recorded. The Zyntris Business Development team must confirm commercial terms and activate the module."},{status:201});
-    }
-  }
-
   const projectPortfolioPath=path==="/api/projects/portfolios";
   if(projectPortfolioPath){
-    const entitlement=await env.DB.prepare(`SELECT enabled,features_json as featuresJson FROM organization_modules WHERE organization_id=? AND module_key='projects'`).bind(context.organizationId).first<{enabled:number;featuresJson:string}>();if(!entitlement||entitlement.enabled!==1)return error("The Projects module is not active for this organization.",403);let portfolioFeatures:Record<string,boolean>={};try{portfolioFeatures=JSON.parse(entitlement.featuresJson||"{}");}catch{}if(portfolioFeatures.portfolios===false)return error("Portfolios are not included in this organization's Projects subscription.",403);
+    const entitlement=await env.DB.prepare(`SELECT enabled,features_json as featuresJson FROM organization_modules WHERE organization_id=? AND module_key='projects'`).bind(context.organizationId).first<{enabled:number;featuresJson:string}>();if(!entitlement||entitlement.enabled!==1)return error("The Projects module is not active for this organization. Contact your platform administrator.",403);let portfolioFeatures:Record<string,boolean>={};try{portfolioFeatures=JSON.parse(entitlement.featuresJson||"{}");}catch{}if(portfolioFeatures.portfolios===false)return error("Portfolios are not enabled for this organization. Contact your platform administrator.",403);
     if(request.method==="GET"){
       const rows=await env.DB.prepare(`SELECT f.id,f.name,f.description,f.status,f.owner_id as ownerId,u.full_name as owner,COUNT(p.id) as projectCount,COALESCE(SUM(p.budget_minor),0) as budgetMinor,COALESCE(AVG(p.progress),0) as progress FROM project_portfolios f LEFT JOIN users u ON u.id=f.owner_id LEFT JOIN projects p ON p.portfolio_id=f.id AND p.organization_id=f.organization_id WHERE f.organization_id=? GROUP BY f.id ORDER BY f.name`).bind(context.organizationId).all();
       return json({data:rows.results||[]});
@@ -3235,8 +3217,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const [,projectId,feature,subId]=projectFeaturePath;
     const featureKey:Record<string,string>={timeline:"gantt",phases:"gantt",dependencies:"gantt",timesheets:"timesheets",budget:"budgets",changes:"change_control",meetings:"meetings",decisions:"meetings",templates:"templates","client-portal":"client_portal",reports:"advanced_reports"};
     const entitlement=await env.DB.prepare(`SELECT enabled,features_json as featuresJson FROM organization_modules WHERE organization_id=? AND module_key='projects'`).bind(context.organizationId).first<{enabled:number;featuresJson:string}>();
-    if(!entitlement||entitlement.enabled!==1)return error("The Projects module is not active for this organization.",403);
-    if(featureKey[feature]){let features:Record<string,boolean>={};try{features=JSON.parse(entitlement.featuresJson||"{}");}catch{}if(features[featureKey[feature]]===false)return error(`The ${featureKey[feature].replaceAll("_"," ")} feature is not enabled for this organization's Projects subscription.`,403);}
+    if(!entitlement||entitlement.enabled!==1)return error("The Projects module is not active for this organization. Contact your platform administrator.",403);
+    if(featureKey[feature]){let features:Record<string,boolean>={};try{features=JSON.parse(entitlement.featuresJson||"{}");}catch{}if(features[featureKey[feature]]===false)return error(`The ${featureKey[feature].replaceAll("_"," ")} feature is not enabled for this organization. Contact your platform administrator.`,403);}
     const canManageProject=hasPermission(context,"projects.manage")||hasPermission(context,"operations.manage");
     const canSeeProjects=hasPermission(context,"projects.view.all")||canManageProject;
     const employee=await env.DB.prepare(`SELECT id FROM employees WHERE organization_id=? AND user_id=? AND deleted_at IS NULL LIMIT 1`).bind(context.organizationId,context.userId).first<{id:string}>();
