@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { allowedBrowserOrigin, isTenantBackupObjectKey, isTenantObjectKey, tenantBackupKey, tenantDocumentKey, tenantReceiptKey } from "../src/security-boundaries.ts";
+import { allowedBrowserOrigin, isTenantBackupObjectKey, isTenantObjectKey, requestSessionToken, tenantBackupKey, tenantDocumentKey, tenantReceiptKey } from "../src/security-boundaries.ts";
 
 test("browser mutations require the configured origin or same-origin referer", () => {
   const app = "https://app.zyntris.org";
@@ -10,6 +10,15 @@ test("browser mutations require the configured origin or same-origin referer", (
   assert.equal(allowedBrowserOrigin(null, null, app), false);
   assert.equal(allowedBrowserOrigin("null", null, app), false);
   assert.equal(allowedBrowserOrigin("https://app.zyntris.org.evil.example", null, app), false);
+});
+
+test("mobile APIs require a bearer token and never fall back to browser cookies", () => {
+  const token = "a".repeat(64);
+  const cookie = "b".repeat(64);
+  assert.equal(requestSessionToken(true, null, cookie), null);
+  assert.equal(requestSessionToken(true, "Basic abc", cookie), null);
+  assert.equal(requestSessionToken(true, `Bearer ${token}`, cookie), token);
+  assert.equal(requestSessionToken(false, null, cookie), cookie);
 });
 
 test("tenant storage keys cannot cross tenant prefixes", () => {

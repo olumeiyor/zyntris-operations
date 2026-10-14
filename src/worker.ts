@@ -1,6 +1,7 @@
-import { allowedBrowserOrigin, isTenantObjectKey, isTenantBackupObjectKey, tenantBackupKey, tenantDocumentKey, tenantReceiptKey } from "./security-boundaries";
+import { allowedBrowserOrigin, isTenantObjectKey, isTenantBackupObjectKey, requestSessionToken, tenantBackupKey, tenantDocumentKey, tenantReceiptKey } from "./security-boundaries";
 import { configurePasswordHashWasm, passwordHash, verifyPassword } from "./password-hashing";
 import { SESSION_IDLE_TIMEOUT_SQL } from "./session-policy";
+import { signedR2Fetch } from "./r2-sigv4";
 // Wrangler imports these as precompiled WebAssembly.Module values. Registering
 // them prevents the Argon2 library from calling WebAssembly.compile at runtime,
 // which Cloudflare Workers intentionally disallows for embedded Wasm bytes.
@@ -15,6 +16,10 @@ export interface Env {
   DB: D1Database;
   FILES: R2Bucket;
   BACKUPS: R2Bucket;
+  R2_BACKUP_ACCOUNT_ID?: string;
+  R2_BACKUP_BUCKET?: string;
+  R2_BACKUP_ACCESS_KEY_ID?: string;
+  R2_BACKUP_SECRET_ACCESS_KEY?: string;
   ASSETS: Fetcher;
   APP_ORIGIN: string;
   ENVIRONMENT: string;
@@ -71,14 +76,93 @@ const BACKUP_TABLES = [
 
 const isoDate = (value: string) => /^\d{4}-\d{2}-\d{2}$/.test(value) && !Number.isNaN(Date.parse(`${value}T00:00:00Z`)) && new Date(`${value}T00:00:00Z`).toISOString().slice(0, 10) === value;
 
-async function getTenantBackupObject(env: Env, organizationId: string, backupId: string, key: string) {
+type BackupObject = { body: ReadableStream<Uint8Array> | null; httpMetadata?: { contentType?: string }; text(): Promise<string> };
+type BackupStorageTarget = "local" | "external_r2";
+
+function externalBackupConfig(env: Env) {
+  const accountId = env.R2_BACKUP_ACCOUNT_ID?.trim();
+  const bucket = env.R2_BACKUP_BUCKET?.trim();
+  const accessKeyId = env.R2_BACKUP_ACCESS_KEY_ID?.trim();
+  const secretAccessKey = env.R2_BACKUP_SECRET_ACCESS_KEY?.trim();
+  if (!accountId || !/^[a-f0-9]{32}$/i.test(accountId) || !bucket || !/^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$/.test(bucket) || !accessKeyId || !secretAccessKey) {
+    throw new Error("Independent backup storage is not configured. Set the external R2 account, bucket, Access Key ID, and Secret Access Key before creating backups.");
+  }
+  return { accountId, bucket, accessKeyId, secretAccessKey };
+}
+
+function externalBackupUrl(env: Env, key: string, query?: URLSearchParams) {
+  const { accountId, bucket } = externalBackupConfig(env);
+  const encodedKey = key.split("/").map(encodeURIComponent).join("/");
+  const url = new URL(`https://${accountId}.r2.cloudflarestorage.com/${encodeURIComponent(bucket)}${encodedKey ? `/${encodedKey}` : ""}`);
+  if (query) url.search = query.toString();
+  return url;
+}
+
+async function externalBackupRequest(env: Env, key: string, init: RequestInit = {}, query?: URLSearchParams) {
+  const { accessKeyId, secretAccessKey } = externalBackupConfig(env);
+  try {
+    return await signedR2Fetch(externalBackupUrl(env, key, query), init, accessKeyId, secretAccessKey);
+  } catch {
+    throw new Error("The independent backup storage could not be reached.");
+  }
+}
+
+async function putExternalBackupObject(env: Env, key: string, body: BodyInit, contentType: string) {
+  const response = await externalBackupRequest(env, key, { method: "PUT", headers: { "content-type": contentType }, body });
+  if (!response.ok) throw new Error(`Independent backup storage rejected an object write (HTTP ${response.status}).`);
+}
+
+async function getExternalBackupObject(env: Env, key: string): Promise<BackupObject | null> {
+  const response = await externalBackupRequest(env, key);
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`Independent backup storage could not read an object (HTTP ${response.status}).`);
+  const contentType = response.headers.get("content-type") || undefined;
+  return { body: response.body, httpMetadata: contentType ? { contentType } : undefined, text: () => response.text() };
+}
+
+async function listExternalBackupKeys(env: Env, prefix: string) {
+  const keys: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const query = new URLSearchParams({ "list-type": "2", prefix });
+    if (cursor) query.set("continuation-token", cursor);
+    const response = await externalBackupRequest(env, "", { method: "GET" }, query);
+    if (!response.ok) throw new Error(`Independent backup storage could not list objects (HTTP ${response.status}).`);
+    const xml = await response.text();
+    const unescapeXml = (value: string) => value.replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos);/gi, (match, entity: string) => {
+      if (entity === "amp") return "&";
+      if (entity === "lt") return "<";
+      if (entity === "gt") return ">";
+      if (entity === "quot") return '"';
+      if (entity === "apos") return "'";
+      const code = entity[1]?.toLowerCase() === "x" ? Number.parseInt(entity.slice(2), 16) : Number.parseInt(entity.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    });
+    for (const entry of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
+      const key = entry[1].match(/<Key>([\s\S]*?)<\/Key>/)?.[1];
+      if (key) keys.push(unescapeXml(key));
+    }
+    const truncated = /<IsTruncated>true<\/IsTruncated>/i.test(xml);
+    cursor = truncated ? unescapeXml(xml.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/i)?.[1] || "") : undefined;
+    if (truncated && !cursor) throw new Error("Independent backup storage returned an invalid list continuation token.");
+  } while (cursor);
+  return keys;
+}
+
+async function deleteExternalBackupObject(env: Env, key: string) {
+  const response = await externalBackupRequest(env, key, { method: "DELETE" });
+  if (!response.ok && response.status !== 404) throw new Error(`Independent backup storage could not delete an expired object (HTTP ${response.status}).`);
+}
+
+async function getTenantBackupObject(env: Env, organizationId: string, backupId: string, key: string, target: BackupStorageTarget = "local"): Promise<BackupObject | null> {
   if (!isTenantBackupObjectKey(key, organizationId, backupId)) return null;
-  // New snapshots are in a dedicated bucket; fall back to the application bucket
-  // only for snapshots written before the backup-target migration.
+  if (target === "external_r2") return getExternalBackupObject(env, key);
+  // Legacy snapshots remain readable from the original same-account buckets.
   return await env.BACKUPS.get(key) || await env.FILES.get(key);
 }
 
 async function createTenantBackup(env: Env, organizationId: string, createdBy: string) {
+  externalBackupConfig(env);
   const id = `backup-${crypto.randomUUID()}`;
   const tableSnapshots = await env.DB.batch(BACKUP_TABLES.map((table) => env.DB.prepare(`SELECT * FROM ${table} WHERE organization_id = ?`).bind(organizationId)));
   const tables: Record<string, unknown[]> = {};
@@ -91,15 +175,15 @@ async function createTenantBackup(env: Env, organizationId: string, createdBy: s
     const source = await env.FILES.get(doc.r2_key);
     if (!source) throw new Error("A referenced document is missing from R2 storage.");
     const backupKey = tenantBackupKey(organizationId, id, `files/${await hashToken(doc.r2_key)}`);
-    await env.BACKUPS.put(backupKey, source.body, { httpMetadata: source.httpMetadata, customMetadata: { originalKeyHash: await hashToken(doc.r2_key) } });
+    await putExternalBackupObject(env, backupKey, await source.arrayBuffer(), source.httpMetadata?.contentType || "application/octet-stream");
     files.push({ originalKey: doc.r2_key, backupKey });
   }
   const payload = JSON.stringify({ schemaVersion: 1, organizationId, generatedAt: new Date().toISOString(), tables, files });
   const checksum = await hashToken(payload); const objectKey = tenantBackupKey(organizationId, id, "snapshot.json");
-  await env.BACKUPS.put(objectKey, payload, { httpMetadata: { contentType: "application/json" }, customMetadata: { checksum, schemaVersion: "1" } });
-  await env.DB.prepare(`INSERT INTO tenant_backups (id, organization_id, object_key, checksum, size_bytes, record_count, created_by) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+  await putExternalBackupObject(env, objectKey, payload, "application/json");
+  await env.DB.prepare(`INSERT INTO tenant_backups (id, organization_id, object_key, checksum, size_bytes, record_count, created_by, storage_target) VALUES (?, ?, ?, ?, ?, ?, ?, 'external_r2')`)
     .bind(id, organizationId, objectKey, checksum, new TextEncoder().encode(payload).byteLength, recordCount, createdBy).run();
-  return { id, checksum, recordCount, fileCount: files.length, createdAt: new Date().toISOString(), objectKey };
+  return { id, checksum, recordCount, fileCount: files.length, createdAt: new Date().toISOString(), objectKey, storageTarget: "external_r2" as const };
 }
 
 async function calendarCipherKey(env: Env) {
@@ -339,8 +423,7 @@ async function publicProjectPortal(token: string, env: Env, asPage = false) {
 
 async function auth(request: Request, env: Env): Promise<AuthContext | null> {
   const mobileRequest = new URL(request.url).pathname.startsWith("/api/mobile/");
-  const authorization = mobileRequest ? request.headers.get("authorization") : null;
-  const token = authorization?.match(/^Bearer\s+([a-f0-9]{64})$/i)?.[1] || getCookie(request, "zyntris_session");
+  const token = requestSessionToken(mobileRequest, request.headers.get("authorization"), getCookie(request, "zyntris_session"));
   if (!token) return null;
   const tokenHash = await hashToken(token);
   if (mobileRequest) {
@@ -1967,7 +2050,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (path === "/api/settings/backups" && request.method === "GET") {
     if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
-    const backups = await env.DB.prepare(`SELECT id, checksum, size_bytes as sizeBytes, record_count as recordCount, created_at as createdAt FROM tenant_backups WHERE organization_id = ? ORDER BY created_at DESC LIMIT 30`).bind(context.organizationId).all();
+    const backups = await env.DB.prepare(`SELECT id, checksum, storage_target as storageTarget, size_bytes as sizeBytes, record_count as recordCount, created_at as createdAt FROM tenant_backups WHERE organization_id = ? ORDER BY created_at DESC LIMIT 30`).bind(context.organizationId).all();
     const settings = await env.DB.prepare(`SELECT enabled, frequency, retention_days as retentionDays, alert_email as alertEmail, last_run_at as lastRunAt, last_status as lastStatus, last_error as lastError, last_verified_at as lastVerifiedAt FROM tenant_backup_settings WHERE organization_id = ?`).bind(context.organizationId).first();
     return json({ data: backups.results || [], settings: settings || { enabled: 0, frequency: "daily", retentionDays: 30, alertEmail: null, lastRunAt: null, lastStatus: null, lastError: null, lastVerifiedAt: null } });
   }
@@ -1994,9 +2077,9 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const backupMatch = path.match(/^\/api\/settings\/backups\/([^/]+)(?:\/(download|restore))?$/);
   if (backupMatch && request.method === "GET" && backupMatch[2] === "download") {
     if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
-    const backup = await env.DB.prepare(`SELECT object_key as objectKey, checksum FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(backupMatch[1], context.organizationId).first<{ objectKey: string; checksum: string }>();
+    const backup = await env.DB.prepare(`SELECT object_key as objectKey, checksum, storage_target as storageTarget FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(backupMatch[1], context.organizationId).first<{ objectKey: string; checksum: string; storageTarget: BackupStorageTarget }>();
     if (!backup) return error("Backup not found.", 404);
-    const object = await getTenantBackupObject(env, context.organizationId, backupMatch[1], backup.objectKey);
+    const object = await getTenantBackupObject(env, context.organizationId, backupMatch[1], backup.objectKey, backup.storageTarget);
     if (!object) return error("Backup file is missing from private storage.", 410);
     const payload = await object.text();
     if (await hashToken(payload) !== backup.checksum) return error("Backup integrity verification failed. Do not use this copy for recovery.", 409);
@@ -2007,9 +2090,9 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (backupMatch && request.method === "POST" && backupMatch[2] === "restore") {
     if (!hasPermission(context, "settings.manage")) return error("Organization administrator permission is required to manage backups.", 403);
     const body = await request.json<{ dryRun?: boolean; confirmation?: string }>();
-    const backup = await env.DB.prepare(`SELECT object_key as objectKey, checksum FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(backupMatch[1], context.organizationId).first<{ objectKey: string; checksum: string }>();
+    const backup = await env.DB.prepare(`SELECT object_key as objectKey, checksum, storage_target as storageTarget FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(backupMatch[1], context.organizationId).first<{ objectKey: string; checksum: string; storageTarget: BackupStorageTarget }>();
     if (!backup) return error("Backup not found.", 404);
-    const object = await getTenantBackupObject(env, context.organizationId, backupMatch[1], backup.objectKey);
+    const object = await getTenantBackupObject(env, context.organizationId, backupMatch[1], backup.objectKey, backup.storageTarget);
     if (!object) return error("Backup file is missing from private storage.", 410);
     const serialized = await object.text();
     if (await hashToken(serialized) !== backup.checksum) return error("Backup integrity verification failed. Do not use this copy for recovery.", 409);
@@ -2027,7 +2110,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       })) return error("Backup contains an invalid or out-of-tenant record.", 409);
     }
     for (const file of snapshot.files || []) {
-      if (!isTenantObjectKey(file.originalKey, context.organizationId) || !isTenantBackupObjectKey(file.backupKey, context.organizationId, backupMatch[1]) || !file.backupKey.includes("/files/") || !await getTenantBackupObject(env, context.organizationId, backupMatch[1], file.backupKey)) return error("Backup file manifest contains a missing or out-of-tenant object.", 409);
+      if (!isTenantObjectKey(file.originalKey, context.organizationId) || !isTenantBackupObjectKey(file.backupKey, context.organizationId, backupMatch[1]) || !file.backupKey.includes("/files/") || !await getTenantBackupObject(env, context.organizationId, backupMatch[1], file.backupKey, backup.storageTarget)) return error("Backup file manifest contains a missing or out-of-tenant object.", 409);
     }
     if (body.dryRun) return json({ valid: true, mode: "non-destructive merge", rows: counts, fileCount: snapshot.files?.length || 0, note: "Existing records are never overwritten or deleted. Missing records and files are restored where their references remain valid." });
     if (body.confirmation !== "RESTORE MERGE") return error("Type RESTORE MERGE to confirm recovery. This is a non-destructive merge; current rows will not be overwritten or deleted.");
@@ -2050,7 +2133,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       for (const file of snapshot.files || []) {
         if (!isTenantObjectKey(file.originalKey, context.organizationId) || !isTenantBackupObjectKey(file.backupKey, context.organizationId, backupMatch[1]) || !file.backupKey.includes("/files/")) continue;
         if (await env.FILES.head(file.originalKey)) continue;
-        const archived = await getTenantBackupObject(env, context.organizationId, backupMatch[1], file.backupKey);
+        const archived = await getTenantBackupObject(env, context.organizationId, backupMatch[1], file.backupKey, backup.storageTarget);
         if (archived) { await env.FILES.put(file.originalKey, archived.body, { httpMetadata: archived.httpMetadata }); restoredFiles += 1; }
       }
       await env.DB.prepare(`INSERT INTO tenant_storage_usage (organization_id, used_bytes, updated_at) SELECT ?, (SELECT COALESCE(SUM(size_bytes),0) FROM documents WHERE organization_id = ?) + (SELECT COALESCE(SUM(receipt_size_bytes),0) FROM expenses WHERE organization_id = ?), CURRENT_TIMESTAMP ON CONFLICT(organization_id) DO UPDATE SET used_bytes = excluded.used_bytes, updated_at = CURRENT_TIMESTAMP`).bind(context.organizationId, context.organizationId, context.organizationId).run();
@@ -4024,7 +4107,7 @@ export default {
       if (schedule.lastRunAt && Date.now() - Date.parse(`${schedule.lastRunAt.replace(" ", "T")}Z`) < interval) continue;
       try {
         const backup = await createTenantBackup(env, schedule.organizationId, schedule.createdBy);
-        const stored = await getTenantBackupObject(env, schedule.organizationId, backup.id, backup.objectKey);
+        const stored = await getTenantBackupObject(env, schedule.organizationId, backup.id, backup.objectKey, backup.storageTarget);
         const serialized = stored ? await stored.text() : "";
         let valid = Boolean(stored && await hashToken(serialized) === backup.checksum);
         if (valid) {
@@ -4033,19 +4116,24 @@ export default {
             valid = snapshot.schemaVersion === 1 && snapshot.organizationId === schedule.organizationId && !!snapshot.tables && !Array.isArray(snapshot.tables)
               && Object.values(snapshot.tables).every((rows) => Array.isArray(rows) && rows.every((row) => !!row && typeof row === "object" && (row as { organization_id?: unknown }).organization_id === schedule.organizationId))
               && Array.isArray(snapshot.files) && snapshot.files.every((file) => file && isTenantObjectKey(file.originalKey, schedule.organizationId) && isTenantBackupObjectKey(file.backupKey, schedule.organizationId, backup.id) && file.backupKey.includes("/files/"));
-            if (valid) for (const file of snapshot.files || []) if (!await getTenantBackupObject(env, schedule.organizationId, backup.id, file.backupKey)) { valid = false; break; }
+            if (valid) for (const file of snapshot.files || []) if (!await getTenantBackupObject(env, schedule.organizationId, backup.id, file.backupKey, backup.storageTarget)) { valid = false; break; }
           } catch { valid = false; }
         }
         await env.DB.prepare(`UPDATE tenant_backup_settings SET last_run_at = CURRENT_TIMESTAMP, last_status = ?, last_error = ?, last_verified_at = CASE WHEN ? = 1 THEN CURRENT_TIMESTAMP ELSE last_verified_at END, updated_at = CURRENT_TIMESTAMP WHERE organization_id = ?`).bind(valid ? "success" : "verification_failed", valid ? null : "Snapshot checksum or restore preflight verification failed", valid ? 1 : 0, schedule.organizationId).run();
         if (!valid) throw new Error("Scheduled snapshot failed its checksum or non-destructive restore preflight verification.");
         const cutoff = new Date(Date.now() - schedule.retentionDays * 86400000).toISOString();
-        const expired = await env.DB.prepare(`SELECT id, object_key as objectKey FROM tenant_backups WHERE organization_id = ? AND created_at < ?`).bind(schedule.organizationId, cutoff).all<{ id: string; objectKey: string }>();
+        const expired = await env.DB.prepare(`SELECT id, object_key as objectKey, storage_target as storageTarget FROM tenant_backups WHERE organization_id = ? AND created_at < ?`).bind(schedule.organizationId, cutoff).all<{ id: string; objectKey: string; storageTarget: BackupStorageTarget }>();
         for (const row of expired.results || []) {
-          if (isTenantBackupObjectKey(row.objectKey, schedule.organizationId, row.id)) await env.BACKUPS.delete(row.objectKey);
-          let cursor: string | undefined;
-          do { const prefix = `tenant-backups/${schedule.organizationId}/${row.id}/`; const listed = await env.BACKUPS.list({ prefix, cursor }); if (listed.objects.length) await Promise.all(listed.objects.map((object) => env.BACKUPS.delete(object.key))); cursor = listed.truncated ? listed.cursor : undefined; } while (cursor);
-          cursor = undefined;
-          do { const prefix = `tenant-backups/${schedule.organizationId}/${row.id}/`; const listed = await env.FILES.list({ prefix, cursor }); if (listed.objects.length) await Promise.all(listed.objects.map((object) => env.FILES.delete(object.key))); cursor = listed.truncated ? listed.cursor : undefined; } while (cursor);
+          const prefix = `tenant-backups/${schedule.organizationId}/${row.id}/`;
+          if (row.storageTarget === "external_r2") {
+            for (const key of await listExternalBackupKeys(env, prefix)) await deleteExternalBackupObject(env, key);
+          } else {
+            if (isTenantBackupObjectKey(row.objectKey, schedule.organizationId, row.id)) await env.BACKUPS.delete(row.objectKey);
+            let cursor: string | undefined;
+            do { const listed = await env.BACKUPS.list({ prefix, cursor }); if (listed.objects.length) await Promise.all(listed.objects.map((object) => env.BACKUPS.delete(object.key))); cursor = listed.truncated ? listed.cursor : undefined; } while (cursor);
+            cursor = undefined;
+            do { const listed = await env.FILES.list({ prefix, cursor }); if (listed.objects.length) await Promise.all(listed.objects.map((object) => env.FILES.delete(object.key))); cursor = listed.truncated ? listed.cursor : undefined; } while (cursor);
+          }
           await env.DB.prepare(`DELETE FROM tenant_backups WHERE id = ? AND organization_id = ?`).bind(row.id, schedule.organizationId).run();
         }
       } catch (cause) {
