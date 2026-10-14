@@ -19,6 +19,7 @@ import { ExitManagement } from "./exit-management";
 import { AnnouncementsWorkspace, GoalsWorkspace } from "./company-modules";
 import { ProjectDeliveryControls, ProjectSubscriptionRequest, ProjectTemplatesAndPortal, WorkCalendarConnections, WorkCalendarWorkspace, WorkLeaveWorkspace, WorkProjectsWorkspace, WorkTasksWorkspace } from "./workspaces";
 import type { DashboardData, Employee, LeaveRequest, PageId, Task } from "./types";
+import { SESSION_IDLE_TIMEOUT_MS, SESSION_IDLE_TIMEOUT_MINUTES } from "./session-policy";
 
 type IconComponent = typeof LayoutDashboard;
 type InboxNotification = { id: string; type: string; title: string; body: string; readAt: string | null; createdAt: string };
@@ -118,7 +119,7 @@ export default function App() {
 
   useEffect(() => {
     if (!user?.id) return;
-    const idleLimitMs = 2 * 60 * 1000;
+    const idleLimitMs = SESSION_IDLE_TIMEOUT_MS;
     lastUserActivityAt.current = Date.now();
     lastSessionHeartbeatAt.current = Date.now();
     let expired = false;
@@ -130,7 +131,7 @@ export default function App() {
       setConnected(false);
       setNotifications([]);
       setUnreadNotifications(0);
-      setAuthNotice("You were signed out after two minutes of inactivity. Sign in to continue.");
+      setAuthNotice(`You were signed out after ${SESSION_IDLE_TIMEOUT_MINUTES} minutes of inactivity. Sign in to continue.`);
     };
     const markActivity = () => {
       const now = Date.now();

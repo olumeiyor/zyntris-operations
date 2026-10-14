@@ -1,5 +1,6 @@
 import { allowedBrowserOrigin, isTenantObjectKey, isTenantBackupObjectKey, tenantBackupKey, tenantDocumentKey, tenantReceiptKey } from "./security-boundaries";
 import { configurePasswordHashWasm, passwordHash, verifyPassword } from "./password-hashing";
+import { SESSION_IDLE_TIMEOUT_SQL } from "./session-policy";
 // Wrangler imports these as precompiled WebAssembly.Module values. Registering
 // them prevents the Argon2 library from calling WebAssembly.compile at runtime,
 // which Cloudflare Workers intentionally disallows for embedded Wasm bytes.
@@ -343,10 +344,10 @@ async function auth(request: Request, env: Env): Promise<AuthContext | null> {
   if (!token) return null;
   const tokenHash = await hashToken(token);
   if (mobileRequest) {
-    const touched = await env.DB.prepare(`UPDATE sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP AND last_seen_at > datetime('now', '-2 minutes')`).bind(tokenHash).run();
+    const touched = await env.DB.prepare(`UPDATE sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP AND last_seen_at > datetime('now', ?)`).bind(tokenHash, SESSION_IDLE_TIMEOUT_SQL).run();
     if (touched.meta.changes !== 1) return null;
   } else {
-    const active = await env.DB.prepare(`SELECT 1 as active FROM sessions WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP AND last_seen_at > datetime('now', '-2 minutes')`).bind(tokenHash).first();
+    const active = await env.DB.prepare(`SELECT 1 as active FROM sessions WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP AND last_seen_at > datetime('now', ?)`).bind(tokenHash, SESSION_IDLE_TIMEOUT_SQL).first();
     if (!active) return null;
   }
   const result = await env.DB.prepare(`
@@ -1569,7 +1570,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     if (!originAllowed(request, env)) return error("Request origin rejected", 403);
     const token = mobilePath ? request.headers.get("authorization")?.match(/^Bearer\s+([a-f0-9]{64})$/i)?.[1] : getCookie(request, "zyntris_session");
     if (!token) return error("Authentication required", 401);
-    const touched = await env.DB.prepare(`UPDATE sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP AND last_seen_at > datetime('now', '-2 minutes')`).bind(await hashToken(decodeURIComponent(token))).run();
+    const touched = await env.DB.prepare(`UPDATE sessions SET last_seen_at = CURRENT_TIMESTAMP WHERE token_hash = ? AND expires_at > CURRENT_TIMESTAMP AND last_seen_at > datetime('now', ?)`).bind(await hashToken(decodeURIComponent(token)), SESSION_IDLE_TIMEOUT_SQL).run();
     if (touched.meta.changes !== 1) return error("Your session expired after inactivity. Sign in again.", 401);
     return json({ ok: true });
   }
@@ -3975,7 +3976,7 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM auth_rate_limits WHERE window_started_at < datetime('now', '-1 day')`),
-      env.DB.prepare(`DELETE FROM sessions WHERE expires_at <= CURRENT_TIMESTAMP OR last_seen_at <= datetime('now', '-2 minutes')`),
+      env.DB.prepare(`DELETE FROM sessions WHERE expires_at <= CURRENT_TIMESTAMP OR last_seen_at <= datetime('now', ?)`).bind(SESSION_IDLE_TIMEOUT_SQL),
       env.DB.prepare(`DELETE FROM two_factor_challenges WHERE expires_at <= CURRENT_TIMESTAMP`),
       env.DB.prepare(`DELETE FROM password_reset_tokens WHERE expires_at <= CURRENT_TIMESTAMP OR (used_at IS NOT NULL AND created_at < datetime('now', '-1 day'))`),
       env.DB.prepare(`DELETE FROM email_verification_tokens WHERE expires_at <= CURRENT_TIMESTAMP OR (used_at IS NOT NULL AND created_at < datetime('now', '-1 day'))`),
