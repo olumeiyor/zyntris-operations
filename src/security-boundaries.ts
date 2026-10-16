@@ -10,7 +10,7 @@ export function allowedBrowserOrigin(origin: string | null, referer: string | nu
 
 export function requestSessionToken(mobileRequest: boolean, authorization: string | null, sessionCookie: string | null | undefined): string | null {
   if (mobileRequest) return authorization?.match(/^Bearer\s+([a-f0-9]{64})$/i)?.[1] || null;
-  return sessionCookie || null;
+  return sessionCookie && /^[a-f0-9]{64}$/i.test(sessionCookie) ? sessionCookie : null;
 }
 
 export function isTenantObjectKey(key: string, organizationId: string): boolean {

@@ -19,6 +19,8 @@ test("mobile APIs require a bearer token and never fall back to browser cookies"
   assert.equal(requestSessionToken(true, "Basic abc", cookie), null);
   assert.equal(requestSessionToken(true, `Bearer ${token}`, cookie), token);
   assert.equal(requestSessionToken(false, null, cookie), cookie);
+  assert.equal(requestSessionToken(false, null, "not-a-session-token"), null);
+  assert.equal(requestSessionToken(false, null, "a".repeat(65)), null);
 });
 
 test("tenant storage keys cannot cross tenant prefixes", () => {

@@ -682,7 +682,7 @@ async function sendEmployeeInviteEmail(env: Env, email: string, fullName: string
     });
     const result = await response.json().catch(() => ({})) as { messageId?: string; code?: string; message?: string };
     if (!response.ok) {
-      console.error("Brevo rejected an employee invitation", { status: response.status, code: result.code || "unknown", message: result.message?.slice(0, 240) || "No provider detail" });
+      console.error("Brevo rejected an employee invitation", { status: response.status, code: result.code || "unknown" });
       return { accepted: false, cause: "provider_rejected", status: response.status };
     }
     return { accepted: true, messageId: result.messageId };
@@ -716,7 +716,7 @@ async function sendPasswordResetEmail(env: Env, email: string, fullName: string,
     });
     if (response.ok) return { accepted: true as const };
     const result = await response.json().catch(() => ({})) as { code?: string; message?: string };
-    console.error("Brevo rejected a platform password reset", { status: response.status, code: result.code || "unknown", message: result.message?.slice(0, 200) || "No provider detail" });
+    console.error("Brevo rejected a platform password reset", { status: response.status, code: result.code || "unknown" });
     if (response.status === 401 || response.status === 403) return { accepted: false as const, message: "Brevo rejected its API key. Update the BREVO_API_KEY Worker secret." };
     return { accepted: false as const, message: "Brevo did not accept the password reset email. Verify the sender and retry." };
   } catch (cause) {
@@ -749,7 +749,7 @@ async function sendApprovalNotificationEmail(env: Env, email: string, fullName: 
     if (!response.ok) console.warn("Brevo rejected an approval notification", response.status);
     return response.ok;
   } catch (cause) {
-    console.warn("Could not deliver an approval notification", cause);
+    console.warn("Could not deliver an approval notification", cause instanceof Error ? cause.name : "unknown");
     return false;
   }
 }
@@ -887,13 +887,13 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
         env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id, new_value_json) VALUES (?, ?, ?, 'created', 'organization', 'organization', ?, ?)`).bind(`audit-${crypto.randomUUID()}`, orgId, userId, orgId, JSON.stringify({ industry: body.industry?.trim() || null, onboardingStatus: "email_verification_pending" })),
       ]);
     } catch (cause) {
-      console.error("Signup persistence failed", cause);
+      console.error("Signup persistence failed", cause instanceof Error ? cause.name : "unknown");
       return error("Unable to create the workspace. Please try again.", 500);
     }
     try {
       if (!(await sendVerificationEmail(env, email, fullName, token))) throw new Error("Verification email provider rejected the message");
     } catch (cause) {
-      console.error("Signup verification delivery failed", cause);
+      console.error("Signup verification delivery failed", cause instanceof Error ? cause.name : "unknown");
       await env.DB.prepare(`DELETE FROM organizations WHERE id = ?`).bind(orgId).run();
       await env.DB.prepare(`DELETE FROM users WHERE id = ?`).bind(userId).run();
       return error("We could not send your verification email. Please try again shortly.", 503);
@@ -931,7 +931,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
       const delivered = await sendPasswordResetEmail(env, user.email, user.fullName, user.organizationName, token);
       if (!delivered.accepted) {
         await env.DB.prepare(`DELETE FROM password_reset_tokens WHERE id = ?`).bind(tokenId).run();
-        console.warn("Self-service password reset email could not be delivered", delivered.message);
+        console.warn("Self-service password reset email could not be delivered", "provider_error");
       } else {
         await env.DB.prepare(`INSERT INTO audit_logs (id, organization_id, actor_user_id, action, module, record_type, record_id) VALUES (?, ?, NULL, 'password_reset_requested', 'authentication', 'user', ?)`).bind(`audit-${crypto.randomUUID()}`, user.organizationId, user.userId).run();
       }
@@ -1595,8 +1595,12 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   const path = mobilePath ? url.pathname.replace("/api/mobile", "/api") : url.pathname;
 
   if (request.method === "GET" && path === "/api/health") {
-    return json({ ok: true, service: "zyntris-operations", environment: env.ENVIRONMENT, d1: Boolean(env.DB), r2: Boolean(env.FILES), timestamp: new Date().toISOString() });
+    return json({ ok: true, service: "zyntris-operations" });
   }
+
+  const contentLength = Number(request.headers.get("content-length") || 0);
+  const bodyLimit = request.headers.get("content-type")?.toLowerCase().startsWith("multipart/form-data") ? 11 * 1024 * 1024 : 1024 * 1024;
+  if (Number.isFinite(contentLength) && contentLength > bodyLimit) return error("Request body is too large.", 413);
 
   if (!mobilePath && ["POST", "PUT", "PATCH", "DELETE"].includes(request.method) && !originAllowed(request, env)) return error("Request origin rejected", 403);
 
@@ -1745,7 +1749,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       });
       const result = await response.json().catch(() => ({})) as { messageId?: string; code?: string; message?: string };
       if (!response.ok) {
-        console.error("Brevo test email was rejected", { status: response.status, code: result.code || "unknown", message: result.message?.slice(0, 240) || "No provider detail" });
+        console.error("Brevo test email was rejected", { status: response.status, code: result.code || "unknown" });
         if (response.status === 401 || response.status === 403) return error("Brevo rejected its API key. Update the BREVO_API_KEY Worker secret.", 502);
         if (response.status === 400) return error("Brevo rejected this message. Verify the sender identity and recipient address in Brevo.", 502);
         return error(`Brevo did not accept the test email (HTTP ${response.status}). Check the sender setup and retry.`, 502);
@@ -2159,7 +2163,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
       await audit(env, context, "restored_merge", "tenant_backups", backupMatch[1], { restoredCount, restoredFiles });
       return json({ ok: true, mode: "non-destructive merge", restoredCount, restoredFiles });
     } catch (cause) {
-      console.error("Tenant backup merge restore stopped", cause);
+      console.error("Tenant backup merge restore stopped", cause instanceof Error ? cause.name : "unknown");
       await audit(env, context, "restore_merge_failed", "tenant_backups", backupMatch[1], { restoredCount });
       return error(`Restore stopped after ${restoredCount} records. Existing data was not overwritten or deleted; review the audit log and source backup before retrying.`, 409);
     }
@@ -2664,7 +2668,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === "GET" && path === "/api/operations/members") {
-    const members = await env.DB.prepare(`SELECT u.id, u.full_name as fullName, u.email FROM users u JOIN memberships m ON m.user_id = u.id AND m.organization_id = ? AND m.status = 'active' WHERE u.status = 'active' ORDER BY u.full_name`).bind(context.organizationId).all();
+    const canViewDirectory = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve") || hasPermission(context, "operations.manage");
+    const members = await env.DB.prepare(`SELECT u.id, u.full_name as fullName, CASE WHEN ? = 1 THEN u.email ELSE NULL END as email FROM users u JOIN memberships m ON m.user_id = u.id AND m.organization_id = ? AND m.status = 'active' WHERE u.status = 'active' ORDER BY u.full_name`).bind(canViewDirectory ? 1 : 0, context.organizationId).all();
     return json({ data: members.results || [] });
   }
 
@@ -2732,7 +2737,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
         try {
           const details = await decryptBankDetails(env, row.bankDetailsEnc);
           masked = { bankName: details.bankName, accountName: details.accountName, accountLast4: details.accountNumber.slice(-4) };
-        } catch (cause) { console.error("Stored remuneration bank record could not be decrypted", cause); }
+        } catch (cause) { console.error("Stored remuneration bank record could not be decrypted", cause instanceof Error ? cause.name : "unknown"); }
       }
       const { bankDetailsEnc: _bankDetailsEnc, ...profile } = row;
       data.push({ ...profile, ...masked, bankConfigured: Boolean(row.bankDetailsEnc) });
@@ -2944,12 +2949,13 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
   if (request.method === "GET" && path === "/api/employees") {
     if (!hasPermission(context, "employees.view")) return error("You do not have permission to view employee records.", 403);
     const query = url.searchParams.get("q")?.trim();
+    const canViewAll = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve");
     const result = await env.DB.prepare(`
-      SELECT e.id, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.email, e.job_title as jobTitle, e.status, e.onboarding_status as onboardingStatus, (SELECT i.email_status FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) as invitationEmailStatus, (SELECT i.last_error FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) as invitationEmailError, e.work_location as workLocation, e.start_date as startDate, e.avatar_color as avatarColor, d.name as department, t.name as team, e.manager_id as managerId, manager.first_name || ' ' || manager.last_name as managerName, r.name as accessRole
+      SELECT e.id, e.employee_number as employeeNumber, e.first_name as firstName, e.last_name as lastName, e.email, e.job_title as jobTitle, e.status, e.onboarding_status as onboardingStatus, CASE WHEN ? = 1 THEN (SELECT i.email_status FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) ELSE NULL END as invitationEmailStatus, CASE WHEN ? = 1 THEN (SELECT i.last_error FROM employee_invites i WHERE i.employee_id = e.id ORDER BY i.created_at DESC LIMIT 1) ELSE NULL END as invitationEmailError, e.work_location as workLocation, e.start_date as startDate, e.avatar_color as avatarColor, d.name as department, t.name as team, e.manager_id as managerId, manager.first_name || ' ' || manager.last_name as managerName, r.name as accessRole
       FROM employees e LEFT JOIN departments d ON d.id = e.department_id LEFT JOIN teams t ON t.id = e.team_id LEFT JOIN employees manager ON manager.id = e.manager_id AND manager.organization_id = e.organization_id AND manager.deleted_at IS NULL LEFT JOIN memberships m ON m.user_id = e.user_id AND m.organization_id = e.organization_id LEFT JOIN roles r ON r.id = m.role_id
-      WHERE e.organization_id = ? AND e.deleted_at IS NULL AND (? IS NULL OR e.first_name || ' ' || e.last_name LIKE '%' || ? || '%' OR e.employee_number LIKE '%' || ? || '%')
+      WHERE e.organization_id = ? AND e.deleted_at IS NULL AND (? = 1 OR e.user_id = ? OR e.manager_id = (SELECT own.id FROM employees own WHERE own.organization_id = ? AND own.user_id = ? AND own.deleted_at IS NULL LIMIT 1)) AND (? IS NULL OR e.first_name || ' ' || e.last_name LIKE '%' || ? || '%' OR e.employee_number LIKE '%' || ? || '%')
       ORDER BY e.first_name ASC
-    `).bind(context.organizationId, query || null, query || null, query || null).all();
+    `).bind(canViewAll ? 1 : 0, canViewAll ? 1 : 0, context.organizationId, canViewAll ? 1 : 0, context.userId, context.organizationId, context.userId, query || null, query || null, query || null).all();
     return json({ data: result.results || [] });
   }
 
@@ -3004,7 +3010,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
         env.DB.prepare(`INSERT INTO employee_invites (id, organization_id, employee_id, user_id, token_hash, expires_at, email_status) VALUES (?, ?, ?, ?, ?, datetime('now', '+72 hours'), 'pending')`).bind(inviteId, context.organizationId, id, userId, await hashToken(token)),
       ]);
     } catch (cause) {
-      console.error("Employee invitation could not be saved", cause);
+      console.error("Employee invitation could not be saved", cause instanceof Error ? cause.name : "unknown");
       return error("We couldn’t prepare the onboarding invitation. Please retry or contact support.", 500);
     }
     const delivery = await sendEmployeeInviteEmail(env, email, `${firstName} ${lastName}`, organization?.name || "your organization", token);
@@ -3048,7 +3054,8 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "GET" && path === "/api/attendance/shifts") {
     if (!hasPermission(context, "employees.view")) return error("You do not have permission to view shift schedules.", 403);
-    const result = await env.DB.prepare(`SELECT s.id, s.employee_id as employeeId, COALESCE(e.first_name || ' ' || e.last_name, 'All employees') as employee, s.weekday, s.start_time as startTime, s.end_time as endTime, s.break_minutes as breakMinutes, s.effective_from as effectiveFrom, s.effective_to as effectiveTo FROM shift_schedules s LEFT JOIN employees e ON e.id = s.employee_id WHERE s.organization_id = ? ORDER BY s.weekday, s.start_time LIMIT 200`).bind(context.organizationId).all();
+    const canViewAll = hasPermission(context, "employees.manage") || hasPermission(context, "hr.onboarding.approve");
+    const result = await env.DB.prepare(`SELECT s.id, s.employee_id as employeeId, COALESCE(e.first_name || ' ' || e.last_name, 'All employees') as employee, s.weekday, s.start_time as startTime, s.end_time as endTime, s.break_minutes as breakMinutes, s.effective_from as effectiveFrom, s.effective_to as effectiveTo FROM shift_schedules s LEFT JOIN employees e ON e.id = s.employee_id AND e.organization_id = s.organization_id WHERE s.organization_id = ? AND (? = 1 OR s.employee_id IS NULL OR s.employee_id = (SELECT own.id FROM employees own WHERE own.organization_id = ? AND own.user_id = ? AND own.deleted_at IS NULL LIMIT 1)) ORDER BY s.weekday, s.start_time LIMIT 200`).bind(context.organizationId, canViewAll ? 1 : 0, context.organizationId, context.userId).all();
     return json({ data: result.results || [] });
   }
 
@@ -3608,7 +3615,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     } catch (cause) {
       if (receipt && receiptKey) {
         let objectRemoved = false;
-        try { await env.FILES.delete(receiptKey); objectRemoved = true; } catch (cleanupError) { console.error("Failed to clean up expense receipt; storage reservation retained", cleanupError); }
+        try { await env.FILES.delete(receiptKey); objectRemoved = true; } catch (cleanupError) { console.error("Failed to clean up expense receipt; storage reservation retained", cleanupError instanceof Error ? cleanupError.name : "unknown"); }
         if (objectRemoved) await releaseTenantStorage(env, context.organizationId, receipt.size);
       }
       throw cause;
@@ -3999,7 +4006,7 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
         .bind(id, context.organizationId, file.name, String(form.get("category") || "General"), key, file.type || "application/octet-stream", file.size).run();
     } catch (cause) {
       let objectRemoved = false;
-      try { await env.FILES.delete(key); objectRemoved = true; } catch (cleanupError) { console.error("Failed to clean up document upload object; storage reservation retained", cleanupError); }
+      try { await env.FILES.delete(key); objectRemoved = true; } catch (cleanupError) { console.error("Failed to clean up document upload object; storage reservation retained", cleanupError instanceof Error ? cleanupError.name : "unknown"); }
       if (objectRemoved) await releaseTenantStorage(env, context.organizationId, file.size);
       throw cause;
     }
@@ -4055,16 +4062,14 @@ export default {
     } catch (cause) {
       const incidentId = requestId();
       const url = new URL(request.url);
-      const failure = cause instanceof Error
-        ? { errorName: cause.name.slice(0, 80), errorMessage: cause.message.replace(/[\r\n\t]/g, " ").slice(0, 500) }
-        : { errorName: "NonErrorThrown", errorMessage: "A non-Error value was thrown." };
+      const errorName = cause instanceof Error ? cause.name.slice(0, 80) : "NonErrorThrown";
       // Log primitive fields: Cloudflare's structured logger drops nested Error objects,
       // which otherwise leaves production incident IDs without actionable diagnostics.
       console.error("Unhandled request error", {
         incidentId,
         method: request.method,
         path: url.pathname,
-        ...failure,
+        errorName,
       });
       const response = error(`Something went wrong. Please try again. Reference: ${incidentId}`, 500);
       response.headers.set("x-zyntris-request-id", incidentId);
