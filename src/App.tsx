@@ -204,6 +204,7 @@ export default function App() {
       const me = await api<NonNullable<typeof user>>("/api/me");
       setUser(me); setConnected(true); setAuthNotice("");
       if (me.mfaEnrollmentRequired) { setPage("security"); return; }
+      setPage(adminPortal ? "platform" : "dashboard");
       if (!adminPortal) {
         const [data, people] = await Promise.all([api<DashboardData>("/api/dashboard"), api<{ data: Employee[] }>("/api/employees")]);
         setDashboard(data); setEmployees(people.data);
