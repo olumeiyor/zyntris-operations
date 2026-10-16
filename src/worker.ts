@@ -2995,7 +2995,9 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     }
     if (teamName) {
       await env.DB.prepare(`INSERT OR IGNORE INTO teams (id, organization_id, department_id, name) VALUES (?, ?, ?, ?)`).bind(`team-${crypto.randomUUID()}`, context.organizationId, departmentId, teamName).run();
-      teamId = (await env.DB.prepare(`SELECT id FROM teams WHERE organization_id = ? AND name = ?`).bind(context.organizationId, teamName).first<{ id: string }>())?.id || null;
+      const team = await env.DB.prepare(`SELECT id, department_id as departmentId FROM teams WHERE organization_id = ? AND name = ?`).bind(context.organizationId, teamName).first<{ id: string; departmentId: string | null }>();
+      teamId = team?.id || null;
+      if (!departmentId) departmentId = team?.departmentId || null;
     }
     const id = `emp-${crypto.randomUUID().slice(0, 8)}`;
     const employeeNumber = `EMP-${crypto.randomUUID().slice(0, 8).toUpperCase()}`;
