@@ -9,6 +9,7 @@ import {
 import { demoDashboard, demoEmployees, demoUser } from "./data/demo";
 import { AttendanceWorkspace, OperationalWorkspace } from "./operations";
 import { CrmWorkspace } from "./crm";
+import { CollectWorkspace } from "./collect";
 import { Onboarding } from "./onboarding";
 import { EmployeePayslips, PayrollWorkspace } from "./payroll";
 import { PlatformAdminWorkspace } from "./platform-admin";
@@ -42,6 +43,7 @@ const navItems: NavItem[] = [
   { id: "expenses", label: "Expenses", icon: WalletCards, section: "Finance" },
   { id: "requests", label: "Requests & approvals", icon: ClipboardCheck, section: "Finance" },
   { id: "budgets", label: "Budgets", icon: CreditCard, section: "Finance" },
+  { id: "collect", label: "Zyntris Collect", icon: CreditCard, section: "Finance" },
   { id: "assets", label: "Assets", icon: BriefcaseBusiness, section: "Operations" },
   { id: "documents", label: "Documents", icon: FileText, section: "Operations" },
   { id: "vendors", label: "Vendors", icon: Building2, section: "Operations" },
@@ -224,7 +226,7 @@ export default function App() {
   const enabledModules = new Set(user?.enabledModules || []);
   const pageModule: Partial<Record<PageId, string>> = {
     employees: "hr", goals: "hr", appraisals: "hr", talent: "hr", exit: "hr", leave: "hr", attendance: "hr",
-    payroll: "payroll", expenses: "finance", requests: "finance", budgets: "finance",
+    payroll: "payroll", expenses: "finance", requests: "finance", budgets: "finance", collect: "collect",
     projects: "projects", customers: "crm", assets: "operations", documents: "operations", vendors: "operations", helpdesk: "operations", tasks: "operations", calendar: "operations", announcements: "operations", reports: "reports",
   };
   const visibleNavItems = navItems.filter((item) => {
@@ -243,6 +245,7 @@ export default function App() {
     if (item.id === "goals") return userPermissions.has("goals.view");
     if (item.id === "announcements") return userPermissions.has("announcements.view");
     if (item.id === "expenses") return userPermissions.has("expenses.view") || userPermissions.has("expenses.manage");
+    if (item.id === "collect") return userPermissions.has("collect.view") || userPermissions.has("collect.view.all") || userPermissions.has("collect.manage");
     if (item.id === "requests") return userPermissions.has("requests.manage") || userPermissions.has("employees.view");
     if (["dashboard", "reports"].includes(item.id)) return userPermissions.has("employees.view") || userPermissions.has("operations.view");
     return userPermissions.has("operations.view");
@@ -342,6 +345,7 @@ export default function App() {
           {page === "projects" && <><WorkProjectsWorkspace canManage={userPermissions.has("projects.manage") || userPermissions.has("projects.edit") || userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><ProjectDeliveryControls canManage={userPermissions.has("projects.manage") || userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><ProjectTemplatesAndPortal canManage={userPermissions.has("projects.manage")} canPortal={userPermissions.has("projects.client_portal.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /></>}
           {page === "calendar" && <><WorkCalendarWorkspace canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /><WorkCalendarConnections canManage={userPermissions.has("operations.manage")} isDemo={Boolean(user.isDemo)} onToast={setToast} /></>}
           {page === "customers" && <CrmWorkspace onToast={setToast} canManageCrm={userPermissions.has("crm.manage")} canConfigure={userPermissions.has("crm.configure")} canQuotes={userPermissions.has("crm.quotes.manage")} canReport={userPermissions.has("crm.report")} canImport={userPermissions.has("crm.import")} />}
+          {page === "collect" && <CollectWorkspace permissions={user.permissions || []} onToast={setToast} isDemo={Boolean(user.isDemo)} />}
           {(["expenses", "requests", "budgets", "assets", "vendors", "helpdesk"] as PageId[]).includes(page) && <OperationalWorkspace page={page} role={user.role} onToast={setToast} />}
           {page === "documents" && <Documents version={documentsVersion} canManage={userPermissions.has("operations.manage")} onUpload={() => setShowUpload(true)} onToast={setToast} />}
           {page === "reports" && <Reports onToast={setToast} />}
