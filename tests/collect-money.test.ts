@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { calculateInvoiceLine, convertMinor, currencyExponent, moneyToMinor, quantityToMilli } from "../src/collect-money.ts";
+import { calculateInvoiceLine, convertMinor, currencyExponent, moneyToMinor, parseBankStatementCsv, quantityToMilli } from "../src/collect-money.ts";
 
 test("currency precision follows minor units for common zero, two and three decimal currencies", () => {
   assert.equal(currencyExponent("JPY"), 0);
@@ -41,4 +41,24 @@ test("FX conversion respects source and destination currency exponents", () => {
   assert.equal(convertMinor(100, "KWD", "NGN", "3000"), 30000);
   assert.equal(convertMinor(10000, "USD", "NGN", "0"), null);
   assert.equal(convertMinor(-1, "USD", "NGN", "1"), null);
+});
+
+test("bank statement CSV parser handles quoted cells and imports only credit rows", () => {
+  const rows = parseBankStatementCsv([
+    "Transaction ID,Transaction Date,Currency,Credit,Debit,Payer,Invoice Reference,Narration",
+    'TX-1,2026-10-28,NGN,"125,000.00",0,"Acme, Ltd",INV-1,"October payment"',
+    "TX-2,2026-10-28,NGN,0,8000,Vendor,,Outgoing transfer",
+  ].join("\r\n"));
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].bankReference, "TX-1");
+  assert.equal(rows[0].payerName, "Acme, Ltd");
+  assert.equal(rows[0].amount, "125000.00");
+  assert.equal(rows[0].invoiceReference, "INV-1");
+});
+
+test("bank statement CSV parser rejects malformed headers, dates, duplicates and quoted fields", () => {
+  assert.throws(() => parseBankStatementCsv("reference,amount\nTX-1,10"), /Required columns/);
+  assert.throws(() => parseBankStatementCsv("reference,date,currency,amount\nTX-1,2026-02-30,NGN,10"), /YYYY-MM-DD/);
+  assert.throws(() => parseBankStatementCsv("reference,date,currency,amount\nTX-1,2026-10-28,NGN,10\nTX-1,2026-10-29,NGN,20"), /duplicate transaction reference/);
+  assert.throws(() => parseBankStatementCsv('reference,date,currency,amount\nTX-1,2026-10-28,NGN,"10'), /unclosed quoted/);
 });
