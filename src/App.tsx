@@ -4,7 +4,7 @@ import {
   CalendarDays, CheckCircle2, ChevronDown, ChevronLeft, CircleHelp, ClipboardCheck, Clock3, Cloud,
   Command, CreditCard, FileText, FolderKanban, Grid2x2, LayoutDashboard, LifeBuoy, ListTodo, LockKeyhole,
   Menu, MessageSquareText, Megaphone, MoreHorizontal, PanelLeftClose, PanelLeftOpen, Plus, Search, Settings, ShieldCheck, Target,
-  Sparkles, TrendingUp, Trash2, UploadCloud, UserRound, UserRoundMinus, Users, WalletCards, X,
+  Sparkles, TrendingUp, Trash2, Truck, UploadCloud, UserRound, UserRoundMinus, Users, WalletCards, X,
 } from "lucide-react";
 import { demoDashboard, demoEmployees, demoUser } from "./data/demo";
 import { AttendanceWorkspace, OperationalWorkspace } from "./operations";
@@ -17,6 +17,8 @@ import { AccountSecurity, OrganizationSettings } from "./settings";
 import { Appraisals } from "./appraisals";
 import { HRTalentWorkspace } from "./hr-talent";
 import { ExitManagement } from "./exit-management";
+import { FleetWorkspace } from "./fleet";
+import { ReportsWorkspace } from "./reports";
 import { AnnouncementsWorkspace, GoalsWorkspace } from "./company-modules";
 import { ProjectDeliveryControls, ProjectTemplatesAndPortal, WorkCalendarConnections, WorkCalendarWorkspace, WorkLeaveWorkspace, WorkProjectsWorkspace, WorkTasksWorkspace } from "./workspaces";
 import type { DashboardData, Employee, LeaveRequest, PageId, Task } from "./types";
@@ -45,6 +47,7 @@ const navItems: NavItem[] = [
   { id: "budgets", label: "Budgets", icon: CreditCard, section: "Finance" },
   { id: "collect", label: "Zyntris Collect", icon: CreditCard, section: "Finance" },
   { id: "assets", label: "Assets", icon: BriefcaseBusiness, section: "Operations" },
+  { id: "fleet", label: "Fleet & dispatch", icon: Truck, section: "Operations" },
   { id: "documents", label: "Documents", icon: FileText, section: "Operations" },
   { id: "vendors", label: "Vendors", icon: Building2, section: "Operations" },
   { id: "helpdesk", label: "Helpdesk", icon: LifeBuoy, section: "Operations" },
@@ -226,7 +229,7 @@ export default function App() {
   const enabledModules = new Set(user?.enabledModules || []);
   const pageModule: Partial<Record<PageId, string>> = {
     employees: "hr", goals: "hr", appraisals: "hr", talent: "hr", exit: "hr", leave: "hr", attendance: "hr",
-    payroll: "payroll", expenses: "finance", requests: "finance", budgets: "finance", collect: "collect",
+    payroll: "payroll", expenses: "finance", requests: "finance", budgets: "finance", collect: "collect", fleet: "operations",
     projects: "projects", customers: "crm", assets: "operations", documents: "operations", vendors: "operations", helpdesk: "operations", tasks: "operations", calendar: "operations", announcements: "operations", reports: "reports",
   };
   const visibleNavItems = navItems.filter((item) => {
@@ -347,8 +350,9 @@ export default function App() {
           {page === "customers" && <CrmWorkspace onToast={setToast} canManageCrm={userPermissions.has("crm.manage")} canConfigure={userPermissions.has("crm.configure")} canQuotes={userPermissions.has("crm.quotes.manage")} canReport={userPermissions.has("crm.report")} canImport={userPermissions.has("crm.import")} />}
           {page === "collect" && <CollectWorkspace permissions={user.permissions || []} onToast={setToast} isDemo={Boolean(user.isDemo)} />}
           {(["expenses", "requests", "budgets", "assets", "vendors", "helpdesk"] as PageId[]).includes(page) && <OperationalWorkspace page={page} role={user.role} onToast={setToast} />}
+          {page === "fleet" && <FleetWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "documents" && <Documents version={documentsVersion} canManage={userPermissions.has("operations.manage")} onUpload={() => setShowUpload(true)} onToast={setToast} />}
-          {page === "reports" && <Reports onToast={setToast} />}
+          {page === "reports" && <ReportsWorkspace onToast={setToast} />}
           {page === "payroll" && (userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") ? <PayrollWorkspace onToast={setToast} role={user.role} readOnly={Boolean(user.isDemo)} /> : <EmployeePayslips />)}
           {page === "settings" && <OrganizationSettings onToast={setToast} currentEmail={user.email} />}
           {page === "security" && <AccountSecurity mandatory={user.mfaMandatory} onToast={setToast} />}

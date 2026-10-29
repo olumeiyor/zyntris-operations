@@ -7,7 +7,7 @@ Cloudflare-native operations SaaS for **Zyntris — One Platform. Every Operatio
 - React/Vite responsive operations workspace with a premium enterprise UI.
 - Cloudflare Worker API with secure response headers, tenant-scoped D1 queries, audit logging and R2 file storage.
 - D1 schema for organizations, memberships, roles, permissions, employees, leave, projects, tasks, expenses, documents, notifications, subscriptions and audit logs.
-- Operational modules for expense claims, approval requests, budgets, assets, vendors, helpdesk, calendar and customer pipeline.
+- Operational modules for expense claims, approval requests, budgets, assets, vendors, helpdesk, calendar, customer pipeline and fleet dispatch/maintenance.
 - Branded Zyntris logo system with SVG favicon, responsive brand lockup and the `One Platform. Every Operation.` visual language.
 - Organization registration with verified-email activation, tenant-specific administrator membership, and a 15-day trial.
 - Organization profile, time zone, and currency settings stored in D1.
@@ -77,9 +77,9 @@ Before the first production deployment, confirm that `database_id` in `wrangler.
 
 ## Tenant and security model
 
-Every organization-owned table has an `organization_id`. The Worker derives the tenant from the authenticated membership and binds it into every data query; the browser never chooses a tenant ID. Browser and mobile sessions expire after two minutes without activity, in addition to the 12-hour absolute session lifetime. Browser activity is refreshed only by real input events, not background polling. Browser sessions use HTTP-only, Secure, SameSite cookies. R2 keys are tenant-scoped, and the bucket is private by default. Important mutations write to `audit_logs`.
+Every organization-owned table has an `organization_id`. The Worker derives the tenant from the authenticated membership and binds it into every data query; the browser never chooses a tenant ID. Browser and mobile sessions expire after ten minutes without activity, in addition to the 12-hour absolute session lifetime. Browser activity is refreshed only by real input events, not background polling. Browser sessions use HTTP-only, Secure, SameSite cookies. R2 keys are tenant-scoped, and the bucket is private by default. Important mutations write to `audit_logs`.
 
-The shared demo administrator login has been removed. Account passwords are PBKDF2-hashed; verified users receive short-lived HTTP-only, Secure, SameSite cookies backed by hashed D1 session tokens. Organization membership and role permissions determine access. Signup/login attempts are rate-limited in D1.
+The shared demo administrator login has been removed. New password hashes use Argon2id with HMAC peppering; legacy PBKDF2 hashes remain verifiable and are upgraded after successful sign-in. Verified users receive short-lived HTTP-only, Secure, SameSite cookies backed by hashed D1 session tokens. Organization membership and role permissions determine access. Signup/login attempts are rate-limited in D1.
 
 Platform administration is enabled only for verified email addresses listed in the `PLATFORM_ADMIN_EMAILS` Worker variable (comma-separated for multiple admins). Platform admins still need a normal verified Zyntris account; never add a public/shared demo address to this allowlist. The console lists every tenant, including the protected synthetic demo tenant, with operational counts and audit events but no payroll or bank data. Admins may suspend or enable customer tenant access; re-enabling an expired trial explicitly converts its subscription to active and is recorded in the audit log. Tenant password resets send a one-use, 30-minute link through Brevo and revoke the user's active sessions; admins never see or set the user's password.
 
@@ -125,12 +125,14 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - `/api/attendance/*` — employee time-clock, HR shift schedules, and manager review of submitted time records.
 - `GET|POST /api/assets`
 - `GET|POST /api/vendors`
+- `/api/fleet/*` — tenant-scoped vehicles, trip dispatch, fuel records, service schedules and incident handling; fleet changes require `operations.manage`.
 - `GET|POST /api/tickets`
 - `GET /api/calendar`
 - `GET|POST /api/customers` and `PATCH /api/customers/:id` — tenant-scoped editable profiles and won-date reporting.
 - `GET|POST /api/files`
 - `/api/settings/organization` — organization profile and trial subscription details.
 - `/api/payroll/*` — policy, employee remuneration/bank records, recurring components, runs, employee-owned payslips, and payroll register exports. Bank details are never included in exports.
+- `GET /api/reports/summary?from=YYYY-MM-DD&to=YYYY-MM-DD` — range-filtered HR, expenses, approvals, tasks, tickets, project, purchasing, CRM and fleet aggregates; range is limited to 367 calendar days.
 
 ## Operational workflows now included
 
@@ -142,14 +144,17 @@ The demo sandbox uses the synthetic `org-demo` tenant and the reserved sign-in I
 - Approvers can return a request for edits with a required note. The requester can edit its title, details and amount and resubmit; the return note and each decision are retained in request history. For non-financial requests, an unavailable approver escalates to HR Admin and CEO. Financial requests go to CEO first and, if marked unavailable, move to the configured second-level approver (HR Admin by default).
 - Approval decisions update both the request and its source expense, and write to the audit log.
 - Asset register supports ownership, location, lifecycle status and current value.
+- Fleet & dispatch records tenant-scoped vehicles, assigned drivers, scheduled/active/completed trips, fuel costs and odometer readings, maintenance schedules, and incident follow-up. Staff need operations-manager permission to change fleet records.
 - Vendor register surfaces contract expiry and spend risk.
 - Helpdesk tickets have category, priority, status, requester and assignee fields.
 - Calendar combines meetings, leave and training events.
 - CRM customer pipeline supports lead, qualified, proposal, negotiation and won stages.
 
-Implemented HR talent modules include line-manager assignments, organization/team/employee KPI libraries, multi-rater 360 feedback, employee appraisal decisions, PIP plans and check-ins, recruitment candidate pipelines, and course assignment/completion tracking. Self-service password recovery is implemented with Brevo and an enumeration-safe response. Paid subscription onboarding is sales-led and manual; there is no online checkout or automatic bank transfer. Google/Outlook two-way calendar sync remains unconfigured pending provider selection and OAuth credentials. The Expo app is separate from the web deployment; store submission and OS push notifications still require the organization’s Apple/Google/EAS accounts and push credentials.
+Implemented HR talent modules include line-manager assignments, organization/team/employee KPI libraries, multi-rater 360 feedback, employee appraisal decisions, PIP plans and check-ins, recruitment candidate pipelines, and course assignment/completion tracking. Self-service password recovery is implemented with Brevo and an enumeration-safe response. Paid subscription onboarding is sales-led and manual; there is no online checkout or automatic bank transfer. Google/Outlook OAuth and incremental sync paths are implemented, but production credentials, tenant consent, and end-to-end provider validation must be confirmed. The Expo app is separate from the web deployment; store submission and OS push delivery still require the organization’s Apple/Google/EAS accounts, signing, and push credentials.
 
-Goals/OKRs and internal announcements are available in the workspace. Larger proposal items still requiring separate implementation or external setup include configurable event-driven automation, Zyntris AI/provider configuration, Google/Outlook calendar OAuth sync, and mobile store/push-notification release work. Compliance flow is intentionally out of scope for this change.
+Goals/OKRs and internal announcements are available in the workspace. Configurable approval SLAs/templates and scheduled reminders/escalation are implemented; a general event bus with delivery retries/dead-letter handling is not. Remaining product work includes Zyntris AI/provider configuration and the outstanding Zyntris Collect capabilities listed in `docs/zyntris-collect-phase1.md`. Remaining external setup includes calendar-provider credentials and UAT, mobile store/push release, independent-backup restore drill, and tenant-specific production acceptance. Compliance flow remains out of scope.
+
+The automated test command runs security/finance unit tests plus the full ordered D1 migration chain against an in-memory SQLite database and checks referential integrity. This does not replace tenant-specific browser/API UAT or production-provider verification.
 
 ## Payroll policy setup
 
