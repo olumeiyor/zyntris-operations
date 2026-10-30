@@ -54,6 +54,8 @@
 	"vars": {
 		"APP_ORIGIN": "https://app.zyntris.org",
 		"ENVIRONMENT": "production",
-		"PLATFORM_ADMIN_EMAILS": "olumeiyor@gmail.com,zyntristech@gmail.com"
+		"PLATFORM_ADMIN_EMAILS": "olumeiyor@gmail.com,zyntristech@gmail.com",
+		"R2_BACKUP_ACCOUNT_ID": "f429381ebec33e03646e456850e36d58",
+		"R2_BACKUP_BUCKET": "zyntris-independent-backups"
 	}
 }
