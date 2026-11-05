@@ -12,6 +12,7 @@ import { CrmWorkspace } from "./crm";
 import { CollectWorkspace } from "./collect";
 import { Onboarding } from "./onboarding";
 import { EmployeePayslips, PayrollWorkspace } from "./payroll";
+import { EmployeeCostIntelligence } from "./employee-costs";
 import { PlatformAdminWorkspace } from "./platform-admin";
 import { AccountSecurity, OrganizationSettings } from "./settings";
 import { Appraisals } from "./appraisals";
@@ -40,6 +41,7 @@ const navItems: NavItem[] = [
   { id: "leave", label: "Leave & attendance", icon: CalendarDays, section: "People" },
   { id: "attendance", label: "Time & shifts", icon: Clock3, section: "People" },
   { id: "payroll", label: "Payroll", icon: WalletCards, section: "People" },
+  { id: "employee-costs", label: "Employee Cost Intelligence", icon: BarChart3, section: "People" },
   { id: "projects", label: "Projects", icon: FolderKanban, section: "Work" },
   { id: "tasks", label: "Tasks", icon: ListTodo, section: "Work" },
   { id: "expenses", label: "Expenses", icon: WalletCards, section: "Finance" },
@@ -229,7 +231,7 @@ export default function App() {
   const enabledModules = new Set(user?.enabledModules || []);
   const pageModule: Partial<Record<PageId, string>> = {
     employees: "hr", goals: "hr", appraisals: "hr", talent: "hr", exit: "hr", leave: "hr", attendance: "hr",
-    payroll: "payroll", expenses: "finance", requests: "finance", budgets: "finance", collect: "collect", fleet: "operations",
+    payroll: "payroll", "employee-costs": "hr", expenses: "finance", requests: "finance", budgets: "finance", collect: "collect", fleet: "operations",
     projects: "projects", customers: "crm", assets: "operations", documents: "operations", vendors: "operations", helpdesk: "operations", tasks: "operations", calendar: "operations", announcements: "operations", reports: "reports",
   };
   const visibleNavItems = navItems.filter((item) => {
@@ -242,6 +244,7 @@ export default function App() {
     if (item.id === "security") return true;
     if (["employees", "leave", "attendance"].includes(item.id)) return userPermissions.has("employees.view");
     if (item.id === "payroll") return userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") || userPermissions.has("payroll.self.view");
+    if (item.id === "employee-costs") return ["eci.view.aggregate","eci.view.profiles","eci.manage","eci.department.view","eci.self.view"].some((permission) => userPermissions.has(permission));
     if (item.id === "appraisals") return userPermissions.has("appraisals.view") || userPermissions.has("appraisals.manage") || userPermissions.has("appraisals.self.view");
     if (item.id === "talent") return userPermissions.has("hr.talent.view") || userPermissions.has("hr.talent.manage");
     if (item.id === "exit") return user?.role === "Admin" || user?.role === "Organization Admin" || userPermissions.has("employees.view") || userPermissions.has("employees.manage") || userPermissions.has("hr.onboarding.approve") || userPermissions.has("payroll.manage") || userPermissions.has("expenses.manage") || userPermissions.has("operations.manage");
@@ -354,6 +357,7 @@ export default function App() {
           {page === "documents" && <Documents version={documentsVersion} canManage={userPermissions.has("operations.manage")} onUpload={() => setShowUpload(true)} onToast={setToast} />}
           {page === "reports" && <ReportsWorkspace onToast={setToast} />}
           {page === "payroll" && (userPermissions.has("payroll.view") || userPermissions.has("payroll.manage") ? <PayrollWorkspace onToast={setToast} role={user.role} readOnly={Boolean(user.isDemo)} /> : <EmployeePayslips />)}
+          {page === "employee-costs" && <EmployeeCostIntelligence onToast={setToast} />}
           {page === "settings" && <OrganizationSettings onToast={setToast} currentEmail={user.email} />}
           {page === "security" && <AccountSecurity mandatory={user.mfaMandatory} onToast={setToast} />}
           {page === "platform" && user.isPlatformAdmin && <PlatformAdminWorkspace />}
