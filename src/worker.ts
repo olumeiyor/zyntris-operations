@@ -828,6 +828,42 @@ async function consumeAuthLimit(env: Env, request: Request, action: string, limi
   return (row?.count || 0) <= limit;
 }
 
+async function loginLockStatus(env: Env, userId: string) {
+  const row = await env.DB.prepare(`SELECT locked_until as lockedUntil FROM user_login_lockouts WHERE user_id = ?`).bind(userId).first<{ lockedUntil: string | null }>();
+  if (!row?.lockedUntil) return { locked: false, lockedUntil: null };
+  const active = await env.DB.prepare(`SELECT CASE WHEN ? > CURRENT_TIMESTAMP THEN 1 ELSE 0 END as active`).bind(row.lockedUntil).first<{ active: number }>();
+  return { locked: active?.active === 1, lockedUntil: active?.active === 1 ? row.lockedUntil : null };
+}
+
+async function recordFailedLogin(env: Env, userId: string) {
+  await env.DB.prepare(`INSERT INTO user_login_lockouts (user_id, failed_attempts, locked_until, updated_at)
+    VALUES (?, 1, NULL, CURRENT_TIMESTAMP)
+    ON CONFLICT(user_id) DO UPDATE SET
+      failed_attempts = CASE WHEN user_login_lockouts.locked_until IS NOT NULL AND user_login_lockouts.locked_until <= CURRENT_TIMESTAMP THEN 1 ELSE MIN(5, user_login_lockouts.failed_attempts + 1) END,
+      locked_until = CASE WHEN user_login_lockouts.locked_until > CURRENT_TIMESTAMP THEN user_login_lockouts.locked_until WHEN user_login_lockouts.failed_attempts >= 4 THEN datetime('now', '+12 hours') ELSE NULL END,
+      updated_at = CURRENT_TIMESTAMP`).bind(userId).run();
+  return loginLockStatus(env, userId);
+}
+
+async function clearLoginLock(env: Env, userId: string) {
+  await env.DB.prepare(`DELETE FROM user_login_lockouts WHERE user_id = ?`).bind(userId).run();
+}
+
+const invalidLoginMessage = "Email or password is incorrect, or sign-in is temporarily locked. Use Forgot password to restore access.";
+
+async function verifyLoginPassword(env: Env, user: { id: string; passwordHash: string | null; status: string }, password: string) {
+  if (!user.passwordHash || user.status !== "active") return { ok: false, locked: false };
+  const lock = await loginLockStatus(env, user.id);
+  if (lock.locked) return { ok: false, locked: true };
+  const matches = password.length <= 128 && await verifyPassword(password, user.passwordHash, env.PASSWORD_PEPPER);
+  if (!matches) {
+    const afterFailure = await recordFailedLogin(env, user.id);
+    return { ok: false, locked: afterFailure.locked };
+  }
+  await clearLoginLock(env, user.id);
+  return { ok: true, locked: false };
+}
+
 async function sendVerificationEmail(env: Env, email: string, fullName: string, token: string) {
   if (!env.BREVO_API_KEY) return false;
   const url = `${env.APP_ORIGIN}/?verify=${encodeURIComponent(token)}`;
@@ -1131,7 +1167,7 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     if (!(await consumeAuthLimit(env, request, "reset-password", 10, 30))) return error("Too many password reset attempts. Try again later.", 429);
     const body = await request.json<{ token?: string; password?: string }>();
     if (!body.token || body.token.length !== 64 || !body.password || body.password.length < 12 || body.password.length > 128) return error("Use a valid reset link and a password of at least 12 characters.");
-    const reset = await env.DB.prepare(`SELECT id, user_id as userId FROM password_reset_tokens WHERE token_hash = ? AND used_at IS NULL AND expires_at > CURRENT_TIMESTAMP LIMIT 1`).bind(await hashToken(body.token)).first<{ id: string; userId: string }>();
+    const reset = await env.DB.prepare(`SELECT r.id, r.user_id as userId, u.email FROM password_reset_tokens r JOIN users u ON u.id = r.user_id WHERE r.token_hash = ? AND r.used_at IS NULL AND r.expires_at > CURRENT_TIMESTAMP LIMIT 1`).bind(await hashToken(body.token)).first<{ id: string; userId: string; email: string }>();
     if (!reset) return error("This password reset link is invalid, expired, or already used. Ask the platform administrator to send a new one.", 400);
     // Hash before claiming the single-use link so transient crypto/runtime failures
     // leave the user's valid reset token usable for a retry.
@@ -1141,7 +1177,10 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     if (!claimed.meta.changes) return error("This password reset link has already been used. Ask the platform administrator to send a new one.", 409);
     const saved = await env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'active'`).bind(newPasswordHash, reset.userId).run();
     if (!saved.meta.changes) return error("This account cannot reset its password. Contact your organization administrator.", 409);
+    const loginSubjectKey = `login:subject:${await hashToken(reset.email.trim().toLowerCase())}`;
     await env.DB.batch([
+      env.DB.prepare(`DELETE FROM user_login_lockouts WHERE user_id = ?`).bind(reset.userId),
+      env.DB.prepare(`DELETE FROM auth_rate_limits WHERE bucket_key = ?`).bind(loginSubjectKey),
       env.DB.prepare(`DELETE FROM sessions WHERE user_id = ?`).bind(reset.userId),
       env.DB.prepare(`DELETE FROM two_factor_challenges WHERE user_id = ?`).bind(reset.userId),
       env.DB.prepare(`DELETE FROM password_reset_tokens WHERE user_id = ? AND id != ?`).bind(reset.userId, reset.id),
@@ -1192,8 +1231,10 @@ async function handlePublicAuth(request: Request, env: Env, path: string, mobile
     const email = body.email?.trim().toLowerCase() || "";
     if (email && !(await consumeAuthLimit(env, request, "login", 8, 15, email))) return error("Too many sign-in attempts. Try again later.", 429);
     const user = await env.DB.prepare(`SELECT id, password_hash as passwordHash, email_verified_at as verifiedAt, status FROM users WHERE email = ?`).bind(email).first<{ id: string; passwordHash: string | null; verifiedAt: string | null; status: string }>();
-    if (!user?.passwordHash || user.status !== "active" || !(await verifyPassword(body.password || "", user.passwordHash, env.PASSWORD_PEPPER))) return error("Email or password is incorrect.", 401);
-    await upgradeLegacyPassword(env, user.id, body.password || "", user.passwordHash);
+    if (!user) return error("Email or password is incorrect.", 401);
+    const passwordCheck = await verifyLoginPassword(env, user, body.password || "");
+    if (!passwordCheck.ok) return error(invalidLoginMessage, 401);
+    await upgradeLegacyPassword(env, user.id, body.password || "", user.passwordHash!);
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
     const membership = await env.DB.prepare(`SELECT organization_id as organizationId FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created_at LIMIT 1`).bind(user.id).first<{ organizationId: string }>();
     if (!membership) return error("No active organization is linked to this account.", 403);
@@ -2069,8 +2110,10 @@ async function handleApi(request: Request, env: Env): Promise<Response> {
     const email = body.email?.trim().toLowerCase() || "";
     if (email && !(await consumeAuthLimit(env, request, "login", 8, 15, email))) return error("Too many sign-in attempts. Try again later.", 429);
     const user = await env.DB.prepare(`SELECT id, password_hash as passwordHash, email_verified_at as verifiedAt, status FROM users WHERE email = ?`).bind(email).first<{ id: string; passwordHash: string | null; verifiedAt: string | null; status: string }>();
-    if (!user?.passwordHash || user.status !== "active" || !(await verifyPassword(body.password || "", user.passwordHash, env.PASSWORD_PEPPER))) return error("Email or password is incorrect.", 401);
-    await upgradeLegacyPassword(env, user.id, body.password || "", user.passwordHash);
+    if (!user) return error("Email or password is incorrect.", 401);
+    const passwordCheck = await verifyLoginPassword(env, user, body.password || "");
+    if (!passwordCheck.ok) return error(invalidLoginMessage, 401);
+    await upgradeLegacyPassword(env, user.id, body.password || "", user.passwordHash!);
     if (!user.verifiedAt) return error("Please verify your email address before signing in.", 403);
     const membership = await env.DB.prepare(`SELECT organization_id as organizationId FROM memberships WHERE user_id = ? AND status = 'active' ORDER BY created_at LIMIT 1`).bind(user.id).first<{ organizationId: string }>();
     if (!membership) return error("No active organization is linked to this account.", 403);
@@ -4634,6 +4677,7 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     await env.DB.batch([
       env.DB.prepare(`DELETE FROM auth_rate_limits WHERE window_started_at < datetime('now', '-1 day')`),
+      env.DB.prepare(`DELETE FROM user_login_lockouts WHERE updated_at < datetime('now', '-7 days')`),
       env.DB.prepare(`DELETE FROM sessions WHERE expires_at <= CURRENT_TIMESTAMP OR last_seen_at <= datetime('now', ?)`).bind(SESSION_IDLE_TIMEOUT_SQL),
       env.DB.prepare(`DELETE FROM two_factor_challenges WHERE expires_at <= CURRENT_TIMESTAMP`),
       env.DB.prepare(`DELETE FROM password_reset_tokens WHERE expires_at <= CURRENT_TIMESTAMP OR (used_at IS NOT NULL AND created_at < datetime('now', '-1 day'))`),
