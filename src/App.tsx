@@ -17,6 +17,7 @@ import { PlatformAdminWorkspace } from "./platform-admin";
 import { AccountSecurity, OrganizationSettings } from "./settings";
 import { Appraisals } from "./appraisals";
 import { HRTalentWorkspace } from "./hr-talent";
+import { HRServicesWorkspace } from "./hr-services";
 import { ExitManagement } from "./exit-management";
 import { FleetWorkspace } from "./fleet";
 import { ReportsWorkspace } from "./reports";
@@ -37,6 +38,7 @@ const navItems: NavItem[] = [
   { id: "goals", label: "Goals & OKRs", icon: Target, section: "People" },
   { id: "appraisals", label: "Performance & appraisals", icon: Award, section: "People" },
   { id: "talent", label: "Teams & talent", icon: Users, section: "People" },
+  { id: "hr-services", label: "HR services", icon: BriefcaseBusiness, section: "People" },
   { id: "exit", label: "Exit management", icon: UserRoundMinus, section: "People" },
   { id: "leave", label: "Leave & attendance", icon: CalendarDays, section: "People" },
   { id: "attendance", label: "Time & shifts", icon: Clock3, section: "People" },
@@ -247,6 +249,7 @@ export default function App() {
     if (item.id === "employee-costs") return ["eci.view.aggregate","eci.view.profiles","eci.manage","eci.department.view","eci.self.view"].some((permission) => userPermissions.has(permission));
     if (item.id === "appraisals") return userPermissions.has("appraisals.view") || userPermissions.has("appraisals.manage") || userPermissions.has("appraisals.self.view");
     if (item.id === "talent") return userPermissions.has("hr.talent.view") || userPermissions.has("hr.talent.manage");
+    if (item.id === "hr-services") return userPermissions.has("hr.talent.view") || userPermissions.has("hr.talent.manage");
     if (item.id === "exit") return user?.role === "Admin" || user?.role === "Organization Admin" || userPermissions.has("employees.view") || userPermissions.has("employees.manage") || userPermissions.has("hr.onboarding.approve") || userPermissions.has("payroll.manage") || userPermissions.has("expenses.manage") || userPermissions.has("operations.manage");
     if (item.id === "goals") return userPermissions.has("goals.view");
     if (item.id === "announcements") return userPermissions.has("announcements.view");
@@ -342,6 +345,7 @@ export default function App() {
           {page === "employees" && <Employees employees={employees} onAdd={() => setShowAddEmployee(true)} canManage={userPermissions.has("employees.manage")} canManageStructure={userPermissions.has("teams.manage") || userPermissions.has("hr.talent.manage")} onToast={setToast} onDeliveryUpdated={(id, status) => setEmployees((current) => current.map((employee) => employee.id === id ? { ...employee, invitationEmailStatus: status } : employee))} />}
           {page === "appraisals" && <Appraisals user={{ id: user.id, permissions: user.permissions }} onToast={setToast} />}
           {page === "talent" && <HRTalentWorkspace user={{ id: user.id, permissions: user.permissions || [] }} employees={employees} onToast={setToast} onEmployeesUpdated={async () => { try { const people = await api<{ data: Employee[] }>("/api/employees"); setEmployees(people.data); } catch { /* handled in the workspace */ } }} />}
+          {page === "hr-services" && <HRServicesWorkspace user={{ id: user.id, permissions: user.permissions || [] }} employees={employees} onToast={setToast} />}
           {page === "exit" && <ExitManagement employees={employees} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "leave" && <WorkLeaveWorkspace canManage={userPermissions.has("employees.manage") || userPermissions.has("hr.onboarding.approve")} isDemo={Boolean(user.isDemo)} onToast={setToast} />}
           {page === "attendance" && <AttendanceWorkspace isDemo={Boolean(user.isDemo)} onToast={setToast} />}
